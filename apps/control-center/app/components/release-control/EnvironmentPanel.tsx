@@ -2,6 +2,7 @@ import type { EnvironmentDashboard, ServiceStatus } from '../../../lib/types'
 import { displayEnvironmentName } from './environmentDisplay'
 import { ServiceCard } from './ServiceCard'
 import { StatusBadge, environmentLabel, environmentTone } from './StatusBadge'
+import type { BuildTrackedState } from './useBuildTracker'
 
 type EnvironmentPanelProps = {
   environment: EnvironmentDashboard
@@ -9,11 +10,14 @@ type EnvironmentPanelProps = {
   previousEnvironment?: EnvironmentDashboard
   lastUpdatedAt: string
   busyKey: string
+  getBuildState: (service: ServiceStatus) => BuildTrackedState | undefined
   onDeploy: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onPromote: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onRestart: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onRollback: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onLogs: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
+  onBuild: (environment: EnvironmentDashboard, service: ServiceStatus) => void
+  onViewBuild: (service: ServiceStatus) => void
   onRetry: () => void
 }
 
@@ -23,11 +27,14 @@ export function EnvironmentPanel({
   previousEnvironment,
   lastUpdatedAt,
   busyKey,
+  getBuildState,
   onDeploy,
   onPromote,
   onRestart,
   onRollback,
   onLogs,
+  onBuild,
+  onViewBuild,
   onRetry,
 }: EnvironmentPanelProps) {
   return (
@@ -85,11 +92,14 @@ export function EnvironmentPanel({
                   previousEnvironment={previousEnvironment}
                   previousService={previousEnvironment?.services.find((item) => item.code === service.code)}
                   isBusy={busyKey.includes(`${environment.code}:${service.code}`)}
+                  buildState={getBuildState(service)}
                   onDeploy={onDeploy}
                   onPromote={onPromote}
                   onRestart={onRestart}
                   onRollback={onRollback}
                   onLogs={onLogs}
+                  onBuild={onBuild}
+                  onViewBuild={onViewBuild}
                 />
               ))}
             </div>

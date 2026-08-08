@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto'
-import type { EnvironmentConfig, OperationSnapshot } from './types'
+import { readJsonSafe } from './http'
+import type { EnvironmentConfig } from './types'
 
 type AgentRequestOptions = {
   method?: 'GET' | 'POST'
@@ -48,15 +49,31 @@ export async function callAgent<T>(
       cache: 'no-store',
       signal: controller.signal,
     })
-    const text = await response.text()
-    let parsed: unknown = null
-    if (text) {
-      try {
-        parsed = JSON.parse(text)
-      } catch {
-        parsed = { error: 'invalid_agent_response', details: text }
+
+    let parsed: unknown
+    try {
+      parsed = await readJsonSafe(response)
+    } catch (parseError) {
+      // Non-empty but invalid JSON body — log without leaking the HMAC secret.
+      console.error('[agent] invalid JSON response', {
+        upstreamStatus: response.status,
+        environment: environment.code,
+        path,
+      })
+      throw new Error(`${environment.code}: ${parseError instanceof Error ? parseError.message : 'invalid response'}`)
+    }
+
+    if (parsed === null) {
+      console.error('[agent] empty response body', {
+        upstreamStatus: response.status,
+        environment: environment.code,
+        path,
+      })
+      if (response.ok) {
+        throw new Error(`${environment.code}: agent returned an empty response body (status ${response.status})`)
       }
     }
+
     if (!response.ok) {
       const message = typeof parsed === 'object' && parsed && 'details' in parsed
         ? String((parsed as { details?: unknown }).details ?? response.statusText)
@@ -86,25 +103,4 @@ export async function streamAgent(environment: EnvironmentConfig, path: string):
     throw new Error(`${environment.code}: agent stream failed (${response.status}) ${text}`)
   }
   return response
-}
-
-/**
- * Polls an agent operation until it reaches a terminal status. Used only by
- * callers (e.g. promote) that still need a single synchronous request/response
- * instead of following realtime progress through the operations endpoints.
- */
-export async function waitForAgentOperation(
-  environment: EnvironmentConfig,
-  operationId: string,
-  options: { timeoutMs?: number; pollIntervalMs?: number } = {},
-): Promise<OperationSnapshot> {
-  const timeoutMs = options.timeoutMs ?? 10 * 60_000
-  const pollIntervalMs = options.pollIntervalMs ?? 1500
-  const deadline = Date.now() + timeoutMs
-  for (;;) {
-    const snapshot = await callAgent<OperationSnapshot>(environment, `/api/operations/${encodeURIComponent(operationId)}`)
-    if (snapshot.status !== 'running') return snapshot
-    if (Date.now() >= deadline) throw new Error('operation timed out')
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
-  }
 }

@@ -1,3 +1,5 @@
+import type { BuildTrackedStatus } from './useBuildTracker'
+
 export type BadgeTone = 'success' | 'danger' | 'warning' | 'neutral'
 
 const TONE_CLASSES: Record<BadgeTone, string> = {
@@ -70,4 +72,25 @@ export function healthLabel(health: string): string {
 export function hasHealthCheck(health: string): boolean {
   const value = health.toLowerCase()
   return Boolean(value) && value !== 'none'
+}
+
+// Build status is intentionally a distinct badge vocabulary from container
+// status above — a build never changes what's running, so it must never be
+// confused with (or overwrite) the container's own state.
+export function buildStatusTone(status: BuildTrackedStatus): BadgeTone {
+  if (status === 'success') return 'success'
+  if (status === 'failed') return 'danger'
+  return 'warning'
+}
+
+const BUILD_STATUS_LABELS: Record<BuildTrackedStatus, string> = {
+  triggering: 'ĐANG GỬI YÊU CẦU',
+  queued: 'BUILD ĐANG CHỜ',
+  in_progress: 'ĐANG BUILD',
+  success: 'BUILD THÀNH CÔNG',
+  failed: 'BUILD THẤT BẠI',
+}
+
+export function buildStatusLabel(status: BuildTrackedStatus): string {
+  return BUILD_STATUS_LABELS[status]
 }

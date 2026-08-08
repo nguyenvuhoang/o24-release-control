@@ -11,6 +11,10 @@ export type ActiveOperation = {
   serviceLabel: string
   action: OperationAction
   actionLabel: string
+  // Overrides OPERATION_FAIL_VERB[action] in the failure toast when this
+  // operation is displayed under a different verb than its underlying agent
+  // action (e.g. a promote surfaces as a target-environment "deploy").
+  failVerb?: string
 }
 
 export type ConnectionState = 'connected' | 'reconnecting' | 'lost'

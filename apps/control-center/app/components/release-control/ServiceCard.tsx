@@ -1,6 +1,8 @@
 import type { EnvironmentDashboard, ServiceStatus } from '../../../lib/types'
+import { imageRepositoryFor, githubServiceForAgentCode } from '../../../lib/github/serviceMap'
 import { CopyableValue } from './CopyableValue'
-import { StatusBadge, containerStatusLabel, containerStatusTone, hasHealthCheck, healthLabel, healthTone } from './StatusBadge'
+import { StatusBadge, buildStatusLabel, buildStatusTone, containerStatusLabel, containerStatusTone, hasHealthCheck, healthLabel, healthTone } from './StatusBadge'
+import type { BuildTrackedState } from './useBuildTracker'
 
 type ServiceCardProps = {
   environment: EnvironmentDashboard
@@ -9,11 +11,14 @@ type ServiceCardProps = {
   previousEnvironment?: EnvironmentDashboard
   previousService?: ServiceStatus
   isBusy: boolean
+  buildState?: BuildTrackedState
   onDeploy: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onPromote: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onRestart: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onRollback: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onLogs: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
+  onBuild: (environment: EnvironmentDashboard, service: ServiceStatus) => void
+  onViewBuild: (service: ServiceStatus) => void
 }
 
 const BUTTON_BASE =
@@ -34,17 +39,35 @@ export function ServiceCard({
   previousEnvironment,
   previousService,
   isBusy,
+  buildState,
   onDeploy,
   onPromote,
   onRestart,
   onRollback,
   onLogs,
+  onBuild,
+  onViewBuild,
 }: ServiceCardProps) {
   const disabled = isBusy || !environment.online
 
-  const buttons: { key: string; label: string; variant: keyof typeof BUTTON_VARIANTS; disabled: boolean; onClick: () => void }[] = [
-    { key: 'deploy', label: 'Triển khai', variant: 'primary', disabled, onClick: () => void onDeploy(environment, service) },
-  ]
+  // Build only makes sense on the first environment in the chain (source of
+  // truth for what gets built), and only for services the GitHub workflow
+  // actually knows how to build.
+  const githubService = !previousEnvironment ? githubServiceForAgentCode(service.code) : null
+  const canBuild = Boolean(githubService)
+  const buildBusy = buildState?.status === 'triggering' || buildState?.status === 'queued' || buildState?.status === 'in_progress'
+
+  const buttons: { key: string; label: string; variant: keyof typeof BUTTON_VARIANTS; disabled: boolean; onClick: () => void }[] = []
+  if (canBuild) {
+    buttons.push({
+      key: 'build',
+      label: 'Build',
+      variant: 'secondary',
+      disabled: disabled || buildBusy,
+      onClick: () => onBuild(environment, service),
+    })
+  }
+  buttons.push({ key: 'deploy', label: 'Triển khai', variant: 'primary', disabled, onClick: () => void onDeploy(environment, service) })
   if (nextEnvironment) {
     buttons.push({
       key: 'promote',
@@ -106,6 +129,43 @@ export function ServiceCard({
           <dd className="m-0 truncate text-xs text-slate-400">{formatDate(service.startedAt)}</dd>
         </div>
       </dl>
+
+      {canBuild && buildState ? (
+        <div className="mb-2.5 rounded border border-slate-800/70 bg-slate-950/30 px-2.5 py-2 text-[11px] leading-relaxed">
+          <div className="mb-1.5 flex items-center justify-between gap-2">
+            <StatusBadge tone={buildStatusTone(buildState.status)} label={buildStatusLabel(buildState.status)} />
+            {buildState.runId ? <span className="text-slate-600">Run #{buildState.runId}</span> : null}
+          </div>
+          {buildState.status === 'success' && githubService ? (
+            <div className="mb-1.5 min-w-0">
+              <p className="mb-0.5 text-slate-500 uppercase">Latest build</p>
+              <p className="m-0 truncate font-mono text-slate-400">
+                {imageRepositoryFor(githubService)}:{buildState.tag}
+              </p>
+            </div>
+          ) : null}
+          {buildState.status === 'failed' && buildState.error ? (
+            <p className="mb-1.5 break-words text-rose-300">{buildState.error}</p>
+          ) : null}
+          <div className="flex gap-3">
+            {buildState.runId ? (
+              <button type="button" onClick={() => onViewBuild(service)} className="font-medium text-emerald-400 hover:underline">
+                {buildState.status === 'failed' ? 'Xem lỗi' : 'Xem chi tiết build'}
+              </button>
+            ) : null}
+            {buildState.status === 'success' || buildState.status === 'failed' ? (
+              <button
+                type="button"
+                disabled={disabled}
+                onClick={() => onBuild(environment, service)}
+                className="font-medium text-slate-400 hover:underline disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Build lại
+              </button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
 
       {previousEnvironment ? (
         <div className="mb-2.5 rounded border border-slate-800/70 bg-slate-950/30 px-2.5 py-2 text-[11px] leading-relaxed">

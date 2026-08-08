@@ -1,7 +1,7 @@
 'use client'
 
 import { usePathname, useRouter, useSearchParams } from 'next/navigation'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
   AuditRecord,
   DashboardResponse,
@@ -12,9 +12,13 @@ import type {
   OperationStatus,
   ServiceStatus,
 } from '../../lib/types'
+import { githubServiceForAgentCode } from '../../lib/github/serviceMap'
+import { readJsonSafe } from '../../lib/http'
 import { escapeHtml, SwalAlert } from '../../lib/swalAlert'
 import type { AuditFilter } from './release-control/AuditLogPanel'
 import { AuditLogPanel } from './release-control/AuditLogPanel'
+import { BuildDetailDrawer } from './release-control/BuildDetailDrawer'
+import { BuildDialog } from './release-control/BuildDialog'
 import { DashboardHeader } from './release-control/DashboardHeader'
 import { EnvironmentPanel } from './release-control/EnvironmentPanel'
 import { EnvironmentTabs } from './release-control/EnvironmentTabs'
@@ -22,6 +26,8 @@ import { LogsModal } from './release-control/LogsModal'
 import { OperationLogDrawer } from './release-control/OperationLogDrawer'
 import type { ActiveOperation } from './release-control/OperationLogDrawer'
 import { SummaryCards } from './release-control/SummaryCards'
+import type { BuildTrackedStatus } from './release-control/useBuildTracker'
+import { useBuildTracker } from './release-control/useBuildTracker'
 
 type Props = { username: string }
 
@@ -73,6 +79,32 @@ export default function Dashboard({ username }: Props) {
   const [operationError, setOperationError] = useState<string | undefined>()
   const [connectionState, setConnectionState] = useState<ConnectionState>('connected')
 
+  // Build (GitHub Actions -> Docker Hub) is tracked entirely independently of
+  // the deploy/restart/rollback/promote operation model above: it never
+  // touches a running container, so it gets its own state and its own
+  // dialog/drawer instead of reusing `busy` / `activeOperation`.
+  const { builds, getBuildState, triggerBuild } = useBuildTracker()
+  const [buildDialogTarget, setBuildDialogTarget] = useState<{ environment: EnvironmentDashboard; service: ServiceStatus } | null>(null)
+  const [buildDetailTarget, setBuildDetailTarget] = useState<{ githubService: string; serviceLabel: string } | null>(null)
+  const previousBuildStatuses = useRef<Record<string, BuildTrackedStatus>>({})
+
+  // Toasts the terminal outcome of a build exactly once, by diffing against
+  // the status seen on the previous render — polling itself lives inside
+  // useBuildTracker.
+  useEffect(() => {
+    for (const [service, state] of Object.entries(builds)) {
+      const previousStatus = previousBuildStatuses.current[service]
+      if (previousStatus !== state.status) {
+        if (state.status === 'success') {
+          SwalAlert.toast(`Build ${service} thành công`)
+        } else if (state.status === 'failed' && previousStatus !== undefined) {
+          SwalAlert.toast(`Build ${service} thất bại`, 'error')
+        }
+      }
+    }
+    previousBuildStatuses.current = Object.fromEntries(Object.entries(builds).map(([service, state]) => [service, state.status]))
+  }, [builds])
+
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
     try {
@@ -84,12 +116,13 @@ export default function Dashboard({ username }: Props) {
         window.location.href = '/login'
         return
       }
-      const dashboardBody = await dashboardResponse.json()
-      const auditBody = await auditResponse.json()
-      if (!dashboardResponse.ok) throw new Error(dashboardBody.details ?? dashboardBody.error ?? 'Không tải được dashboard')
-      if (!auditResponse.ok) throw new Error(auditBody.details ?? auditBody.error ?? 'Không tải được lịch sử thao tác')
+      const dashboardBody = await readJsonSafe<DashboardResponse & { details?: string; error?: string }>(dashboardResponse)
+      const auditBody = await readJsonSafe<{ items?: AuditRecord[]; details?: string; error?: string }>(auditResponse)
+      if (!dashboardResponse.ok) throw new Error(dashboardBody?.details ?? dashboardBody?.error ?? 'Không tải được dashboard')
+      if (!auditResponse.ok) throw new Error(auditBody?.details ?? auditBody?.error ?? 'Không tải được lịch sử thao tác')
+      if (!dashboardBody) throw new Error('Không tải được dashboard')
       setDashboard(dashboardBody)
-      setAudit(auditBody.items ?? [])
+      setAudit(auditBody?.items ?? [])
       setError('')
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Không tải được dữ liệu')
@@ -211,8 +244,8 @@ export default function Dashboard({ username }: Props) {
         `/api/operations/${encodeURIComponent(operation.operationId)}?environment=${encodeURIComponent(operation.environment)}`,
         { cache: 'no-store' },
       )
-      if (response.ok) {
-        const data = await response.json() as OperationSnapshot
+      const data = response.ok ? await readJsonSafe<OperationSnapshot>(response) : null
+      if (data) {
         finalLogs = data.logs
         finalStatus = data.status
         finalError = data.error
@@ -240,7 +273,7 @@ export default function Dashboard({ username }: Props) {
         await SwalAlert.success(`${operation.actionLabel} thành công`)
       } else {
         await SwalAlert.error(
-          `Không thể ${OPERATION_FAIL_VERB[operation.action]} ${operation.serviceLabel}.`,
+          `Không thể ${operation.failVerb ?? OPERATION_FAIL_VERB[operation.action]} ${operation.serviceLabel}.`,
           { detail: finalError },
         )
       }
@@ -254,17 +287,19 @@ export default function Dashboard({ username }: Props) {
     environment: EnvironmentDashboard,
     service: ServiceStatus,
     action: OperationAction,
+    overrides?: { actionLabel?: string; failVerb?: string },
   ) {
-    setBusy({ key, label: OPERATION_ACTION_LABEL[action] })
+    const actionLabel = overrides?.actionLabel ?? OPERATION_ACTION_LABEL[action]
+    setBusy({ key, label: actionLabel })
     try {
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      const result = await response.json()
-      if (!response.ok) throw new Error(result.details ?? result.error ?? 'Thao tác thất bại')
-      if (!result.operationId || typeof result.operationId !== 'string') {
+      const result = await readJsonSafe<{ operationId?: string; details?: string; error?: string }>(response)
+      if (!response.ok) throw new Error(result?.details ?? result?.error ?? `Yêu cầu thất bại (mã ${response.status})`)
+      if (!result?.operationId || typeof result.operationId !== 'string') {
         if (process.env.NODE_ENV !== 'production') {
           // eslint-disable-next-line no-console
           console.error('[operation] response missing operationId — Deploy Agent may be running an outdated build without async operation support', {
@@ -279,7 +314,8 @@ export default function Dashboard({ username }: Props) {
         service: service.code,
         serviceLabel: service.displayName || service.code,
         action,
-        actionLabel: OPERATION_ACTION_LABEL[action],
+        actionLabel,
+        failVerb: overrides?.failVerb,
       }
       setOperationLogs([])
       setOperationStatus('running')
@@ -289,25 +325,6 @@ export default function Dashboard({ username }: Props) {
       setActiveOperation(operation)
     } catch (caught) {
       await SwalAlert.error(caught instanceof Error ? caught.message : 'Thao tác thất bại')
-      setBusy(null)
-    }
-  }
-
-  async function runAction(key: string, label: string, url: string, body: unknown) {
-    setBusy({ key, label })
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      const result = await response.json()
-      if (!response.ok) throw new Error(result.details ?? result.error ?? 'Thao tác thất bại')
-      await refresh(true)
-      await SwalAlert.success(`${label} thành công`)
-    } catch (caught) {
-      await SwalAlert.error(caught instanceof Error ? caught.message : 'Thao tác thất bại')
-    } finally {
       setBusy(null)
     }
   }
@@ -364,11 +381,15 @@ export default function Dashboard({ username }: Props) {
       cancelText: 'Hủy',
     })
     if (!confirmed) return
-    await runAction(
+    // The operation actually runs on the target agent (promote internally
+    // triggers a deploy there), so the SSE stream must target `target`, not
+    // the source environment the button lives on.
+    await startOperation(
       `promote:${environment.code}:${service.code}`,
-      `Chuyển tiếp ${service.code} ${environment.code} → ${target.code}`,
       '/api/promote',
       { sourceEnvironment: environment.code, targetEnvironment: target.code, service: service.code },
+      target, service, 'deploy',
+      { actionLabel: 'Chuyển tiếp', failVerb: 'chuyển tiếp' },
     )
   }
 
@@ -420,15 +441,47 @@ export default function Dashboard({ username }: Props) {
     setBusy({ key: `logs:${environment.code}:${service.code}`, label: 'Đang tải nhật ký' })
     try {
       const response = await fetch(`/api/logs?environment=${encodeURIComponent(environment.code)}&service=${encodeURIComponent(service.code)}&tail=500`)
-      const result = await response.json()
-      if (!response.ok) throw new Error(result.details ?? result.error ?? 'Không tải được nhật ký')
-      setLogs({ title: `${environment.code} / ${service.code}`, content: result.logs ?? '' })
+      const result = await readJsonSafe<{ logs?: string; details?: string; error?: string }>(response)
+      if (!response.ok) throw new Error(result?.details ?? result?.error ?? 'Không tải được nhật ký')
+      setLogs({ title: `${environment.code} / ${service.code}`, content: result?.logs ?? '' })
     } catch (caught) {
       await SwalAlert.error(caught instanceof Error ? caught.message : 'Không tải được nhật ký')
     } finally {
       setBusy(null)
     }
   }
+
+  function openBuildDialog(environment: EnvironmentDashboard, service: ServiceStatus) {
+    setBuildDialogTarget({ environment, service })
+  }
+
+  async function submitBuild(tag: string) {
+    if (!buildDialogTarget) return
+    const githubService = githubServiceForAgentCode(buildDialogTarget.service.code)
+    if (!githubService) return
+    try {
+      await triggerBuild(githubService, { branch: dashboard?.buildBranch ?? 'developer', tag })
+      SwalAlert.toast(`Đã gửi yêu cầu build ${githubService}`)
+    } catch (caught) {
+      await SwalAlert.error(caught instanceof Error ? caught.message : `Không thể gửi yêu cầu build ${githubService}`)
+    } finally {
+      setBuildDialogTarget(null)
+    }
+  }
+
+  function openBuildDetail(service: ServiceStatus) {
+    const githubService = githubServiceForAgentCode(service.code)
+    if (!githubService) return
+    setBuildDetailTarget({ githubService, serviceLabel: service.displayName || service.code })
+  }
+
+  const getBuildStateForService = useCallback(
+    (service: ServiceStatus) => {
+      const githubService = githubServiceForAgentCode(service.code)
+      return githubService ? getBuildState(githubService) : undefined
+    },
+    [getBuildState],
+  )
 
   const environments = dashboard?.environments ?? []
   const agentsOnlineCount = environments.filter((item) => item.online).length
@@ -442,6 +495,8 @@ export default function Dashboard({ username }: Props) {
   const activeEnvironment = activeIndex >= 0 ? environments[activeIndex] : undefined
   const nextEnvironment = activeIndex >= 0 ? environments[activeIndex + 1] : undefined
   const previousEnvironment = activeIndex > 0 ? environments[activeIndex - 1] : undefined
+
+  const buildDetailState = buildDetailTarget ? getBuildState(buildDetailTarget.githubService) : undefined
 
   return (
     <main className="mx-auto w-full max-w-[1600px] px-4 py-6 sm:px-6 lg:px-8">
@@ -492,11 +547,14 @@ export default function Dashboard({ username }: Props) {
             previousEnvironment={previousEnvironment}
             lastUpdatedAt={lastUpdatedFull}
             busyKey={busy?.key ?? ''}
+            getBuildState={getBuildStateForService}
             onDeploy={deploy}
             onPromote={promote}
             onRestart={restart}
             onRollback={rollback}
             onLogs={viewLogs}
+            onBuild={openBuildDialog}
+            onViewBuild={openBuildDetail}
             onRetry={() => void refresh(true)}
           />
         ) : !dashboard && loading ? (
@@ -523,6 +581,26 @@ export default function Dashboard({ username }: Props) {
           error={operationError}
           connectionState={connectionState}
           onClose={() => setActiveOperation(null)}
+        />
+      ) : null}
+
+      {buildDialogTarget ? (
+        <BuildDialog
+          serviceLabel={buildDialogTarget.service.displayName || buildDialogTarget.service.code}
+          serviceCode={githubServiceForAgentCode(buildDialogTarget.service.code) ?? buildDialogTarget.service.code}
+          branch={dashboard?.buildBranch ?? 'developer'}
+          onCancel={() => setBuildDialogTarget(null)}
+          onSubmit={submitBuild}
+        />
+      ) : null}
+
+      {buildDetailTarget && buildDetailState?.runId ? (
+        <BuildDetailDrawer
+          serviceLabel={buildDetailTarget.serviceLabel}
+          runId={buildDetailState.runId}
+          htmlUrl={buildDetailState.htmlUrl}
+          status={buildDetailState.status}
+          onClose={() => setBuildDetailTarget(null)}
         />
       ) : null}
     </main>

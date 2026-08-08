@@ -3,6 +3,7 @@ import { callAgent } from '../../../../lib/agent'
 import { requireApiSession, errorResponse } from '../../../../lib/api'
 import { appendAudit } from '../../../../lib/audit'
 import { getEnvironment } from '../../../../lib/config'
+import { getPromoteContext } from '../../../../lib/operationContext'
 import type { OperationSnapshot } from '../../../../lib/types'
 
 // Tracks operations whose terminal outcome has already been written to the
@@ -27,10 +28,13 @@ export async function GET(request: Request, { params }: { params: Promise<{ oper
     if (snapshot.status !== 'running' && !auditedOperations.has(operationId)) {
       auditedOperations.add(operationId)
       const digest = snapshot.image?.includes('@sha256:') ? snapshot.image.split('@sha256:')[1] : undefined
+      const promoteContext = getPromoteContext(operationId)
       await appendAudit({
         username: session.username,
-        action: snapshot.action,
-        environment: snapshot.environment,
+        action: promoteContext ? 'promote' : snapshot.action,
+        environment: promoteContext ? undefined : snapshot.environment,
+        sourceEnvironment: promoteContext?.sourceEnvironment,
+        targetEnvironment: promoteContext?.targetEnvironment,
         service: snapshot.service,
         digest: digest ? `sha256:${digest}` : undefined,
         status: snapshot.status === 'success' ? 'succeeded' : 'failed',

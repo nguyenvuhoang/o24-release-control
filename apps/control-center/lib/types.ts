@@ -54,6 +54,7 @@ export type DashboardResponse = {
   applicationName: string
   generatedAt: string
   environments: EnvironmentDashboard[]
+  buildBranch: string
 }
 
 export type AuditRecord = {
@@ -96,4 +97,60 @@ export type OperationSnapshot = {
   completedAt?: string
   error?: string
   logs: OperationLogLine[]
+}
+
+// GitHub Actions build trigger (source -> docker build -> Docker Hub). This is
+// intentionally separate from OperationSnapshot/OperationAction above: a
+// build never touches a running container, and is tracked independently of
+// deploy/restart/rollback/promote operations.
+export type BuildTriggerResponse = {
+  success: true
+  service: string
+  tag: string
+  branch: string
+  runId: number
+  runUrl: string
+  htmlUrl: string
+}
+
+export type BuildTriggerError = {
+  success: false
+  error: string
+  details?: string
+}
+
+export type BuildRunStatus = 'queued' | 'in_progress' | 'completed'
+export type BuildConclusion = 'success' | 'failure' | 'cancelled' | 'skipped' | 'timed_out' | 'action_required' | 'stale' | 'neutral' | null
+
+export type BuildRunSnapshot = {
+  runId: number
+  status: BuildRunStatus
+  conclusion: BuildConclusion
+  htmlUrl: string
+  branch: string
+  commitSha: string
+  createdAt: string
+  updatedAt: string
+}
+
+export type BuildJobStepStatus = 'queued' | 'in_progress' | 'completed'
+
+export type BuildJobStep = {
+  name: string
+  status: BuildJobStepStatus
+  conclusion: BuildConclusion
+  number: number
+}
+
+export type BuildJob = {
+  id: number
+  name: string
+  status: BuildJobStepStatus
+  conclusion: BuildConclusion
+  steps: BuildJobStep[]
+}
+
+export type BuildJobsResponse = {
+  runId: number
+  jobs: BuildJob[]
 }

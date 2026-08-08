@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { callAgent } from '../../../lib/agent'
 import { requireApiSession, errorResponse } from '../../../lib/api'
 import { loadControlConfig } from '../../../lib/config'
+import { getConfiguredBuildBranch } from '../../../lib/github/client'
 import type { AgentStatus, DashboardResponse, EnvironmentDashboard, ServiceStatus } from '../../../lib/types'
 
 export const dynamic = 'force-dynamic'
@@ -42,6 +43,7 @@ export async function GET() {
       applicationName: config.applicationName ?? 'O24 Release Control',
       generatedAt: new Date().toISOString(),
       environments,
+      buildBranch: getConfiguredBuildBranch(),
     }
     return NextResponse.json(response)
   } catch (error) {
