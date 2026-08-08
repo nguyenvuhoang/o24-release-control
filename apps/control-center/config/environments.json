@@ -1,0 +1,32 @@
+{
+  "applicationName": "IPS Release Control",
+  "environments": [
+    {
+      "code": "DEV",
+      "name": "Development",
+      "baseUrl": "https://deploy-dev.vknight.io.vn",
+      "apiKey": "${DEV_AGENT_KEY}",
+      "apiSecret": "${DEV_AGENT_SECRET}",
+      "order": 1,
+      "enabled": true
+    },
+    {
+      "code": "UAT",
+      "name": "Kiểm thử UAT",
+      "baseUrl": "https://deploy-uat.vknight.io.vn",
+      "apiKey": "${UAT_AGENT_KEY}",
+      "apiSecret": "${UAT_AGENT_SECRET}",
+      "order": 2,
+      "enabled": true
+    },
+    {
+      "code": "PROD",
+      "name": "Production",
+      "baseUrl": "https://deploy-prod.vknight.io.vn",
+      "apiKey": "${PROD_AGENT_KEY}",
+      "apiSecret": "${PROD_AGENT_SECRET}",
+      "order": 3,
+      "enabled": false
+    }
+  ]
+}

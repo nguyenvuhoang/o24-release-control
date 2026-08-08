@@ -20,7 +20,9 @@ function resolveEnvironmentVariables(value: unknown): unknown {
 }
 
 export async function loadControlConfig(): Promise<ControlConfig> {
-  const configPath = process.env.CONTROL_CONFIG_PATH ?? '/data/environments.json'
+  const configPath =
+    process.env.CONTROL_CONFIG_PATH ??
+    path.join(process.cwd(), 'config', 'environments.json')
   const raw = await fs.readFile(configPath, 'utf8')
   const parsed = resolveEnvironmentVariables(JSON.parse(raw)) as ControlConfig
 
