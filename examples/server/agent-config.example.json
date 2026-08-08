@@ -1,0 +1,32 @@
+{
+  "environment": "UAT",
+  "listenAddr": ":9100",
+  "compose": {
+    "projectDirectory": "/app",
+    "files": [
+      "/app/docker-compose.yml"
+    ],
+    "baseEnvFile": "/app/.env",
+    "deployEnvFile": "/app/.env.deploy"
+  },
+  "services": [
+    {
+      "code": "o24-wfo",
+      "displayName": "O24 Workflow",
+      "composeService": "o24-wfo",
+      "containerName": "o24-wfo",
+      "imageRepository": "vknighthub/ips_o24wfo",
+      "imageEnvKey": "O24_WFO_IMAGE",
+      "healthTimeoutSeconds": 90
+    },
+    {
+      "code": "o24-cms",
+      "displayName": "O24 CMS",
+      "composeService": "o24-cms",
+      "containerName": "o24-cms",
+      "imageRepository": "vknighthub/ips_o24cms",
+      "imageEnvKey": "O24_CMS_IMAGE",
+      "healthTimeoutSeconds": 90
+    }
+  ]
+}

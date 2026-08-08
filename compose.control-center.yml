@@ -1,0 +1,24 @@
+services:
+  release-control:
+    build:
+      context: ./apps/control-center
+    image: vknighthub/o24-release-control:1.0.0
+    container_name: o24-release-control
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8088:3000"
+    volumes:
+      - ./config/environments.json:/config/environments.json:ro
+      - release_control_data:/data
+    security_opt:
+      - no-new-privileges:true
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+    environment:
+      NODE_OPTIONS: "--dns-result-order=ipv4first"
+
+volumes:
+  release_control_data:

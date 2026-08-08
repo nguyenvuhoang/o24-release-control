@@ -1,0 +1,12 @@
+# Merge this pattern into the existing server docker-compose.yml.
+# Do not copy blindly; retain the existing ports, networks, volumes and environment.
+services:
+  o24-wfo:
+    image: ${O24_WFO_IMAGE}
+    container_name: o24-wfo
+    restart: unless-stopped
+
+  o24-cms:
+    image: ${O24_CMS_IMAGE}
+    container_name: o24-cms
+    restart: unless-stopped

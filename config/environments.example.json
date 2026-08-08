@@ -1,0 +1,38 @@
+{
+  "applicationName": "IPS Release Control",
+  "environments": [
+    {
+      "code": "DEV",
+      "name": "Development",
+      "baseUrl": "https://deploy-dev.vknight.io.vn",
+      "apiKey": "${DEV_AGENT_KEY}",
+      "apiSecret": "${DEV_AGENT_SECRET}",
+      "cfAccessClientId": "${DEV_CF_ACCESS_CLIENT_ID}",
+      "cfAccessClientSecret": "${DEV_CF_ACCESS_CLIENT_SECRET}",
+      "order": 1,
+      "enabled": true
+    },
+    {
+      "code": "UAT",
+      "name": "User Acceptance Test",
+      "baseUrl": "https://deploy-uat.vknight.io.vn",
+      "apiKey": "${UAT_AGENT_KEY}",
+      "apiSecret": "${UAT_AGENT_SECRET}",
+      "cfAccessClientId": "${UAT_CF_ACCESS_CLIENT_ID}",
+      "cfAccessClientSecret": "${UAT_CF_ACCESS_CLIENT_SECRET}",
+      "order": 2,
+      "enabled": true
+    },
+    {
+      "code": "PROD",
+      "name": "Production",
+      "baseUrl": "https://deploy-prod.vknight.io.vn",
+      "apiKey": "${PROD_AGENT_KEY}",
+      "apiSecret": "${PROD_AGENT_SECRET}",
+      "cfAccessClientId": "${PROD_CF_ACCESS_CLIENT_ID}",
+      "cfAccessClientSecret": "${PROD_CF_ACCESS_CLIENT_SECRET}",
+      "order": 3,
+      "enabled": true
+    }
+  ]
+}

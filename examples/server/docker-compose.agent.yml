@@ -1,0 +1,23 @@
+services:
+  deploy-agent:
+    image: vknighthub/o24-deploy-agent:1.0.0
+    container_name: o24-deploy-agent
+    restart: unless-stopped
+    env_file:
+      - .env.agent
+    environment:
+      AGENT_CONFIG_PATH: /config/agent-config.json
+      AGENT_DATA_DIR: /data
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "127.0.0.1:9100:9100"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount with the same absolute path used on the host.
+      - /app:/app
+      - ./agent-config.json:/config/agent-config.json:ro
+      - ./agent-data:/data
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true

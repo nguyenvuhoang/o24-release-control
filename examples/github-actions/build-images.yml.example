@@ -1,0 +1,34 @@
+name: Build Release Control Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Image version
+        required: true
+        default: 1.0.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - name: o24-release-control
+            context: apps/control-center
+          - name: o24-deploy-agent
+            context: apps/deploy-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: vknighthub/${{ matrix.name }}:${{ inputs.version }}
