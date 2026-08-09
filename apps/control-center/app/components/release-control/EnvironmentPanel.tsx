@@ -82,7 +82,12 @@ export function EnvironmentPanel({
       ) : (
         <div className="w-full p-4">
           {environment.services.length > 0 ? (
-            <div className="grid w-full grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
+            // auto-fit/minmax instead of fixed breakpoint column counts: each
+            // card keeps a guaranteed minimum width so its 2-column action
+            // grid never gets so narrow that a label like "Chuyển tiếp → UAT"
+            // has to wrap — the number of columns adapts to available width
+            // instead of being hard-coded per viewport size.
+            <div className="grid w-full grid-cols-[repeat(auto-fit,minmax(min(340px,100%),1fr))] gap-4">
               {environment.services.map((service) => (
                 <ServiceCard
                   key={service.code}

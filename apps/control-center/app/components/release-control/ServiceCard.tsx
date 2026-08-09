@@ -22,7 +22,7 @@ type ServiceCardProps = {
 }
 
 const BUTTON_BASE =
-  'flex min-h-[32px] items-center justify-center rounded px-2.5 text-xs font-medium transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1'
+  'flex min-h-[36px] w-full items-center justify-center rounded px-3 text-center text-xs font-medium whitespace-nowrap transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1'
 
 const BUTTON_VARIANTS = {
   primary: 'bg-emerald-600 text-white hover:bg-emerald-500 focus-visible:outline-emerald-600',
@@ -191,7 +191,7 @@ export function ServiceCard({
 
       {service.error ? <div className="mb-2.5 text-xs break-words text-rose-400">{service.error}</div> : null}
 
-      <div className="mt-auto grid grid-cols-2 gap-1.5">
+      <div className="mt-auto grid grid-cols-1 gap-2 sm:grid-cols-2">
         {buttons.map((button, index) => (
           <button
             key={button.key}
