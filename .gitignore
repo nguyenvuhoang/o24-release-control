@@ -6,5 +6,4 @@ data/
 **/agent-data/
 **/node_modules/
 **/.next/
-*.zip
-apps/control-center/.env.local
+**/.env.local
