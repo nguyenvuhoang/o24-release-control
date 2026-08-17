@@ -4,7 +4,9 @@ import { callAgent } from '../../../lib/agent'
 import { requireApiSession } from '../../../lib/api'
 import { loadControlConfig } from '../../../lib/config'
 import { registerPromoteOperation } from '../../../lib/operationContext'
-import type { OperationStartResponse, ServiceStatus } from '../../../lib/types'
+import { normalizeServiceStatus } from '../../../lib/serviceStatus'
+import type { RawServiceStatus } from '../../../lib/serviceStatus'
+import type { OperationStartResponse } from '../../../lib/types'
 
 function promoteError(error: string, status: number, details?: string) {
   return NextResponse.json({ success: false, error, details }, { status })
@@ -34,16 +36,20 @@ export async function POST(request: Request) {
     const source = config.environments[sourceIndex]
     const target = config.environments[targetIndex]
 
-    const sourceServices = await callAgent<{ items: ServiceStatus[] }>(source, '/api/services')
-    const service = sourceServices.items.find((item) => item.code === body.service)
+    const sourceServices = await callAgent<{ items: RawServiceStatus[] }>(source, '/api/services')
+    if (process.env.NODE_ENV !== 'production') {
+      console.debug('[promote] raw /api/services response', { environment: source.code, items: sourceServices.items })
+    }
+    const service = sourceServices.items.map(normalizeServiceStatus).find((item) => item.code === body.service)
     if (!service?.repoDigest) {
       return promoteError(`Source service ${body.service} does not expose an immutable digest`, 409)
     }
 
-    // Promotion always deploys the source's repoDigest (the registry digest),
-    // never imageId (local Docker image ID) and never a cached/previous
-    // value — service.repoDigest above comes fresh from the source agent's
-    // /api/services call made just above.
+    // Promotion always deploys the source's normalized repoDigest (the
+    // registry digest), never imageId (local Docker image ID) and never a
+    // cached/previous value — service.repoDigest above comes fresh from the
+    // source agent's /api/services call made just above, normalized to bridge
+    // both the current and legacy (pre-1.2.2) agent response schemas.
     const started = await callAgent<OperationStartResponse>(target, '/api/deploy', {
       method: 'POST',
       timeoutMs: 30_000,
