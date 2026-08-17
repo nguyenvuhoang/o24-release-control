@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { requireApiSession } from '../../../lib/api'
+import { recordDispatchedRun } from '../../../lib/buildPointerStore'
 import { getConfiguredBuildBranch, triggerWorkflowBuild } from '../../../lib/github/client'
 import { isDispatchLocked, markDispatched } from '../../../lib/github/dispatchLock'
 import { isBuildServiceCode, BUILD_SERVICES } from '../../../lib/github/serviceMap'
@@ -47,6 +48,17 @@ export async function POST(request: Request) {
 
   try {
     const run = await triggerWorkflowBuild({ service, branch, tag })
+    try {
+      // Best-effort hint for /api/builds/latest's fallback path — never let
+      // a storage hiccup here fail an otherwise-successful dispatch.
+      await recordDispatchedRun(service, run.runId)
+    } catch (pointerError) {
+      console.error('[builds] recordDispatchedRun failed', {
+        service,
+        runId: run.runId,
+        error: pointerError instanceof Error ? pointerError.message : 'Unknown error',
+      })
+    }
     const response: BuildTriggerResponse = {
       success: true,
       service,

@@ -1,5 +1,5 @@
 import { getAuditRepository, type AppendResult } from './auditRepository'
-import type { AuditRecord } from './types'
+import type { AuditRecord, BuildRunSnapshot } from './types'
 
 /**
  * Appends an audit record only once per idempotencyKey — pass a deterministic
@@ -23,6 +23,35 @@ export async function appendAudit(
   return getAuditRepository().append(record)
 }
 
-export async function readAudit(limit = 50): Promise<AuditRecord[]> {
-  return getAuditRepository().list(limit)
+/**
+ * A GitHub "Re-run failed jobs" keeps the same runId but bumps run_attempt —
+ * that retry deserves its own audit row (e.g. attempt 1 failed, attempt 2
+ * succeeded), so the attempt is part of the key. Shared by every code path
+ * that can observe a build's terminal state (the per-run poll route and the
+ * latest-build discovery route) so they can never disagree on the key and
+ * therefore never produce duplicate rows for the same attempt.
+ */
+export function buildAuditIdempotencyKey(runId: number, runAttempt: number | undefined): string {
+  return `build:${runId}:attempt:${runAttempt ?? 1}`
+}
+
+/**
+ * Records a build's terminal outcome. A no-op unless the run has actually
+ * completed — callers can pass any run snapshot unconditionally.
+ */
+export async function appendBuildAudit(
+  run: BuildRunSnapshot,
+  service: string | undefined,
+  username: string,
+): Promise<AppendResult | undefined> {
+  if (run.status !== 'completed') return undefined
+  return appendAudit({
+    idempotencyKey: buildAuditIdempotencyKey(run.runId, run.runAttempt),
+    username,
+    action: 'build',
+    service,
+    status: run.conclusion === 'success' ? 'succeeded' : 'failed',
+    error: run.conclusion && run.conclusion !== 'success' ? `Build conclusion: ${run.conclusion}` : undefined,
+    details: { runId: run.runId, runAttempt: run.runAttempt, branch: run.branch, commitSha: run.commitSha, htmlUrl: run.htmlUrl },
+  })
 }

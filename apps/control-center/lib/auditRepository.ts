@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import { isRunningOnVercel, kvCommand, resolveKvConfig, type KvConfig } from './kv'
 import type { AuditRecord } from './types'
 
 export type AppendResult = { record: AuditRecord; deduped: boolean }
@@ -61,32 +62,6 @@ export class FileAuditRepository implements AuditRepository {
 }
 
 // ---- Production (Vercel) — KV over the Upstash-compatible REST protocol ----
-// No extra npm dependency: Vercel KV and Upstash Redis both speak the same
-// single-command REST API (POST {url} with a JSON command array, Bearer
-// token auth), so a plain fetch is enough.
-
-type KvConfig = { url: string; token: string }
-
-function resolveKvConfig(): KvConfig | null {
-  const url = process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL
-  const token = process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN
-  if (!url || !token) return null
-  return { url, token }
-}
-
-async function kvCommand(config: KvConfig, command: (string | number)[]): Promise<unknown> {
-  const response = await fetch(config.url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${config.token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(command),
-    cache: 'no-store',
-  })
-  const body = (await response.json().catch(() => null)) as { result?: unknown; error?: string } | null
-  if (!response.ok) {
-    throw new Error(`KV command failed (${response.status}): ${body?.error ?? response.statusText}`)
-  }
-  return body?.result
-}
 
 const KV_RECORD_PREFIX = 'o24:audit:record:'
 const KV_INDEX_KEY = 'o24:audit:index'
@@ -122,19 +97,15 @@ export class KvAuditRepository implements AuditRepository {
   }
 }
 
-// ---- Last-resort fallback (Vercel, no KV configured yet) ----
-// Explicitly in-memory rather than writing into /tmp: /tmp on Vercel is
-// per-instance and just as non-durable as memory, and writing to it would
-// falsely look like real persistence. This exists so the app still functions
-// (with a loud warning) until KV_REST_API_URL/TOKEN is configured.
+// ---- In-memory (used only when NOT on Vercel and KV isn't configured — see
+// getAuditRepositoryStatus. On Vercel without KV, /api/audit refuses to
+// silently serve an empty list instead of falling back to this.) ----
 
 export class InMemoryAuditRepository implements AuditRepository {
   private records: AuditRecord[] = []
   private ids = new Set<string>()
-  private warned = false
 
   async append(record: AuditRecord): Promise<AppendResult> {
-    this.warnOnce()
     if (this.ids.has(record.id)) {
       return { record: this.records.find((item) => item.id === record.id) ?? record, deduped: true }
     }
@@ -148,45 +119,53 @@ export class InMemoryAuditRepository implements AuditRepository {
   }
 
   async list(limit: number): Promise<AuditRecord[]> {
-    this.warnOnce()
     return this.records.slice(0, Math.min(Math.max(limit, 1), 500))
-  }
-
-  private warnOnce(): void {
-    if (this.warned) return
-    this.warned = true
-    console.warn(
-      '[audit] No persistent audit store is configured on Vercel (KV_REST_API_URL/KV_REST_API_TOKEN are unset). ' +
-        'Audit records are kept in-memory only and will be lost on cold start or redeploy. ' +
-        'Configure Vercel KV (or any Upstash-compatible REST endpoint) for durable audit history.',
-    )
   }
 }
 
 // ---- Repository selection ----
 
-let cachedRepository: AuditRepository | null = null
+export type AuditBackend = 'kv' | 'file' | 'memory'
+
+export type AuditRepositoryStatus = {
+  repository: AuditRepository
+  /**
+   * false only in the one case that must never be silently OK: running on
+   * Vercel with no KV configured. Vercel's filesystem (including /tmp) is
+   * per-instance and wiped on cold start/redeploy, so this in-memory
+   * fallback exists purely so the app doesn't crash — it is NOT durable
+   * audit storage, and callers (see /api/audit) must surface that instead
+   * of quietly returning an empty history as if nothing had ever happened.
+   */
+  configured: boolean
+  backend: AuditBackend
+}
+
+let cachedStatus: AuditRepositoryStatus | null = null
 
 /**
  * Picks the right backend for the current deployment:
- *  - KV configured (works anywhere, incl. local dev if set) -> KvAuditRepository.
- *  - Running on Vercel without KV configured -> InMemoryAuditRepository, with
- *    a warning, so we never silently rely on Vercel's ephemeral /tmp.
+ *  - KV configured (works anywhere, incl. local dev if set) -> KvAuditRepository, configured.
+ *  - Running on Vercel without KV configured -> InMemoryAuditRepository, NOT configured.
  *  - Otherwise (local dev / self-hosted Docker, where CONTROL_DATA_DIR is a
- *    real persistent volume) -> FileAuditRepository.
+ *    real persistent volume) -> FileAuditRepository, configured.
  */
-export function getAuditRepository(): AuditRepository {
-  if (cachedRepository) return cachedRepository
+export function getAuditRepositoryStatus(): AuditRepositoryStatus {
+  if (cachedStatus) return cachedStatus
 
   const kvConfig = resolveKvConfig()
   if (kvConfig) {
-    cachedRepository = new KvAuditRepository(kvConfig)
-  } else if (process.env.VERCEL) {
-    cachedRepository = new InMemoryAuditRepository()
+    cachedStatus = { repository: new KvAuditRepository(kvConfig), configured: true, backend: 'kv' }
+  } else if (isRunningOnVercel()) {
+    cachedStatus = { repository: new InMemoryAuditRepository(), configured: false, backend: 'memory' }
   } else {
-    cachedRepository = new FileAuditRepository(getAuditFilePath())
+    cachedStatus = { repository: new FileAuditRepository(getAuditFilePath()), configured: true, backend: 'file' }
   }
-  return cachedRepository
+  return cachedStatus
+}
+
+export function getAuditRepository(): AuditRepository {
+  return getAuditRepositoryStatus().repository
 }
 
 function getAuditFilePath(): string {
@@ -194,7 +173,7 @@ function getAuditFilePath(): string {
   return path.join(dataDir, 'audit.jsonl')
 }
 
-/** Test-only: forces the next getAuditRepository() call to re-resolve the backend. */
+/** Test-only: forces the next getAuditRepositoryStatus() call to re-resolve the backend. */
 export function resetAuditRepositoryForTests(): void {
-  cachedRepository = null
+  cachedStatus = null
 }

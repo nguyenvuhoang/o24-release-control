@@ -20,6 +20,7 @@ const ACTION_LABELS: Record<string, string> = {
   promote: 'CHUYỂN TIẾP',
   restart: 'KHỞI ĐỘNG LẠI',
   rollback: 'QUAY LẠI PHIÊN BẢN',
+  build: 'BUILD',
 }
 
 function actionLabel(action: string): string {
@@ -33,9 +34,10 @@ type AuditLogPanelProps = {
   activeEnvironmentCode: string
   filter: AuditFilter
   onFilterChange: (filter: AuditFilter) => void
+  storageNotConfigured?: boolean
 }
 
-export function AuditLogPanel({ records, activeEnvironmentCode, filter, onFilterChange }: AuditLogPanelProps) {
+export function AuditLogPanel({ records, activeEnvironmentCode, filter, onFilterChange, storageNotConfigured }: AuditLogPanelProps) {
   const filtered = filter === 'all'
     ? records
     : records.filter((item) =>
@@ -75,10 +77,22 @@ export function AuditLogPanel({ records, activeEnvironmentCode, filter, onFilter
 
       {filtered.length === 0 ? (
         <div className="rounded border border-dashed border-slate-800 py-6 text-center">
-          <p className="text-sm text-slate-400">Chưa có thao tác triển khai</p>
-          <p className="mt-1 text-xs text-slate-600">
-            Các thao tác triển khai, khởi động lại hoặc quay phiên bản sẽ hiển thị tại đây.
-          </p>
+          {storageNotConfigured ? (
+            <>
+              <p className="text-sm text-amber-400">Chưa cấu hình kho lưu trữ lịch sử thao tác</p>
+              <p className="mt-1 text-xs text-slate-600">
+                Đặt KV_REST_API_URL / KV_REST_API_TOKEN (hoặc UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN) để
+                bật lưu trữ lâu dài trên Vercel.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-sm text-slate-400">Chưa có thao tác triển khai</p>
+              <p className="mt-1 text-xs text-slate-600">
+                Các thao tác triển khai, khởi động lại hoặc quay phiên bản sẽ hiển thị tại đây.
+              </p>
+            </>
+          )}
         </div>
       ) : (
         <div className="grid gap-2">

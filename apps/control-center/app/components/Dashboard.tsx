@@ -13,6 +13,7 @@ import type {
   ServiceStatus,
 } from '../../lib/types'
 import { githubServiceForAgentCode } from '../../lib/github/serviceMap'
+import type { BuildServiceCode } from '../../lib/github/serviceMap'
 import { readJsonSafe } from '../../lib/http'
 import { escapeHtml, SwalAlert } from '../../lib/swalAlert'
 import type { AuditFilter } from './release-control/AuditLogPanel'
@@ -61,6 +62,7 @@ export default function Dashboard({ username }: Props) {
 
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null)
   const [audit, setAudit] = useState<AuditRecord[]>([])
+  const [auditStorageNotConfigured, setAuditStorageNotConfigured] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState<BusyAction>(null)
@@ -83,7 +85,7 @@ export default function Dashboard({ username }: Props) {
   // the deploy/restart/rollback/promote operation model above: it never
   // touches a running container, so it gets its own state and its own
   // dialog/drawer instead of reusing `busy` / `activeOperation`.
-  const { builds, getBuildState, triggerBuild, syncBuild } = useBuildTracker()
+  const { builds, getBuildState, triggerBuild, syncBuild, hydrateFromServer } = useBuildTracker()
   const [buildDialogTarget, setBuildDialogTarget] = useState<{ environment: EnvironmentDashboard; service: ServiceStatus } | null>(null)
   const [buildDetailTarget, setBuildDetailTarget] = useState<{ githubService: string; serviceLabel: string } | null>(null)
   const previousBuildStatuses = useRef<Record<string, BuildTrackedStatus>>({})
@@ -102,10 +104,21 @@ export default function Dashboard({ username }: Props) {
       const dashboardBody = await readJsonSafe<DashboardResponse & { details?: string; error?: string }>(dashboardResponse)
       const auditBody = await readJsonSafe<{ items?: AuditRecord[]; details?: string; error?: string }>(auditResponse)
       if (!dashboardResponse.ok) throw new Error(dashboardBody?.details ?? dashboardBody?.error ?? 'Không tải được dashboard')
-      if (!auditResponse.ok) throw new Error(auditBody?.details ?? auditBody?.error ?? 'Không tải được lịch sử thao tác')
       if (!dashboardBody) throw new Error('Không tải được dashboard')
       setDashboard(dashboardBody)
-      setAudit(auditBody?.items ?? [])
+
+      // Audit storage not being configured (Vercel without KV) must not take
+      // the whole dashboard down — only the audit panel needs to know, so it
+      // can show a distinct "not configured" message instead of an empty
+      // history. Any OTHER audit fetch failure is treated the same way
+      // (fail soft): the rest of the app stays usable either way.
+      if (auditResponse.ok) {
+        setAudit(auditBody?.items ?? [])
+        setAuditStorageNotConfigured(false)
+      } else {
+        setAudit([])
+        setAuditStorageNotConfigured(auditBody?.error === 'audit_storage_not_configured')
+      }
       setError('')
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Không tải được dữ liệu')
@@ -119,6 +132,25 @@ export default function Dashboard({ username }: Props) {
     const timer = window.setInterval(() => void refresh(true), 15_000)
     return () => window.clearInterval(timer)
   }, [refresh])
+
+  // Loads each buildable service's latest GitHub Actions build state
+  // straight from the server as soon as the dashboard knows which services
+  // those are (DEV environment services that map to a build-service code) —
+  // regardless of whether this browser/device ever triggered or tracked
+  // that build itself. hydrateFromServer is a cheap no-op for services
+  // already confirmed this session, so re-running this on every dashboard
+  // refresh (not just the first) also means a service whose discovery
+  // failed once (e.g. a transient GitHub API error) gets retried instead of
+  // being stuck showing only "Build" forever.
+  useEffect(() => {
+    const devEnvironment = dashboard?.environments?.[0]
+    if (!devEnvironment) return
+    const buildableServices = devEnvironment.services
+      .map((service) => githubServiceForAgentCode(service.code))
+      .filter((code): code is BuildServiceCode => code !== null)
+    if (buildableServices.length === 0) return
+    hydrateFromServer(buildableServices)
+  }, [dashboard, hydrateFromServer])
 
   // Toasts the terminal outcome of a build exactly once, by diffing against
   // the status seen on the previous render — polling itself lives inside
@@ -591,6 +623,7 @@ export default function Dashboard({ username }: Props) {
         activeEnvironmentCode={activeEnvironmentCode}
         filter={auditFilter}
         onFilterChange={setAuditFilter}
+        storageNotConfigured={auditStorageNotConfigured}
       />
 
       {logs ? <LogsModal title={logs.title} content={logs.content} onClose={() => setLogs(null)} /> : null}

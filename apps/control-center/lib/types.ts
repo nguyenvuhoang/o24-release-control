@@ -140,6 +140,14 @@ export type BuildRunSnapshot = {
   runAttempt?: number
 }
 
+// Response of GET /api/builds/latest?service=<code> — server-side discovery
+// of the newest GitHub Actions run for a service, so the UI never needs to
+// rely on having seen/remembered a runId itself (see docs on
+// findLatestGithubRunForService for how "newest run for this service" is
+// determined). runId is null when no run could be found for the service at
+// all — a real, valid answer ("no build has happened yet"), not an error.
+export type LatestBuildResponse = { service: string; runId: null } | ({ service: string } & BuildRunSnapshot)
+
 export type BuildJobStepStatus = 'queued' | 'in_progress' | 'completed'
 
 export type BuildJobStep = {

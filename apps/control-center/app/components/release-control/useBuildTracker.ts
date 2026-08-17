@@ -7,6 +7,17 @@ import type { BuildConclusion, BuildRunStatus } from '../../../lib/types'
 // Tracks GitHub Actions build state per GitHub build-service code (e.g.
 // "CMS"), independent of any environment or the deploy/restart/rollback
 // operation model — a build never touches a running container.
+//
+// GitHub itself (via /api/builds/latest and /api/builds/{runId}, both
+// server-side) is the source of truth for this state, NOT this hook's memory
+// and NOT localStorage — a build can originate outside this app entirely
+// (Telegram, a direct GitHub-UI dispatch or Re-run, another browser/device),
+// so nothing here is trusted until it's been confirmed by a live GitHub
+// read. localStorage is used only as an optimistic first-paint cache (see
+// PersistedBuild's cached* fields) to avoid a blank flash before that first
+// read resolves — every value it seeds is overwritten as soon as the
+// corresponding server call returns, whether that's from hydrateFromServer
+// on dashboard load, the background poller, or a manual "Đồng bộ trạng thái".
 export type BuildTrackedStatus = 'triggering' | 'queued' | 'in_progress' | 'success' | 'failed'
 
 export type BuildTrackedState = {
@@ -22,16 +33,21 @@ export type BuildTrackedState = {
   updatedAt?: string
 }
 
-type BuildRunResult = {
+type ApiErrorBody = { error?: string; details?: string }
+
+// Shape shared by GET /api/builds/{runId} and GET /api/builds/latest once a
+// run has actually been found — both are "one live GitHub run snapshot".
+type RunSnapshotResult = {
   runId: number
   status: BuildRunStatus
   conclusion: BuildConclusion
   htmlUrl: string
   updatedAt: string
   runAttempt?: number
+  branch?: string
 }
 
-type ApiErrorBody = { error?: string; details?: string }
+type LatestBuildResult = ({ service: string; runId: null }) | ({ service: string } & RunSnapshotResult)
 
 // null return means "stop polling"; a number is the delay before the next poll.
 type PollOutcome = { nextDelayMs: number | null }
@@ -91,18 +107,23 @@ export function deriveBuildUpdate(
   }
 }
 
-// Only what's needed to re-query GitHub after a page refresh — deliberately
-// NOT status/conclusion, which must always come from a fresh GitHub read,
-// never from client memory (including whatever was last written here).
+// Purely an optimistic first-paint cache — see the module doc comment above.
+// cached* fields are never treated as fact; only used to seed initial state
+// before the first live GitHub read of this session resolves.
 type PersistedBuild = {
   runId: number
   tag?: string
   branch?: string
   runUrl?: string
   slowWatchDeadline?: number
+  cachedStatus?: BuildTrackedStatus
+  cachedConclusion?: BuildConclusion
+  cachedRunAttempt?: number
+  cachedHtmlUrl?: string
+  cachedUpdatedAt?: string
 }
 
-const STORAGE_KEY = 'o24-release-control:tracked-builds:v1'
+const STORAGE_KEY = 'o24-release-control:tracked-builds:v2'
 
 function loadPersistedBuilds(): Record<string, PersistedBuild> {
   if (typeof window === 'undefined') return {}
@@ -128,17 +149,41 @@ function savePersistedBuilds(entries: Record<string, PersistedBuild>): void {
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(entries))
   } catch {
-    // Best-effort only — persistence just avoids a manual re-sync after a
-    // page refresh; safe to skip silently if storage is unavailable/full.
+    // Best-effort only — this is a UX cache, not a data store; safe to skip
+    // silently if storage is unavailable/full/disabled.
   }
 }
 
+function initialBuildsFromCache(): Record<string, BuildTrackedState> {
+  const initial: Record<string, BuildTrackedState> = {}
+  for (const [service, entry] of Object.entries(loadPersistedBuilds())) {
+    if (!entry.cachedStatus) continue
+    initial[service] = {
+      status: entry.cachedStatus,
+      runId: entry.runId,
+      runUrl: entry.runUrl,
+      tag: entry.tag,
+      branch: entry.branch,
+      conclusion: entry.cachedConclusion,
+      runAttempt: entry.cachedRunAttempt,
+      htmlUrl: entry.cachedHtmlUrl,
+      updatedAt: entry.cachedUpdatedAt,
+    }
+  }
+  return initial
+}
+
 export function useBuildTracker() {
-  const [builds, setBuilds] = useState<Record<string, BuildTrackedState>>({})
+  const [builds, setBuilds] = useState<Record<string, BuildTrackedState>>(initialBuildsFromCache)
   const buildsRef = useRef<Record<string, BuildTrackedState>>({})
   const timers = useRef<Map<string, number>>(new Map())
   const slowWatchDeadline = useRef<Map<string, number>>(new Map())
   const consecutiveErrors = useRef<Map<string, number>>(new Map())
+  // Services whose state has been confirmed by an actual GitHub read (or a
+  // dispatch response) THIS session — distinct from merely appearing in
+  // `builds`, which can also be true from an unverified localStorage-cache
+  // seed. hydrateFromServer only skips services already in this set.
+  const verifiedThisSession = useRef<Set<string>>(new Set())
 
   useEffect(() => {
     buildsRef.current = builds
@@ -158,16 +203,63 @@ export function useBuildTracker() {
     savePersistedBuilds(all)
   }, [])
 
-  // Does a single live GitHub read via /api/builds/{runId} and applies it to
-  // state, returning how long to wait before the next poll (or null to stop).
-  // Used identically by the background polling loop, the mount-time
-  // rehydrate, and the manual "Đồng bộ trạng thái" sync — one code path, so
-  // all three always agree on what "current" means.
+  // Applies one live GitHub run snapshot to state + the optimistic cache,
+  // returning how long to wait before the next poll (or null to stop).
+  // Shared by the per-runId background poller and the latest-build sync path
+  // so both always agree on what "current" means and never disagree on the
+  // slow-watch deadline for the same service.
+  const applyRunResult = useCallback(
+    (service: string, snapshot: RunSnapshotResult): number | null => {
+      verifiedThisSession.current.add(service)
+      const update = deriveBuildUpdate(snapshot, slowWatchDeadline.current.get(service), Date.now())
+      if (update.slowWatchDeadline === undefined) {
+        slowWatchDeadline.current.delete(service)
+      } else {
+        slowWatchDeadline.current.set(service, update.slowWatchDeadline)
+      }
+      persistEntry(service, {
+        runId: snapshot.runId,
+        branch: snapshot.branch,
+        slowWatchDeadline: update.slowWatchDeadline,
+        cachedStatus: update.status,
+        cachedConclusion: update.conclusion,
+        cachedRunAttempt: snapshot.runAttempt,
+        cachedHtmlUrl: snapshot.htmlUrl,
+        cachedUpdatedAt: snapshot.updatedAt,
+      })
+
+      setBuilds((prev) => {
+        const current = prev[service]
+        return {
+          ...prev,
+          [service]: {
+            ...current,
+            status: update.status,
+            conclusion: update.conclusion,
+            runId: snapshot.runId,
+            runAttempt: snapshot.runAttempt,
+            htmlUrl: snapshot.htmlUrl,
+            branch: snapshot.branch ?? current?.branch,
+            updatedAt: snapshot.updatedAt,
+            error: update.status === 'failed' ? current?.error : undefined,
+          },
+        }
+      })
+
+      return update.nextDelayMs
+    },
+    [persistEntry],
+  )
+
+  // Does a single live GitHub read via /api/builds/{runId} — cheap and
+  // precise once a runId is already known (the background poll loop and any
+  // GitHub "Re-run failed jobs" on that same runId are both handled here,
+  // since GitHub's per-run endpoint always reflects the latest attempt).
   const pollRun = useCallback(
     async (service: string, runId: number): Promise<PollOutcome> => {
       try {
         const response = await fetch(`/api/builds/${runId}?service=${encodeURIComponent(service)}`, { cache: 'no-store' })
-        const data = await readJsonSafe<BuildRunResult & ApiErrorBody>(response)
+        const data = await readJsonSafe<RunSnapshotResult & ApiErrorBody>(response)
         if (!response.ok || !data) {
           throw new Error(data?.details ?? data?.error ?? `Không lấy được trạng thái build (mã ${response.status})`)
         }
@@ -175,41 +267,11 @@ export function useBuildTracker() {
 
         // A newer build (or nothing at all) has since taken over this
         // service's tracking slot — this response is for a stale runId.
-        // Bail out before touching any shared/persisted state so a slow
-        // in-flight poll for an old run can never clobber the new one's
-        // slow-watch deadline or storage entry.
         if (buildsRef.current[service]?.runId !== runId) {
           return { nextDelayMs: null }
         }
 
-        const update = deriveBuildUpdate(data, slowWatchDeadline.current.get(service), Date.now())
-        if (update.slowWatchDeadline === undefined) {
-          slowWatchDeadline.current.delete(service)
-        } else {
-          slowWatchDeadline.current.set(service, update.slowWatchDeadline)
-        }
-        persistEntry(service, { slowWatchDeadline: update.slowWatchDeadline })
-
-        setBuilds((prev) => {
-          const current = prev[service]
-          // A newer build (or nothing at all) has since taken over this
-          // service's tracking slot — this response is for a stale runId.
-          if (!current || current.runId !== runId) return prev
-          return {
-            ...prev,
-            [service]: {
-              ...current,
-              status: update.status,
-              conclusion: update.conclusion,
-              runAttempt: data.runAttempt,
-              htmlUrl: data.htmlUrl,
-              updatedAt: data.updatedAt,
-              error: update.status === 'failed' ? current.error : undefined,
-            },
-          }
-        })
-
-        return { nextDelayMs: update.nextDelayMs }
+        return { nextDelayMs: applyRunResult(service, data) }
       } catch (caught) {
         const message = caught instanceof Error ? caught.message : 'Không lấy được trạng thái build'
         const errorCount = (consecutiveErrors.current.get(service) ?? 0) + 1
@@ -232,12 +294,12 @@ export function useBuildTracker() {
         return { nextDelayMs: retryDelay }
       }
     },
-    [persistEntry],
+    [applyRunResult],
   )
 
-  // pollRunRef breaks the pollRun <-> scheduleNext circular dependency: the
-  // scheduled setTimeout always calls through the ref, so scheduleNext never
-  // needs pollRun in its own deps.
+  // pollRunRef breaks the pollRun <-> runAndSchedule circular dependency: the
+  // scheduled setTimeout always calls through the ref, so runAndSchedule
+  // never needs pollRun in its own deps.
   const pollRunRef = useRef(pollRun)
   useEffect(() => {
     pollRunRef.current = pollRun
@@ -246,12 +308,10 @@ export function useBuildTracker() {
   const runAndSchedule = useCallback(
     async (service: string, runId: number) => {
       const { nextDelayMs } = await pollRunRef.current(service, runId)
+      clearTimer(service)
       if (nextDelayMs !== null) {
-        clearTimer(service)
         const handle = window.setTimeout(() => void runAndScheduleRef.current(service, runId), nextDelayMs)
         timers.current.set(service, handle)
-      } else {
-        clearTimer(service)
       }
     },
     [clearTimer],
@@ -261,37 +321,51 @@ export function useBuildTracker() {
     runAndScheduleRef.current = runAndSchedule
   }, [runAndSchedule])
 
-  // Rehydrate on mount: restore which runs were being tracked, then always
-  // re-query GitHub for their CURRENT state — never trust the status/
-  // conclusion this session last saw, since a "Re-run failed jobs" on GitHub
-  // could have happened while the tab was closed or reloaded.
-  useEffect(() => {
-    const persisted = loadPersistedBuilds()
-    const entries = Object.entries(persisted)
-    if (entries.length === 0) return
+  // Does a live discovery read via /api/builds/latest — the server queries
+  // GitHub Actions directly for the newest run it can identify as belonging
+  // to this service (see findLatestGithubRunForService), independent of
+  // whether THIS app dispatched it, tracked it before, or has ever seen this
+  // browser/device. Used for the initial per-service hydrate and for the
+  // manual "Đồng bộ trạng thái" action — both cases where we can't just
+  // reuse a remembered runId.
+  const syncFromLatest = useCallback(
+    async (service: string): Promise<void> => {
+      try {
+        const response = await fetch(`/api/builds/latest?service=${encodeURIComponent(service)}`, { cache: 'no-store' })
+        const data = await readJsonSafe<LatestBuildResult & ApiErrorBody>(response)
+        if (!response.ok || !data) return
+        verifiedThisSession.current.add(service)
+        if (data.runId === null) return // a real "no build found" answer — nothing to schedule
 
-    setBuilds((prev) => {
-      const next = { ...prev }
-      for (const [service, entry] of entries) {
-        if (next[service]) continue
-        next[service] = {
-          status: 'in_progress', // placeholder, corrected by the immediate re-query below
-          runId: entry.runId,
-          runUrl: entry.runUrl,
-          tag: entry.tag,
-          branch: entry.branch,
+        const nextDelayMs = applyRunResult(service, data)
+        clearTimer(service)
+        if (nextDelayMs !== null) {
+          const handle = window.setTimeout(() => void runAndScheduleRef.current(service, data.runId as number), nextDelayMs)
+          timers.current.set(service, handle)
         }
+      } catch {
+        // Best-effort discovery: leaves this service's card falling back to
+        // "no known run yet" (or whatever the optimistic cache showed) —
+        // triggering a build or a later manual sync still works normally.
       }
-      return next
-    })
+    },
+    [applyRunResult, clearTimer],
+  )
 
-    for (const [service, entry] of entries) {
-      if (entry.slowWatchDeadline) slowWatchDeadline.current.set(service, entry.slowWatchDeadline)
-      void runAndScheduleRef.current(service, entry.runId)
-    }
-    // Intentionally mount-only.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  // Called once the dashboard knows which services support build (DEV
+  // environment services that map to a GitHub build-service code). Fetches
+  // each service's latest state from GitHub, skipping any service already
+  // confirmed this session (a just-triggered build, or an already-completed
+  // hydrate) — safe to call more than once.
+  const hydrateFromServer = useCallback(
+    (services: string[]) => {
+      for (const service of services) {
+        if (verifiedThisSession.current.has(service)) continue
+        void syncFromLatest(service)
+      }
+    },
+    [syncFromLatest],
+  )
 
   const triggerBuild = useCallback(
     async (service: string, options: { branch: string; tag: string }): Promise<void> => {
@@ -315,6 +389,7 @@ export function useBuildTracker() {
           throw new Error(result?.details ?? result?.error ?? `Yêu cầu build thất bại (mã ${response.status})`)
         }
         const runId = result.runId
+        verifiedThisSession.current.add(service)
         setBuilds((prev) => ({
           ...prev,
           [service]: {
@@ -326,7 +401,18 @@ export function useBuildTracker() {
             branch: options.branch,
           },
         }))
-        persistEntry(service, { runId, runUrl: result.runUrl, tag: options.tag, branch: options.branch, slowWatchDeadline: undefined })
+        persistEntry(service, {
+          runId,
+          runUrl: result.runUrl,
+          tag: options.tag,
+          branch: options.branch,
+          slowWatchDeadline: undefined,
+          cachedStatus: 'queued',
+          cachedConclusion: undefined,
+          cachedRunAttempt: undefined,
+          cachedHtmlUrl: result.htmlUrl,
+          cachedUpdatedAt: undefined,
+        })
         clearTimer(service)
         const handle = window.setTimeout(() => void runAndScheduleRef.current(service, runId), FAST_INTERVAL_MS)
         timers.current.set(service, handle)
@@ -339,16 +425,17 @@ export function useBuildTracker() {
     [clearTimer, persistEntry],
   )
 
-  // Manual "Đồng bộ trạng thái": re-checks a build currently shown as
-  // success/failed (e.g. after the user re-ran it directly on GitHub) via
-  // the exact same live GitHub read the background poller uses, then resumes
-  // whatever polling cadence that fresh state implies — including switching
-  // back to fast polling if GitHub now shows it queued/in_progress again.
-  // This never triggers a new workflow run (no POST to /api/builds).
-  const syncBuild = useCallback((service: string) => {
-    const runId = buildsRef.current[service]?.runId
-    if (runId !== undefined) void runAndScheduleRef.current(service, runId)
-  }, [])
+  // Manual "Đồng bộ trạng thái": always re-discovers this service's latest
+  // build straight from GitHub via /api/builds/latest — not a remembered
+  // runId, not localStorage — then resumes whatever polling cadence that
+  // fresh state implies. This never triggers a new workflow run (no POST to
+  // /api/builds).
+  const syncBuild = useCallback(
+    (service: string) => {
+      void syncFromLatest(service)
+    },
+    [syncFromLatest],
+  )
 
   const getBuildState = useCallback((service: string) => builds[service], [builds])
 
@@ -360,5 +447,5 @@ export function useBuildTracker() {
     }
   }, [])
 
-  return { builds, getBuildState, triggerBuild, syncBuild }
+  return { builds, getBuildState, triggerBuild, syncBuild, hydrateFromServer }
 }
