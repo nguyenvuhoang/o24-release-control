@@ -19,6 +19,7 @@ type ServiceCardProps = {
   onLogs: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onBuild: (environment: EnvironmentDashboard, service: ServiceStatus) => void
   onViewBuild: (service: ServiceStatus) => void
+  onSyncBuild: (service: ServiceStatus) => void
 }
 
 const BUTTON_BASE =
@@ -47,6 +48,7 @@ export function ServiceCard({
   onLogs,
   onBuild,
   onViewBuild,
+  onSyncBuild,
 }: ServiceCardProps) {
   const disabled = isBusy || !environment.online
 
@@ -144,7 +146,12 @@ export function ServiceCard({
         <div className="mb-2.5 rounded border border-slate-800/70 bg-slate-950/30 px-2.5 py-2 text-[11px] leading-relaxed">
           <div className="mb-1.5 flex items-center justify-between gap-2">
             <StatusBadge tone={buildStatusTone(buildState.status)} label={buildStatusLabel(buildState.status)} />
-            {buildState.runId ? <span className="text-slate-600">Run #{buildState.runId}</span> : null}
+            {buildState.runId ? (
+              <span className="text-slate-600">
+                Run #{buildState.runId}
+                {buildState.runAttempt ? ` · Attempt ${buildState.runAttempt}` : ''}
+              </span>
+            ) : null}
           </div>
           {buildState.status === 'success' && githubService ? (
             <div className="mb-1.5 min-w-0">
@@ -164,14 +171,24 @@ export function ServiceCard({
               </button>
             ) : null}
             {buildState.status === 'success' || buildState.status === 'failed' ? (
-              <button
-                type="button"
-                disabled={disabled}
-                onClick={() => onBuild(environment, service)}
-                className="font-medium text-slate-400 hover:underline disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                Build lại
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={() => onSyncBuild(service)}
+                  title="Đọc lại trạng thái build hiện tại từ GitHub — hữu ích sau khi Re-run trực tiếp trên GitHub"
+                  className="font-medium text-slate-400 hover:underline"
+                >
+                  Đồng bộ trạng thái
+                </button>
+                <button
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => onBuild(environment, service)}
+                  className="font-medium text-slate-400 hover:underline disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Build lại
+                </button>
+              </>
             ) : null}
           </div>
         </div>

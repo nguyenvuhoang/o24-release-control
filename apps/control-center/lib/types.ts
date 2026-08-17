@@ -134,6 +134,10 @@ export type BuildRunSnapshot = {
   commitSha: string
   createdAt: string
   updatedAt: string
+  // GitHub increments this every time a run is re-run ("Re-run failed jobs",
+  // "Re-run all jobs"), while runId itself stays the same — required to tell
+  // a fresh re-run attempt apart from the original attempt that produced it.
+  runAttempt?: number
 }
 
 export type BuildJobStepStatus = 'queued' | 'in_progress' | 'completed'

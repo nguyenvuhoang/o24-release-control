@@ -18,6 +18,7 @@ type EnvironmentPanelProps = {
   onLogs: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onBuild: (environment: EnvironmentDashboard, service: ServiceStatus) => void
   onViewBuild: (service: ServiceStatus) => void
+  onSyncBuild: (service: ServiceStatus) => void
   onRetry: () => void
 }
 
@@ -35,6 +36,7 @@ export function EnvironmentPanel({
   onLogs,
   onBuild,
   onViewBuild,
+  onSyncBuild,
   onRetry,
 }: EnvironmentPanelProps) {
   return (
@@ -105,6 +107,7 @@ export function EnvironmentPanel({
                   onLogs={onLogs}
                   onBuild={onBuild}
                   onViewBuild={onViewBuild}
+                  onSyncBuild={onSyncBuild}
                 />
               ))}
             </div>

@@ -83,7 +83,7 @@ export default function Dashboard({ username }: Props) {
   // the deploy/restart/rollback/promote operation model above: it never
   // touches a running container, so it gets its own state and its own
   // dialog/drawer instead of reusing `busy` / `activeOperation`.
-  const { builds, getBuildState, triggerBuild } = useBuildTracker()
+  const { builds, getBuildState, triggerBuild, syncBuild } = useBuildTracker()
   const [buildDialogTarget, setBuildDialogTarget] = useState<{ environment: EnvironmentDashboard; service: ServiceStatus } | null>(null)
   const [buildDetailTarget, setBuildDetailTarget] = useState<{ githubService: string; serviceLabel: string } | null>(null)
   const previousBuildStatuses = useRef<Record<string, BuildTrackedStatus>>({})
@@ -126,11 +126,18 @@ export default function Dashboard({ username }: Props) {
   // the poll request that first observes "completed" (see
   // /api/builds/[runId]), so by the time this effect sees the status
   // transition, refreshing /api/audit is guaranteed to pick it up.
+  //
+  // Both branches require previousStatus !== undefined: after a page
+  // refresh, useBuildTracker rehydrates a previously-tracked build and its
+  // FIRST appearance in `builds` can already be 'success' or 'failed' (from
+  // the live re-query, not stale memory) — without this guard that would
+  // read as a fresh transition and pop a toast for a build that actually
+  // finished in an earlier session.
   useEffect(() => {
     for (const [service, state] of Object.entries(builds)) {
       const previousStatus = previousBuildStatuses.current[service]
       if (previousStatus !== state.status) {
-        if (state.status === 'success') {
+        if (state.status === 'success' && previousStatus !== undefined) {
           SwalAlert.toast(`Build ${service} thành công`)
           void refresh(true)
         } else if (state.status === 'failed' && previousStatus !== undefined) {
@@ -480,6 +487,15 @@ export default function Dashboard({ username }: Props) {
     setBuildDetailTarget({ githubService, serviceLabel: service.displayName || service.code })
   }
 
+  // Re-reads the build's current status straight from GitHub — e.g. after
+  // the user hit "Re-run failed jobs" on GitHub itself. Never dispatches a
+  // new workflow run.
+  function syncBuildStatus(service: ServiceStatus) {
+    const githubService = githubServiceForAgentCode(service.code)
+    if (!githubService) return
+    syncBuild(githubService)
+  }
+
   const getBuildStateForService = useCallback(
     (service: ServiceStatus) => {
       const githubService = githubServiceForAgentCode(service.code)
@@ -560,6 +576,7 @@ export default function Dashboard({ username }: Props) {
             onLogs={viewLogs}
             onBuild={openBuildDialog}
             onViewBuild={openBuildDetail}
+            onSyncBuild={syncBuildStatus}
             onRetry={() => void refresh(true)}
           />
         ) : !dashboard && loading ? (
@@ -603,6 +620,7 @@ export default function Dashboard({ username }: Props) {
         <BuildDetailDrawer
           serviceLabel={buildDetailTarget.serviceLabel}
           runId={buildDetailState.runId}
+          runAttempt={buildDetailState.runAttempt}
           htmlUrl={buildDetailState.htmlUrl}
           status={buildDetailState.status}
           onClose={() => setBuildDetailTarget(null)}

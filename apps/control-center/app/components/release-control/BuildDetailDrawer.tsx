@@ -8,6 +8,7 @@ import type { BuildTrackedStatus } from './useBuildTracker'
 type BuildDetailDrawerProps = {
   serviceLabel: string
   runId: number
+  runAttempt?: number
   htmlUrl?: string
   status: BuildTrackedStatus
   onClose: () => void
@@ -23,7 +24,7 @@ const STATUS_BADGE: Record<BuildTrackedStatus, { label: string; className: strin
 
 const RUNNING_STATUSES: BuildTrackedStatus[] = ['triggering', 'queued', 'in_progress']
 
-export function BuildDetailDrawer({ serviceLabel, runId, htmlUrl, status, onClose }: BuildDetailDrawerProps) {
+export function BuildDetailDrawer({ serviceLabel, runId, runAttempt, htmlUrl, status, onClose }: BuildDetailDrawerProps) {
   const [jobs, setJobs] = useState<BuildJob[]>([])
   const [error, setError] = useState<string>()
   const [loading, setLoading] = useState(true)
@@ -69,7 +70,10 @@ export function BuildDetailDrawer({ serviceLabel, runId, htmlUrl, status, onClos
       <section className="flex h-full w-full max-w-lg flex-col border-l border-slate-800 bg-slate-950 shadow-2xl shadow-black/50">
         <div className="flex items-start justify-between gap-4 border-b border-slate-800 px-5 py-4">
           <div className="min-w-0">
-            <p className="mb-1 text-[11px] tracking-wide text-slate-500">BUILD · RUN #{runId}</p>
+            <p className="mb-1 text-[11px] tracking-wide text-slate-500">
+              BUILD · RUN #{runId}
+              {runAttempt ? ` · ATTEMPT ${runAttempt}` : ''}
+            </p>
             <h2 className="truncate text-base font-semibold text-slate-100">{serviceLabel}</h2>
           </div>
           <span className={`inline-flex shrink-0 items-center gap-1.5 rounded px-2 py-1 text-[11px] font-semibold ${badge.className}`}>

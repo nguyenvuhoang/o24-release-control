@@ -69,6 +69,7 @@ type GithubRunResponse = {
   head_sha: string
   created_at: string
   updated_at: string
+  run_attempt?: number
 }
 
 type GithubStep = { name: string; status: string; conclusion: string | null; number: number }
@@ -84,6 +85,7 @@ function normalizeRun(run: GithubRunResponse): BuildRunSnapshot {
     commitSha: run.head_sha,
     createdAt: run.created_at,
     updatedAt: run.updated_at,
+    runAttempt: run.run_attempt,
   }
 }
 
@@ -156,6 +158,11 @@ export async function triggerWorkflowBuild(input: {
   return { runId: run.id, runUrl: run.url, htmlUrl: run.html_url }
 }
 
+// GitHub's "get a workflow run" endpoint (unlike the per-attempt variant
+// under .../attempts/{n}) always reflects the LATEST attempt's status and
+// conclusion — combined with cache: 'no-store' in githubRequest, every call
+// here reads GitHub's current state fresh; nothing about a previous
+// (e.g. failed) attempt is ever cached or reused.
 export async function getWorkflowRun(runId: number): Promise<BuildRunSnapshot> {
   const { owner, repo } = githubConfig()
   const data = await githubRequest<GithubRunResponse>(`/repos/${owner}/${repo}/actions/runs/${runId}`)
