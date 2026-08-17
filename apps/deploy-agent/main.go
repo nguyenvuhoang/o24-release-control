@@ -88,6 +88,17 @@ type StatusResponse struct {
 	Timestamp       time.Time `json:"timestamp"`
 }
 
+// ServiceStatus reports three distinct image identifiers that must never be
+// confused with one another:
+//   - ImageRef: the reference the container was actually started from
+//     (container Config.Image — e.g. "repo@sha256:..." or "repo:latest").
+//   - ImageID: the local Docker image ID (container inspect .Image /
+//     `sha256:<id>`). This is a local content hash, NOT a registry digest,
+//     and must never be shown or used as one.
+//   - RepoDigest: the immutable registry digest ("repo@sha256:...") for
+//     ImageRepository, resolved either directly from ImageRef or by matching
+//     the running image's RepoDigests. This is the only identifier safe to
+//     use for promotion and DEV/UAT digest comparisons.
 type ServiceStatus struct {
 	Code            string            `json:"code"`
 	DisplayName     string            `json:"displayName"`
@@ -95,9 +106,9 @@ type ServiceStatus struct {
 	ContainerName   string            `json:"containerName"`
 	Status          string            `json:"status"`
 	Health          string            `json:"health"`
-	Image           string            `json:"image"`
+	ImageRef        string            `json:"imageRef"`
 	ImageID         string            `json:"imageId"`
-	Digest          string            `json:"digest,omitempty"`
+	RepoDigest      string            `json:"repoDigest,omitempty"`
 	GitRevision     string            `json:"gitRevision,omitempty"`
 	StartedAt       string            `json:"startedAt,omitempty"`
 	Labels          map[string]string `json:"labels,omitempty"`
@@ -842,27 +853,46 @@ func (a *App) inspectService(parent context.Context, svc ServiceConfig) ServiceS
 	if item.State.Health != nil {
 		result.Health = item.State.Health.Status
 	}
-	result.Image = item.Config.Image
+	result.ImageRef = item.Config.Image
 	result.ImageID = item.Image
 	result.StartedAt = item.State.StartedAt
 	result.Labels = item.Config.Labels
 
+	var repoDigests []string
 	imageOutput, imageErr := runCommand(ctx, "docker", "image", "inspect", item.Image)
 	if imageErr == nil {
 		var images []imageInspect
 		if json.Unmarshal([]byte(imageOutput), &images) == nil && len(images) > 0 {
-			for _, repoDigest := range images[0].RepoDigests {
-				if strings.HasPrefix(repoDigest, svc.ImageRepository+"@sha256:") {
-					result.Digest = strings.TrimPrefix(repoDigest, svc.ImageRepository+"@")
-					break
-				}
-			}
+			repoDigests = images[0].RepoDigests
 			if images[0].Config.Labels != nil {
 				result.GitRevision = images[0].Config.Labels["org.opencontainers.image.revision"]
 			}
 		}
 	}
+	result.RepoDigest = resolveRepoDigest(item.Config.Image, svc.ImageRepository, repoDigests)
 	return result
+}
+
+// resolveRepoDigest resolves the immutable registry digest for a service's
+// image, distinct from the local Docker image ID. Two paths, tried in order:
+//  1. If configImage (container Config.Image) is already an immutable
+//     "repo@sha256:..." reference for imageRepository, the digest is read
+//     directly from it — no ambiguity possible.
+//  2. Otherwise (e.g. configImage is "repo:latest"), fall back to matching
+//     repoDigests (from `docker image inspect` on the running image) against
+//     imageRepository, since the tag alone doesn't carry a digest.
+// Returns "" if neither path yields a digest for imageRepository.
+func resolveRepoDigest(configImage, imageRepository string, repoDigests []string) string {
+	prefix := imageRepository + "@sha256:"
+	if strings.HasPrefix(configImage, prefix) {
+		return strings.TrimPrefix(configImage, imageRepository+"@")
+	}
+	for _, repoDigest := range repoDigests {
+		if strings.HasPrefix(repoDigest, prefix) {
+			return strings.TrimPrefix(repoDigest, imageRepository+"@")
+		}
+	}
+	return ""
 }
 
 func (a *App) findService(code string) (ServiceConfig, bool) {

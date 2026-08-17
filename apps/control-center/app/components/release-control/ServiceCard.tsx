@@ -73,7 +73,7 @@ export function ServiceCard({
       key: 'promote',
       label: `Chuyển tiếp → ${nextEnvironment.code}`,
       variant: 'secondary',
-      disabled: disabled || !service.digest,
+      disabled: disabled || !service.repoDigest,
       onClick: () => void onPromote(environment, service),
     })
   }
@@ -107,7 +107,7 @@ export function ServiceCard({
       <div className="mb-2.5 min-w-0">
         <dt className="mb-0.5 text-[10px] tracking-wide text-slate-500 uppercase">Image</dt>
         <dd className="m-0">
-          <CopyableValue value={service.image} className="text-xs" />
+          <CopyableValue value={service.imageRef} className="text-xs" />
         </dd>
       </div>
 
@@ -115,7 +115,7 @@ export function ServiceCard({
         <div className="min-w-0">
           <dt className="mb-0.5 text-[10px] tracking-wide text-slate-500 uppercase">Digest</dt>
           <dd className="m-0">
-            <CopyableValue value={service.digest} className="text-xs" />
+            <CopyableValue value={service.repoDigest} className="text-xs" />
           </dd>
         </div>
         <div className="min-w-0">
@@ -129,6 +129,16 @@ export function ServiceCard({
           <dd className="m-0 truncate text-xs text-slate-400">{formatDate(service.startedAt)}</dd>
         </div>
       </dl>
+
+      <details className="mb-2.5 text-[11px] text-slate-500">
+        <summary className="cursor-pointer select-none hover:text-slate-400">Chi tiết kỹ thuật</summary>
+        <div className="mt-1.5 min-w-0">
+          <dt className="mb-0.5 text-[10px] tracking-wide text-slate-600 uppercase">Image ID (local, debug)</dt>
+          <dd className="m-0">
+            <CopyableValue value={service.imageId} className="text-xs" />
+          </dd>
+        </div>
+      </details>
 
       {canBuild && buildState ? (
         <div className="mb-2.5 rounded border border-slate-800/70 bg-slate-950/30 px-2.5 py-2 text-[11px] leading-relaxed">
@@ -169,17 +179,17 @@ export function ServiceCard({
 
       {previousEnvironment ? (
         <div className="mb-2.5 rounded border border-slate-800/70 bg-slate-950/30 px-2.5 py-2 text-[11px] leading-relaxed">
-          {service.digest && previousService?.digest && service.digest === previousService.digest ? (
+          {service.repoDigest && previousService?.repoDigest && service.repoDigest === previousService.repoDigest ? (
             <span className="text-emerald-400">✓ Đồng bộ với {previousEnvironment.code}</span>
           ) : (
             <div className="space-y-1">
               <div className="flex gap-1.5">
                 <span className="shrink-0 text-slate-600">{previousEnvironment.code}:</span>
-                <span className="min-w-0 truncate font-mono text-slate-400">{shortDigest(previousService?.digest)}</span>
+                <span className="min-w-0 truncate font-mono text-slate-400">{shortDigest(previousService?.repoDigest)}</span>
               </div>
               <div className="flex gap-1.5">
                 <span className="shrink-0 text-slate-600">{environment.code}:</span>
-                <span className="min-w-0 truncate font-mono text-slate-400">{shortDigest(service.digest)}</span>
+                <span className="min-w-0 truncate font-mono text-slate-400">{shortDigest(service.repoDigest)}</span>
               </div>
               <span className="inline-block rounded bg-amber-500/10 px-1.5 py-0.5 font-medium text-amber-400">
                 Khác {previousEnvironment.code}

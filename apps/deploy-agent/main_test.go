@@ -42,6 +42,40 @@ func TestRequestedImage(t *testing.T) {
 	}
 }
 
+func TestResolveRepoDigest(t *testing.T) {
+	repo := "vknighthub/ips_o24wfo"
+	digest := "sha256:1753aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	t.Run("reads digest directly from an already-immutable config image", func(t *testing.T) {
+		got := resolveRepoDigest(repo+"@"+digest, repo, []string{"unrelated/repo@sha256:deadbeef"})
+		if got != digest {
+			t.Fatalf("expected %s, got %s", digest, got)
+		}
+	})
+
+	t.Run("falls back to matching RepoDigests when config image is a mutable tag", func(t *testing.T) {
+		got := resolveRepoDigest(repo+":latest", repo, []string{"unrelated/repo@sha256:deadbeef", repo + "@" + digest})
+		if got != digest {
+			t.Fatalf("expected %s, got %s", digest, got)
+		}
+	})
+
+	t.Run("returns empty when no RepoDigests match the configured repository", func(t *testing.T) {
+		got := resolveRepoDigest(repo+":latest", repo, []string{"unrelated/repo@sha256:deadbeef"})
+		if got != "" {
+			t.Fatalf("expected empty digest, got %q", got)
+		}
+	})
+
+	t.Run("direct extraction wins even when repoDigests would also match", func(t *testing.T) {
+		other := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		got := resolveRepoDigest(repo+"@"+digest, repo, []string{repo + "@" + other})
+		if got != digest {
+			t.Fatalf("expected direct digest %s to win over repoDigests match %s, got %s", digest, other, got)
+		}
+	})
+}
+
 func TestOperationLogAndComplete(t *testing.T) {
 	op := newOperation("op-test-1", "dev", "wfo", "deploy", "repo@sha256:abc")
 

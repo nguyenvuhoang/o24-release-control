@@ -36,17 +36,21 @@ export async function POST(request: Request) {
 
     const sourceServices = await callAgent<{ items: ServiceStatus[] }>(source, '/api/services')
     const service = sourceServices.items.find((item) => item.code === body.service)
-    if (!service?.digest) {
+    if (!service?.repoDigest) {
       return promoteError(`Source service ${body.service} does not expose an immutable digest`, 409)
     }
 
+    // Promotion always deploys the source's repoDigest (the registry digest),
+    // never imageId (local Docker image ID) and never a cached/previous
+    // value — service.repoDigest above comes fresh from the source agent's
+    // /api/services call made just above.
     const started = await callAgent<OperationStartResponse>(target, '/api/deploy', {
       method: 'POST',
       timeoutMs: 30_000,
       body: {
         requestId: randomUUID(),
         service: body.service,
-        digest: service.digest,
+        digest: service.repoDigest,
         requestedBy: session.username,
         reason: `promote ${source.code} -> ${target.code}`,
       },
@@ -77,8 +81,8 @@ export async function POST(request: Request) {
       sourceEnvironment: source.code,
       targetEnvironment: target.code,
       service: body.service,
-      image: service.image,
-      digest: service.digest,
+      imageRef: service.imageRef,
+      repoDigest: service.repoDigest,
     })
   } catch (error) {
     return promoteError(

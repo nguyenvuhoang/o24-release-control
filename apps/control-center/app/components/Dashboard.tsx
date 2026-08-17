@@ -335,7 +335,7 @@ export default function Dashboard({ username }: Props) {
       title: 'Nhập image digest',
       message: `Digest cho ${escapeHtml(serviceLabel)} tại ${escapeHtml(environment.name)}`,
       placeholder: 'sha256:...',
-      defaultValue: service.digest ?? 'sha256:',
+      defaultValue: service.repoDigest ?? 'sha256:',
       confirmText: 'Tiếp tục',
       validator: (value) => {
         const normalized = value.trim().toLowerCase()
@@ -369,7 +369,7 @@ export default function Dashboard({ username }: Props) {
     const index = dashboard.environments.findIndex((item) => item.code === environment.code)
     const target = dashboard.environments[index + 1]
     if (!target) return
-    if (!service.digest) {
+    if (!service.repoDigest) {
       await SwalAlert.error('Service nguồn chưa đọc được digest bất biến.')
       return
     }
@@ -416,8 +416,8 @@ export default function Dashboard({ username }: Props) {
       `<div class="mt-3 space-y-1 text-left text-xs">`,
       `<div><span class="text-slate-500">Service:</span> <span class="font-mono">${escapeHtml(service.code)}</span></div>`,
       `<div><span class="text-slate-500">Environment:</span> <span class="font-mono">${escapeHtml(environment.code)}</span></div>`,
-      service.digest
-        ? `<div><span class="text-slate-500">Digest hiện tại:</span> <span class="font-mono break-all">${escapeHtml(service.digest)}</span></div>`
+      service.repoDigest
+        ? `<div><span class="text-slate-500">Digest hiện tại:</span> <span class="font-mono break-all">${escapeHtml(service.repoDigest)}</span></div>`
         : '',
       `</div>`,
     ].join('')

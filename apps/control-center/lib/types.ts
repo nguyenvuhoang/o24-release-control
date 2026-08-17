@@ -31,9 +31,12 @@ export type ServiceStatus = {
   containerName: string
   status: string
   health: string
-  image: string
+  /** The reference the container was actually started from (e.g. "repo@sha256:..." or "repo:latest"). */
+  imageRef: string
+  /** Local Docker image ID (container inspect .Image). NOT a registry digest — debug/technical detail only. */
   imageId: string
-  digest?: string
+  /** Immutable registry digest ("sha256:..."). The only identifier safe for promotion and DEV/UAT comparisons. */
+  repoDigest?: string
   gitRevision?: string
   startedAt?: string
   configuredImage?: string
