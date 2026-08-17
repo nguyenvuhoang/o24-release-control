@@ -1,33 +1,28 @@
-import { randomUUID } from 'node:crypto'
-import { promises as fs } from 'node:fs'
-import path from 'node:path'
-import { getDataPath } from './config'
+import { getAuditRepository, type AppendResult } from './auditRepository'
 import type { AuditRecord } from './types'
 
-export async function appendAudit(record: Omit<AuditRecord, 'id' | 'timestamp'>): Promise<AuditRecord> {
-  const completed: AuditRecord = {
-    id: randomUUID(),
+/**
+ * Appends an audit record only once per idempotencyKey — pass a deterministic
+ * key derived from the thing being audited (e.g. `operation:${operationId}`,
+ * `build:${runId}`), NOT a random value. The repository uses it as the
+ * record's id and treats append as an upsert-if-absent, so an SSE reconnect
+ * or a repeated settleOperation()/poll call can call this as many times as
+ * it wants without producing duplicate rows — including across separate
+ * process instances (KV-backed repository) or after a process restart
+ * (file-backed repository).
+ */
+export async function appendAudit(
+  input: Omit<AuditRecord, 'id' | 'timestamp'> & { idempotencyKey: string },
+): Promise<AppendResult> {
+  const { idempotencyKey, ...fields } = input
+  const record: AuditRecord = {
+    id: idempotencyKey,
     timestamp: new Date().toISOString(),
-    ...record,
+    ...fields,
   }
-  const filePath = getDataPath('audit.jsonl')
-  await fs.mkdir(path.dirname(filePath), { recursive: true })
-  await fs.appendFile(filePath, `${JSON.stringify(completed)}\n`, { encoding: 'utf8', mode: 0o640 })
-  return completed
+  return getAuditRepository().append(record)
 }
 
 export async function readAudit(limit = 50): Promise<AuditRecord[]> {
-  const filePath = getDataPath('audit.jsonl')
-  try {
-    const raw = await fs.readFile(filePath, 'utf8')
-    return raw
-      .split('\n')
-      .filter(Boolean)
-      .slice(-Math.min(Math.max(limit, 1), 500))
-      .reverse()
-      .map((line) => JSON.parse(line) as AuditRecord)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
-    throw error
-  }
+  return getAuditRepository().list(limit)
 }

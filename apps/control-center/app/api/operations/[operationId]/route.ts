@@ -6,12 +6,6 @@ import { getEnvironment } from '../../../../lib/config'
 import { getPromoteContext } from '../../../../lib/operationContext'
 import type { OperationSnapshot } from '../../../../lib/types'
 
-// Tracks operations whose terminal outcome has already been written to the
-// audit log, so re-fetching status after a reload never double-records it.
-// Reset on process restart; the agent's own deployments.jsonl remains the
-// durable source of truth for deploy history either way.
-const auditedOperations = new Set<string>()
-
 export async function GET(request: Request, { params }: { params: Promise<{ operationId: string }> }) {
   const session = await requireApiSession()
   if (session instanceof NextResponse) return session
@@ -25,11 +19,17 @@ export async function GET(request: Request, { params }: { params: Promise<{ oper
     const environment = await getEnvironment(environmentCode)
     const snapshot = await callAgent<OperationSnapshot>(environment, `/api/operations/${encodeURIComponent(operationId)}`)
 
-    if (snapshot.status !== 'running' && !auditedOperations.has(operationId)) {
-      auditedOperations.add(operationId)
+    if (snapshot.status !== 'running') {
       const digest = snapshot.image?.includes('@sha256:') ? snapshot.image.split('@sha256:')[1] : undefined
       const promoteContext = getPromoteContext(operationId)
+      // idempotencyKey (not a random id) so repeated calls for the same
+      // operation — an SSE reconnect re-hitting this route, or
+      // settleOperation()'s fallback fetch racing the stream's own terminal
+      // event — write the same audit record at most once, enforced by the
+      // repository rather than by in-process state (which wouldn't survive
+      // a serverless cold start or a second instance).
       await appendAudit({
+        idempotencyKey: `operation:${operationId}`,
         username: session.username,
         action: promoteContext ? 'promote' : snapshot.action,
         environment: promoteContext ? undefined : snapshot.environment,

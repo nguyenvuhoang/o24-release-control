@@ -48,7 +48,7 @@ export function useBuildTracker() {
   const pollRun = useCallback(
     async (service: string, runId: number) => {
       try {
-        const response = await fetch(`/api/builds/${runId}`, { cache: 'no-store' })
+        const response = await fetch(`/api/builds/${runId}?service=${encodeURIComponent(service)}`, { cache: 'no-store' })
         const data = await readJsonSafe<BuildRunResult & ApiErrorBody>(response)
         if (!response.ok || !data) {
           throw new Error(data?.details ?? data?.error ?? `Không lấy được trạng thái build (mã ${response.status})`)

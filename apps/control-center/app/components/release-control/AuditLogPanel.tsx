@@ -5,6 +5,16 @@ const STATUS_DOT: Record<AuditRecord['status'], string> = {
   failed: 'bg-rose-400',
 }
 
+const STATUS_LABEL: Record<AuditRecord['status'], string> = {
+  succeeded: 'Thành công',
+  failed: 'Thất bại',
+}
+
+const STATUS_TEXT_COLOR: Record<AuditRecord['status'], string> = {
+  succeeded: 'text-emerald-400',
+  failed: 'text-rose-400',
+}
+
 const ACTION_LABELS: Record<string, string> = {
   deploy: 'TRIỂN KHAI',
   promote: 'CHUYỂN TIẾP',
@@ -87,6 +97,9 @@ export function AuditLogPanel({ records, activeEnvironmentCode, filter, onFilter
               <code className="hidden truncate text-slate-500 sm:block sm:max-w-[180px]">{shortDigest(item.digest)}</code>
               <span className="hidden text-slate-400 sm:block">{item.username}</span>
               <time className="hidden text-slate-400 md:block">{new Date(item.timestamp).toLocaleString('vi-VN')}</time>
+              <span className={`shrink-0 font-medium ${STATUS_TEXT_COLOR[item.status] ?? 'text-amber-400'}`}>
+                {STATUS_LABEL[item.status] ?? item.status}
+              </span>
             </article>
           ))}
         </div>

@@ -88,23 +88,6 @@ export default function Dashboard({ username }: Props) {
   const [buildDetailTarget, setBuildDetailTarget] = useState<{ githubService: string; serviceLabel: string } | null>(null)
   const previousBuildStatuses = useRef<Record<string, BuildTrackedStatus>>({})
 
-  // Toasts the terminal outcome of a build exactly once, by diffing against
-  // the status seen on the previous render — polling itself lives inside
-  // useBuildTracker.
-  useEffect(() => {
-    for (const [service, state] of Object.entries(builds)) {
-      const previousStatus = previousBuildStatuses.current[service]
-      if (previousStatus !== state.status) {
-        if (state.status === 'success') {
-          SwalAlert.toast(`Build ${service} thành công`)
-        } else if (state.status === 'failed' && previousStatus !== undefined) {
-          SwalAlert.toast(`Build ${service} thất bại`, 'error')
-        }
-      }
-    }
-    previousBuildStatuses.current = Object.fromEntries(Object.entries(builds).map(([service, state]) => [service, state.status]))
-  }, [builds])
-
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
     try {
@@ -136,6 +119,28 @@ export default function Dashboard({ username }: Props) {
     const timer = window.setInterval(() => void refresh(true), 15_000)
     return () => window.clearInterval(timer)
   }, [refresh])
+
+  // Toasts the terminal outcome of a build exactly once, by diffing against
+  // the status seen on the previous render — polling itself lives inside
+  // useBuildTracker. The server writes the build's audit record as part of
+  // the poll request that first observes "completed" (see
+  // /api/builds/[runId]), so by the time this effect sees the status
+  // transition, refreshing /api/audit is guaranteed to pick it up.
+  useEffect(() => {
+    for (const [service, state] of Object.entries(builds)) {
+      const previousStatus = previousBuildStatuses.current[service]
+      if (previousStatus !== state.status) {
+        if (state.status === 'success') {
+          SwalAlert.toast(`Build ${service} thành công`)
+          void refresh(true)
+        } else if (state.status === 'failed' && previousStatus !== undefined) {
+          SwalAlert.toast(`Build ${service} thất bại`, 'error')
+          void refresh(true)
+        }
+      }
+    }
+    previousBuildStatuses.current = Object.fromEntries(Object.entries(builds).map(([service, state]) => [service, state.status]))
+  }, [builds, refresh])
 
   // Reconciles the active tab against the loaded environments: keeps a valid
   // `?env=` from the URL, otherwise falls back to the first environment by
