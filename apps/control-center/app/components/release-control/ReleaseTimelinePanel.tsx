@@ -11,6 +11,10 @@ type ReleaseTimelinePanelProps = {
   environments: EnvironmentDashboard[]
   operationBusy: boolean
   onDeploy: (release: ReleaseSnapshot, environmentCode: string, intent: ReleaseDeployIntent) => void
+  /** Pre-selects a service when opened from a specific card's "Xem dòng thời gian phiên bản" action. */
+  initialService?: BuildServiceCode
+  /** Present only when rendered as a drawer (see Dashboard.tsx) — shows a Close button and stops this panel being permanently on the page. */
+  onClose?: () => void
 }
 
 const SOURCE_OPTIONS: { value: ReleaseSource | ''; label: string }[] = [
@@ -26,8 +30,8 @@ const INPUT_CLASS =
 const BUTTON_CLASS =
   'min-h-[30px] rounded border border-slate-800 bg-slate-900/60 px-3 text-xs font-medium text-slate-200 transition-colors duration-150 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-45 focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-600'
 
-export function ReleaseTimelinePanel({ environments, operationBusy, onDeploy }: ReleaseTimelinePanelProps) {
-  const [service, setService] = useState<BuildServiceCode>(BUILD_SERVICES[0])
+export function ReleaseTimelinePanel({ environments, operationBusy, onDeploy, initialService, onClose }: ReleaseTimelinePanelProps) {
+  const [service, setService] = useState<BuildServiceCode>(initialService ?? BUILD_SERVICES[0])
   const [branchFilter, setBranchFilter] = useState('')
   const [sourceFilter, setSourceFilter] = useState<ReleaseSource | ''>('')
   const [environmentFilter, setEnvironmentFilter] = useState('')
@@ -91,6 +95,11 @@ export function ReleaseTimelinePanel({ environments, operationBusy, onDeploy }: 
           <button type="button" onClick={() => void reload()} className={BUTTON_CLASS}>
             Làm mới
           </button>
+          {onClose ? (
+            <button type="button" onClick={onClose} className={BUTTON_CLASS}>
+              Đóng
+            </button>
+          ) : null}
         </div>
       </div>
 

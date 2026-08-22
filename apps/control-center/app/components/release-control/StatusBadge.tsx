@@ -1,4 +1,4 @@
-import type { ReleaseComparisonState, ResolvedReleaseSource, RunningRelease } from '../../../lib/types'
+import type { ReleaseComparison, ReleaseComparisonState, ResolvedReleaseSource, RunningRelease } from '../../../lib/types'
 import type { BuildTrackedStatus } from './useBuildTracker'
 
 export type BadgeTone = 'success' | 'danger' | 'warning' | 'neutral'
@@ -142,10 +142,10 @@ const COMPARISON_STATE_LABELS: Record<ReleaseComparisonState, string> = {
   DEV_OUTDATED: 'DEV đang dùng bản cũ',
   UAT_SYNCED_WITH_DEV: 'UAT đã đồng bộ với DEV',
   UAT_DIFFERS_FROM_DEV: 'UAT khác DEV',
-  UAT_AHEAD_OR_UNKNOWN: 'UAT khác DEV (chưa xác định)',
+  UAT_AHEAD_OR_UNKNOWN: 'UAT chưa đồng bộ với DEV',
   PROD_SYNCED_WITH_UAT: 'PROD đã đồng bộ với UAT',
   PROD_DIFFERS_FROM_UAT: 'PROD khác UAT',
-  UNTRACKED_BUILD: 'Bản build chưa được theo dõi',
+  UNTRACKED_BUILD: 'Build ngoài hệ thống, chưa đồng bộ',
   ENVIRONMENT_UNAVAILABLE: 'Không thể kiểm tra',
   NO_BUILD: 'Chưa có dữ liệu',
   UNKNOWN: 'Không xác định',
@@ -172,4 +172,34 @@ const COMPARISON_STATE_TONES: Record<ReleaseComparisonState, BadgeTone> = {
 
 export function comparisonStateTone(state: ReleaseComparisonState): BadgeTone {
   return COMPARISON_STATE_TONES[state]
+}
+
+/**
+ * The ONE headline badge shown prominently on a service card — "nhìn 3 giây
+ * biết service nào cần hành động". Wraps comparisonStateLabel/Tone with a
+ * `tooltip` for every state that isn't self-explanatory (an uncertain or
+ * unreachable state must always say why, never just "Không xác định" with
+ * no further explanation). Purely a display concern — never re-derives the
+ * state itself, always reads `comparison.state` as computed by
+ * lib/releaseComparison.ts.
+ */
+export function primaryComparisonBadge(comparison: ReleaseComparison): { label: string; tone: BadgeTone; tooltip?: string } {
+  const label = comparisonStateLabel(comparison.state)
+  const tone = comparisonStateTone(comparison.state)
+  switch (comparison.state) {
+    case 'NO_BUILD':
+      return { label, tone, tooltip: 'Không tìm thấy tag "latest" nào trên Docker Hub cho dịch vụ này.' }
+    case 'ENVIRONMENT_UNAVAILABLE':
+      return { label, tone, tooltip: comparison.dev?.error ?? 'Không thể kết nối Deploy Agent DEV để kiểm tra trạng thái.' }
+    case 'UNTRACKED_BUILD':
+      return { label, tone, tooltip: 'Docker Hub có digest mới nhưng chưa có Release Snapshot tương ứng — cần đồng bộ trước khi triển khai.' }
+    case 'DEV_OUTDATED':
+      return { label, tone, tooltip: 'DEV đang chạy một digest không khớp bất kỳ Release Snapshot nào đã biết.' }
+    case 'UAT_AHEAD_OR_UNKNOWN':
+      return { label, tone, tooltip: 'UAT đang chạy một digest không khớp bất kỳ Release Snapshot nào đã biết.' }
+    case 'UNKNOWN':
+      return { label, tone, tooltip: 'Không đủ dữ liệu để xác định trạng thái đồng bộ của dịch vụ này.' }
+    default:
+      return { label, tone }
+  }
 }

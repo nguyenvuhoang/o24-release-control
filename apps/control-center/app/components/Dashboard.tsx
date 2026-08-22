@@ -79,6 +79,12 @@ export default function Dashboard({ username }: Props) {
   const [logs, setLogs] = useState<{ title: string; content: string } | null>(null)
   const [activeEnvironmentCode, setActiveEnvironmentCode] = useState<string>(() => searchParams.get('env') ?? '')
   const [auditFilter, setAuditFilter] = useState<AuditFilter>('current')
+  // "Latest Build vs DEV/UAT/PROD" is shown either inline per-card (default)
+  // or as one compact table — never both at once (they'd repeat the same
+  // digests). "Dòng thời gian phiên bản" is opened on demand for one
+  // service at a time instead of sitting permanently on the dashboard.
+  const [comparisonView, setComparisonView] = useState<'cards' | 'table'>('cards')
+  const [timelineService, setTimelineService] = useState<BuildServiceCode | null>(null)
 
   // The drawer's visibility (activeOperation) is intentionally separate from
   // the operation being tracked (trackedOperation): closing the drawer must
@@ -454,7 +460,13 @@ export default function Dashboard({ username }: Props) {
     const expectedDigest = service.repoDigest
     const confirmed = await SwalAlert.confirm({
       title: 'Xác nhận chuyển tiếp',
-      message: `${escapeHtml(serviceLabel)} sẽ được chuyển tiếp từ ${escapeHtml(environment.code)} sang ${escapeHtml(target.code)}.`,
+      message: [
+        `${escapeHtml(serviceLabel)} sẽ được chuyển tiếp từ ${escapeHtml(environment.code)} sang ${escapeHtml(target.code)}.`,
+        `<div class="mt-3 space-y-1 text-left text-xs">`,
+        `<div><span class="text-slate-500">Sẽ lấy digest ĐANG CHẠY ở ${escapeHtml(environment.code)} (không phải Latest Build):</span></div>`,
+        `<div class="font-mono break-all">${escapeHtml(expectedDigest)}</div>`,
+        `</div>`,
+      ].join(''),
       confirmText: 'Chuyển tiếp',
       cancelText: 'Hủy',
     })
@@ -638,6 +650,14 @@ export default function Dashboard({ username }: Props) {
     syncBuild(githubService)
   }
 
+  // "Xem dòng thời gian phiên bản" — opens the Version Timeline for exactly
+  // this service, as a drawer. Never shown permanently on the dashboard.
+  function openTimeline(service: ServiceStatus) {
+    const githubService = githubServiceForAgentCode(service.code)
+    if (!githubService) return
+    setTimelineService(githubService)
+  }
+
   const getBuildStateForService = useCallback(
     (service: ServiceStatus) => {
       const githubService = githubServiceForAgentCode(service.code)
@@ -706,14 +726,18 @@ export default function Dashboard({ username }: Props) {
       : ''
     const untrackedLine = !latest.snapshotId
       ? `<div class="mt-2 text-amber-400">Bản build này chưa có Release Snapshot — hệ thống sẽ tự động đồng bộ trước khi triển khai.</div>`
-      : `<div class="mt-2 text-amber-400">Release hiện đang chạy trên DEV sẽ bị thay thế.</div>`
+      : ''
+    const devDigestLine = comparison.dev?.repoDigest
+      ? `<div><span class="text-slate-500">Digest DEV hiện tại (sẽ bị thay thế):</span> <span class="font-mono break-all">${escapeHtml(comparison.dev.repoDigest)}</span></div>`
+      : `<div class="text-amber-400">Không đọc được digest hiện tại của DEV.</div>`
     const details = [
       `<div class="mt-3 space-y-1 text-left text-xs">`,
       `<div><span class="text-slate-500">Service:</span> <span class="font-mono">${escapeHtml(githubService)}</span></div>`,
       `<div><span class="text-slate-500">Môi trường:</span> <span class="font-mono">DEV</span></div>`,
       `<div><span class="text-slate-500">Tag:</span> <span class="font-mono">${escapeHtml(latest.tag)}</span></div>`,
       commitLine,
-      `<div><span class="text-slate-500">Digest:</span> <span class="font-mono break-all">${escapeHtml(latest.repoDigest)}</span></div>`,
+      `<div><span class="text-slate-500">Digest nguồn (Latest Build):</span> <span class="font-mono break-all">${escapeHtml(latest.repoDigest)}</span></div>`,
+      devDigestLine,
       untrackedLine,
       `</div>`,
     ].join('')
@@ -812,11 +836,37 @@ export default function Dashboard({ username }: Props) {
       />
 
       {environments.length > 0 ? (
-        <EnvironmentTabs
-          environments={environments}
-          activeEnvironment={activeEnvironmentCode}
-          onChange={handleEnvironmentChange}
-        />
+        <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <EnvironmentTabs
+              environments={environments}
+              activeEnvironment={activeEnvironmentCode}
+              onChange={handleEnvironmentChange}
+            />
+          </div>
+          <div className="flex shrink-0 items-center gap-1.5 rounded border border-slate-800 p-0.5 text-xs">
+            <button
+              type="button"
+              onClick={() => setComparisonView('cards')}
+              title="Xem so sánh Latest Build/DEV/UAT/PROD trực tiếp trên từng thẻ dịch vụ"
+              className={`rounded px-2.5 py-1.5 font-medium transition-colors duration-150 ${
+                comparisonView === 'cards' ? 'bg-slate-800 text-slate-100' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Dạng thẻ
+            </button>
+            <button
+              type="button"
+              onClick={() => setComparisonView('table')}
+              title="Xem so sánh Latest Build/DEV/UAT/PROD dạng bảng gọn cho cả 7 dịch vụ"
+              className={`rounded px-2.5 py-1.5 font-medium transition-colors duration-150 ${
+                comparisonView === 'table' ? 'bg-slate-800 text-slate-100' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Dạng bảng
+            </button>
+          </div>
+        </div>
       ) : null}
 
       <section className="w-full">
@@ -829,6 +879,7 @@ export default function Dashboard({ username }: Props) {
             busyKey={busy?.key ?? ''}
             getBuildState={getBuildStateForService}
             comparisons={comparisons}
+            showComparisonBlock={comparisonView === 'cards'}
             registrySyncingKeys={registrySyncingKeys}
             deployingLatestKeys={deployingLatestKeys}
             onDeploy={deploy}
@@ -841,6 +892,7 @@ export default function Dashboard({ username }: Props) {
             onSyncBuild={syncBuildStatus}
             onSyncRegistry={syncRegistry}
             onDeployLatestToDev={deployLatestToDev}
+            onViewTimeline={openTimeline}
             onRetry={() => void refresh(true)}
           />
         ) : !dashboard && loading ? (
@@ -850,7 +902,7 @@ export default function Dashboard({ username }: Props) {
         ) : null}
       </section>
 
-      {environments.length > 0 ? (
+      {environments.length > 0 && comparisonView === 'table' ? (
         <LatestReleasePanel
           registryStatus={registryStatus}
           environments={environments}
@@ -859,8 +911,18 @@ export default function Dashboard({ username }: Props) {
         />
       ) : null}
 
-      {environments.length > 0 ? (
-        <ReleaseTimelinePanel environments={environments} operationBusy={Boolean(busy)} onDeploy={deployRelease} />
+      {timelineService ? (
+        <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/60" role="dialog" aria-modal="true">
+          <div className="h-full w-full max-w-3xl overflow-y-auto border-l border-slate-800 bg-slate-950 p-4 shadow-2xl shadow-black/50">
+            <ReleaseTimelinePanel
+              environments={environments}
+              operationBusy={Boolean(busy)}
+              onDeploy={deployRelease}
+              initialService={timelineService}
+              onClose={() => setTimelineService(null)}
+            />
+          </div>
+        </div>
       ) : null}
 
       <AuditLogPanel

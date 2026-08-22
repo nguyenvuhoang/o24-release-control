@@ -56,6 +56,10 @@ type PromptOptions = {
 }
 
 export const SwalAlert = {
+  // Confirmation dialogs gate real, consequential actions (deploy/rollback/
+  // promote/...) — an accidental outside click or Esc must never silently
+  // dismiss one as if the user had decided anything. Only the Hủy button or
+  // this explicit close (X) button count as a decision.
   async confirm(options: ConfirmOptions): Promise<boolean> {
     const result = await base.fire({
       icon: options.danger ? 'warning' : undefined,
@@ -63,6 +67,9 @@ export const SwalAlert = {
       title: options.title,
       html: options.message,
       showCancelButton: true,
+      showCloseButton: true,
+      allowOutsideClick: false,
+      allowEscapeKey: false,
       confirmButtonText: options.confirmText,
       cancelButtonText: options.cancelText ?? 'Hủy',
       customClass: {
@@ -84,6 +91,9 @@ export const SwalAlert = {
       inputPlaceholder: options.placeholder,
       inputValue: options.defaultValue ?? '',
       showCancelButton: true,
+      showCloseButton: true,
+      allowOutsideClick: false,
+      allowEscapeKey: false,
       confirmButtonText: options.confirmText ?? 'Xác nhận',
       cancelButtonText: options.cancelText ?? 'Hủy',
       inputValidator: (value: string) => {

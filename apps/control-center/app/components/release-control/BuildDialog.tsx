@@ -25,11 +25,8 @@ export function BuildDialog({ serviceLabel, serviceCode, branch, onCancel, onSub
   }
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/75 p-6" onClick={submitting ? undefined : onCancel}>
-      <section
-        className="w-full max-w-md rounded-lg border border-slate-800 bg-slate-950 p-5"
-        onClick={(event) => event.stopPropagation()}
-      >
+    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/75 p-6" role="dialog" aria-modal="true">
+      <section className="w-full max-w-md rounded-lg border border-slate-800 bg-slate-950 p-5">
         <p className="mb-0.5 text-[11px] tracking-wide text-slate-500">BUILD DOCKER IMAGE</p>
         <h2 className="mb-4 text-base font-semibold text-slate-100">Build {serviceLabel}</h2>
 

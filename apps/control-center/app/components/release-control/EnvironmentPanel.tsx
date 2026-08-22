@@ -14,6 +14,7 @@ type EnvironmentPanelProps = {
   busyKey: string
   getBuildState: (service: ServiceStatus) => BuildTrackedState | undefined
   comparisons: Partial<Record<BuildServiceCode, ReleaseComparison>>
+  showComparisonBlock: boolean
   registrySyncingKeys: Set<string>
   deployingLatestKeys: Set<string>
   onDeploy: (environment: EnvironmentDashboard, service: ServiceStatus, prefillDigest?: string) => Promise<void>
@@ -26,6 +27,7 @@ type EnvironmentPanelProps = {
   onSyncBuild: (service: ServiceStatus) => void
   onSyncRegistry: (service: ServiceStatus) => Promise<void>
   onDeployLatestToDev: (service: ServiceStatus) => Promise<void>
+  onViewTimeline: (service: ServiceStatus) => void
   onRetry: () => void
 }
 
@@ -37,6 +39,7 @@ export function EnvironmentPanel({
   busyKey,
   getBuildState,
   comparisons,
+  showComparisonBlock,
   registrySyncingKeys,
   deployingLatestKeys,
   onDeploy,
@@ -49,6 +52,7 @@ export function EnvironmentPanel({
   onSyncBuild,
   onSyncRegistry,
   onDeployLatestToDev,
+  onViewTimeline,
   onRetry,
 }: EnvironmentPanelProps) {
   return (
@@ -97,11 +101,12 @@ export function EnvironmentPanel({
         <div className="w-full p-4">
           {environment.services.length > 0 ? (
             // auto-fit/minmax instead of fixed breakpoint column counts: each
-            // card keeps a guaranteed minimum width so its 2-column action
-            // grid never gets so narrow that a label like "Chuyển tiếp → UAT"
-            // has to wrap — the number of columns adapts to available width
-            // instead of being hard-coded per viewport size.
-            <div className="grid w-full grid-cols-[repeat(auto-fit,minmax(min(340px,100%),1fr))] gap-4">
+            // card keeps a guaranteed minimum width so text/badges/buttons
+            // never wrap awkwardly — the number of columns adapts to
+            // available width instead of being hard-coded per viewport size.
+            // 460px prefers 3 cards per row on a typical desktop width
+            // rather than 4, which was cramping the comparison flow.
+            <div className="grid w-full grid-cols-[repeat(auto-fit,minmax(min(460px,100%),1fr))] gap-4">
               {environment.services.map((service) => {
                 const githubService = githubServiceForAgentCode(service.code)
                 return (
@@ -113,6 +118,7 @@ export function EnvironmentPanel({
                     previousEnvironment={previousEnvironment}
                     previousService={previousEnvironment?.services.find((item) => item.code === service.code)}
                     comparison={githubService ? comparisons[githubService] : undefined}
+                    showComparisonBlock={showComparisonBlock}
                     registrySyncing={githubService ? registrySyncingKeys.has(githubService) : false}
                     deployingLatest={githubService ? deployingLatestKeys.has(githubService) : false}
                     isBusy={busyKey.includes(`${environment.code}:${service.code}`)}
@@ -127,6 +133,7 @@ export function EnvironmentPanel({
                     onSyncBuild={onSyncBuild}
                     onSyncRegistry={onSyncRegistry}
                     onDeployLatestToDev={onDeployLatestToDev}
+                    onViewTimeline={onViewTimeline}
                   />
                 )
               })}
