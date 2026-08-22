@@ -880,19 +880,38 @@ func (a *App) inspectService(parent context.Context, svc ServiceConfig) ServiceS
 //     directly from it — no ambiguity possible.
 //  2. Otherwise (e.g. configImage is "repo:latest"), fall back to matching
 //     repoDigests (from `docker image inspect` on the running image) against
-//     imageRepository, since the tag alone doesn't carry a digest.
-// Returns "" if neither path yields a digest for imageRepository.
+//     imageRepository, since the tag alone doesn't carry a digest. Each
+//     candidate is checked with Docker Hub's registry-alias prefixes
+//     ("docker.io/", "index.docker.io/") stripped first, since Docker
+//     sometimes reports RepoDigests fully-qualified even though
+//     imageRepository is configured in short form.
+// Returns "" if neither path yields a digest for imageRepository — this
+// function never falls back to the local Docker image ID.
 func resolveRepoDigest(configImage, imageRepository string, repoDigests []string) string {
 	prefix := imageRepository + "@sha256:"
 	if strings.HasPrefix(configImage, prefix) {
 		return strings.TrimPrefix(configImage, imageRepository+"@")
 	}
 	for _, repoDigest := range repoDigests {
-		if strings.HasPrefix(repoDigest, prefix) {
-			return strings.TrimPrefix(repoDigest, imageRepository+"@")
+		normalized := stripRegistryAlias(repoDigest)
+		if strings.HasPrefix(normalized, prefix) {
+			return strings.TrimPrefix(normalized, imageRepository+"@")
 		}
 	}
 	return ""
+}
+
+// stripRegistryAlias removes Docker Hub's registry-alias prefixes that
+// RepoDigests entries can carry depending on Docker version/how an image was
+// pulled, so matching against a short-form configured repository name (e.g.
+// "vknighthub/ips_o24cms") doesn't silently miss a real digest.
+func stripRegistryAlias(repoDigest string) string {
+	for _, alias := range []string{"index.docker.io/", "docker.io/"} {
+		if strings.HasPrefix(repoDigest, alias) {
+			return strings.TrimPrefix(repoDigest, alias)
+		}
+	}
+	return repoDigest
 }
 
 func (a *App) findService(code string) (ServiceConfig, bool) {

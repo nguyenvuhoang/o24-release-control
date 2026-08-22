@@ -74,6 +74,40 @@ func TestResolveRepoDigest(t *testing.T) {
 			t.Fatalf("expected direct digest %s to win over repoDigests match %s, got %s", digest, other, got)
 		}
 	})
+
+	t.Run("picks the matching entry out of multiple RepoDigests", func(t *testing.T) {
+		other := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		got := resolveRepoDigest(repo+":latest", repo, []string{
+			"unrelated/repo@sha256:deadbeef",
+			"another/unrelated@" + other,
+			repo + "@" + digest,
+		})
+		if got != digest {
+			t.Fatalf("expected %s, got %s", digest, got)
+		}
+	})
+
+	t.Run("normalizes docker.io and index.docker.io aliases before matching", func(t *testing.T) {
+		gotDockerIO := resolveRepoDigest(repo+":latest", repo, []string{"docker.io/" + repo + "@" + digest})
+		if gotDockerIO != digest {
+			t.Fatalf("expected %s from docker.io/ alias, got %s", digest, gotDockerIO)
+		}
+		gotIndexDockerIO := resolveRepoDigest(repo+":latest", repo, []string{"index.docker.io/" + repo + "@" + digest})
+		if gotIndexDockerIO != digest {
+			t.Fatalf("expected %s from index.docker.io/ alias, got %s", digest, gotIndexDockerIO)
+		}
+	})
+
+	t.Run("never falls back to a local image ID when RepoDigests is empty", func(t *testing.T) {
+		localImageID := "sha256:6fd8478b1ba307003c9261826d9d295095bf7fa5eacbd4b9fddfd548fdcc186c"
+		got := resolveRepoDigest(repo+":latest", repo, nil)
+		if got != "" {
+			t.Fatalf("expected empty digest when RepoDigests has nothing for this repository, got %q", got)
+		}
+		if got == localImageID {
+			t.Fatalf("resolveRepoDigest must never return a local image ID")
+		}
+	})
 }
 
 func TestOperationLogAndComplete(t *testing.T) {

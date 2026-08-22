@@ -72,12 +72,19 @@ export function toRunningRelease(input: {
     return { environment, service, containerStatus: 'unknown', checkedAt, error: serviceStatus.error }
   }
 
+  const configuredDigest = normalizeDigest(serviceStatus.configuredImage)
+  const runningDigest = normalizeDigest(serviceStatus.repoDigest)
+  const configDrift = Boolean(configuredDigest) && Boolean(runningDigest) && configuredDigest !== runningDigest
+
   return {
     environment,
     service,
     repository: matchedSnapshot?.dockerRepository,
     tag: matchedSnapshot?.tag,
     repoDigest: serviceStatus.repoDigest,
+    localImageId: serviceStatus.imageId || undefined,
+    imageReference: serviceStatus.imageRef || undefined,
+    configDrift,
     snapshotId: matchedSnapshot?.id,
     containerStatus: containerStatusOf(serviceStatus.status),
     checkedAt,
@@ -133,6 +140,16 @@ export function resolveReleaseComparison(input: ComparisonInput): ReleaseCompari
   if (dev && !devAvailable) warnings.push(`Không thể kiểm tra DEV${dev.error ? `: ${dev.error}` : ''}`)
   if (uat && !uatAvailable) warnings.push(`Không thể kiểm tra UAT${uat.error ? `: ${uat.error}` : ''}`)
   if (prod && !prodAvailable) warnings.push(`Không thể kiểm tra PROD${prod.error ? `: ${prod.error}` : ''}`)
+
+  // Real evidence, not inference: the agent's own record of what it last
+  // configured (ServiceStatus.configuredImage) resolves to a different
+  // digest than what's actually running. Surfaced ahead of every other
+  // warning because it changes what action actually helps — redeploying
+  // again is unlikely to fix a container that never picked up the previous
+  // deploy's pinned image (see RunningRelease.configDrift).
+  if (dev?.configDrift) warnings.push('DEV: container đang chạy khác với image đã cấu hình triển khai gần nhất — kiểm tra docker-compose trên máy chủ, triển khai lại có thể không khắc phục được.')
+  if (uat?.configDrift) warnings.push('UAT: container đang chạy khác với image đã cấu hình triển khai gần nhất — kiểm tra docker-compose trên máy chủ, triển khai lại có thể không khắc phục được.')
+  if (prod?.configDrift) warnings.push('PROD: container đang chạy khác với image đã cấu hình triển khai gần nhất — kiểm tra docker-compose trên máy chủ, triển khai lại có thể không khắc phục được.')
 
   if (!latest) {
     return { state: 'NO_BUILD', latest, dev, uat, prod, canImportSnapshot: false, canDeployLatestToDev: false, canPromoteDevToUat, canPromoteUatToProd, warnings }

@@ -100,6 +100,66 @@ test('toRunningRelease maps container status and attaches the matched snapshot',
   assert.notEqual(result.repoDigest, serviceStatus.imageId)
 })
 
+test('toRunningRelease carries localImageId/imageReference separately from repoDigest and never cross-maps them', () => {
+  // Reproduces the exact production report: repoDigest happens to equal the
+  // local image ID string (a real Docker RepoDigests coincidence, not a
+  // mapping bug) — repoDigest must still be sourced only from
+  // ServiceStatus.repoDigest, never derived from imageId.
+  const localId = 'sha256:6fd8478b1ba307003c9261826d9d295095bf7fa5eacbd4b9fddfd548fdcc186c'
+  const serviceStatus: ServiceStatus = {
+    code: 'o24-cms', displayName: 'CMS', composeService: 'cms', containerName: 'o24-cms',
+    status: 'running', health: 'none', imageRef: `${REPO}:latest`, imageId: localId,
+    repoDigest: localId,
+  }
+  const result = toRunningRelease({ environment: 'DEV', service: 'CMS', environmentOnline: true, serviceStatus, checkedAt: 'now' })
+  assert.equal(result.repoDigest, localId)
+  assert.equal(result.localImageId, localId)
+  assert.equal(result.imageReference, `${REPO}:latest`)
+  // Same string value here only because the source data coincides — the
+  // fields must still come from distinct ServiceStatus properties.
+  assert.equal(result.repoDigest, serviceStatus.repoDigest)
+  assert.notEqual(result.imageReference, result.repoDigest)
+})
+
+test('toRunningRelease flags configDrift when the agent\'s configured image resolves to a different digest than what is actually running', () => {
+  const serviceStatus: ServiceStatus = {
+    code: 'o24-cms', displayName: 'CMS', composeService: 'cms', containerName: 'o24-cms',
+    status: 'running', health: 'none', imageRef: `${REPO}:latest`, imageId: 'sha256:localid',
+    repoDigest: DIGEST_B,
+    configuredImage: `${REPO}@${DIGEST_A}`,
+  }
+  const result = toRunningRelease({ environment: 'DEV', service: 'CMS', environmentOnline: true, serviceStatus, checkedAt: 'now' })
+  assert.equal(result.configDrift, true)
+})
+
+test('toRunningRelease does not flag configDrift when configuredImage matches the running digest, or is absent', () => {
+  const matching: ServiceStatus = {
+    code: 'o24-cms', displayName: 'CMS', composeService: 'cms', containerName: 'o24-cms',
+    status: 'running', health: 'none', imageRef: `${REPO}@${DIGEST_A}`, imageId: 'sha256:localid',
+    repoDigest: DIGEST_A, configuredImage: `${REPO}@${DIGEST_A}`,
+  }
+  assert.equal(toRunningRelease({ environment: 'DEV', service: 'CMS', environmentOnline: true, serviceStatus: matching, checkedAt: 'now' }).configDrift, false)
+
+  const noConfigured: ServiceStatus = {
+    code: 'o24-cms', displayName: 'CMS', composeService: 'cms', containerName: 'o24-cms',
+    status: 'running', health: 'none', imageRef: `${REPO}@${DIGEST_A}`, imageId: 'sha256:localid',
+    repoDigest: DIGEST_A,
+  }
+  assert.equal(toRunningRelease({ environment: 'DEV', service: 'CMS', environmentOnline: true, serviceStatus: noConfigured, checkedAt: 'now' }).configDrift, false)
+})
+
+test('resolveReleaseComparison surfaces a configDrift warning ahead of other warnings, without changing the digest-based headline state', () => {
+  const result = resolveReleaseComparison({
+    latest: makeLatest(),
+    dev: makeRunning({ repoDigest: DIGEST_A, configDrift: true }),
+  })
+  // DEV's digest still matches latest -> DEV_SYNCED stays the headline; the
+  // drift is a warning, not a different classification of "which digest is
+  // running" (that answer, from repoDigest, is unaffected by configDrift).
+  assert.equal(result.state, 'DEV_SYNCED')
+  assert.ok(result.warnings.some((w) => w.includes('DEV') && w.includes('cấu hình triển khai')))
+})
+
 test('toRunningRelease maps exited/stopped/dead to "stopped" and anything else to "unknown"', () => {
   const base = { environment: 'DEV', service: 'CMS' as const, environmentOnline: true, checkedAt: 'now' }
   const statusOf = (status: string): ServiceStatus => ({

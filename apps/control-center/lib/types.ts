@@ -238,6 +238,21 @@ export type RunningRelease = {
   repository?: string
   tag?: string
   repoDigest?: string
+  /** Local Docker image ID (ServiceStatus.imageId) — debug/display only. NEVER compared or used for promote/deploy decisions. */
+  localImageId?: string
+  /** The reference the container was actually started from (ServiceStatus.imageRef, e.g. "repo@sha256:..." or "repo:latest") — debug/display only. */
+  imageReference?: string
+  /**
+   * True when the digest the deploy pipeline most recently configured for
+   * this service (ServiceStatus.configuredImage) resolves to a DIFFERENT
+   * digest than what's actually running (repoDigest). This means a deploy
+   * was recorded as pulling/writing one digest, but the container was never
+   * actually recreated from it — typically because docker-compose on the
+   * host isn't consuming the pinned image reference. Distinct from "DEV
+   * hasn't been redeployed yet": redeploying again is unlikely to fix this
+   * on its own, since the previous deploy already tried.
+   */
+  configDrift?: boolean
   snapshotId?: string
   containerStatus: 'running' | 'stopped' | 'missing' | 'unknown'
   checkedAt: string
