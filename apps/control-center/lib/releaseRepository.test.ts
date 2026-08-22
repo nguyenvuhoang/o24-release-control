@@ -1,10 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { promises as fs } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import {
   buildRegistryReleaseId,
   buildReleaseId,
+  FileReleaseRepository,
   InMemoryReleaseRepository,
   InvalidReleaseInputError,
+  planReleaseDeploy,
   ReleaseConflictError,
   type CreateReleaseInput,
 } from './releaseRepository'
@@ -215,4 +220,110 @@ test('github-actions releases still require branch, commitSha, githubRunId and g
   await assert.rejects(() => repo.create(makeInput({ commitSha: null })), InvalidReleaseInputError)
   await assert.rejects(() => repo.create(makeInput({ githubRunId: null })), InvalidReleaseInputError)
   await assert.rejects(() => repo.create(makeInput({ githubRunAttempt: null })), InvalidReleaseInputError)
+})
+
+// ---- getByDigest — mapping "which release is this live digest" ----
+
+test('getByDigest maps a live runtime digest to its release, matching either digest form', async () => {
+  const repo = new InMemoryReleaseRepository()
+  const digest = 'f'.repeat(64)
+  const { record } = await repo.create(makeInput({ repoDigest: `vknighthub/ips_o24cms@sha256:${digest}` }))
+
+  // Deploy Agent reports the bare "sha256:<hex>" form (no repo prefix) —
+  // must resolve to the same release as the full "repo@sha256:<hex>" form.
+  assert.deepEqual(await repo.getByDigest('CMS', `sha256:${digest}`), record)
+  assert.deepEqual(await repo.getByDigest('CMS', `vknighthub/ips_o24cms@sha256:${digest}`), record)
+})
+
+test('getByDigest returns undefined for a digest no release has, or for the wrong service', async () => {
+  const repo = new InMemoryReleaseRepository()
+  const digest = '1'.repeat(64)
+  await repo.create(makeInput({ service: 'CMS', repoDigest: `vknighthub/ips_o24cms@sha256:${digest}` }))
+
+  assert.equal(await repo.getByDigest('CMS', `sha256:${'2'.repeat(64)}`), undefined)
+  assert.equal(await repo.getByDigest('WFO', `sha256:${digest}`), undefined)
+})
+
+// ---- list() filters (branch/source/since/until) ----
+
+test('list filters by branch and by source', async () => {
+  const repo = new InMemoryReleaseRepository()
+  await repo.create(makeInput({ branch: 'developer', githubRunId: 1, githubRunAttempt: 1 }))
+  await repo.create(makeInput({ branch: 'main', githubRunId: 2, githubRunAttempt: 1 }))
+  await repo.create(makeRegistryInput({ repoDigest: `vknighthub/ips_o24cms@sha256:${'9'.repeat(64)}` }))
+
+  const byBranch = await repo.list({ service: 'CMS', branch: 'main' })
+  assert.deepEqual(byBranch.items.map((item) => item.githubRunId), [2])
+
+  const bySource = await repo.list({ service: 'CMS', source: 'docker-registry' })
+  assert.equal(bySource.items.length, 1)
+  assert.equal(bySource.items[0].source, 'docker-registry')
+})
+
+test('list filters by since/until on createdAt', async () => {
+  const repo = new InMemoryReleaseRepository()
+  await repo.create(makeInput({ githubRunId: 1, githubRunAttempt: 1 }))
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  const cutoff = new Date().toISOString()
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  await repo.create(makeInput({ githubRunId: 2, githubRunAttempt: 1 }))
+
+  const before = await repo.list({ service: 'CMS', until: cutoff })
+  assert.deepEqual(before.items.map((item) => item.githubRunId), [1])
+
+  const after = await repo.list({ service: 'CMS', since: cutoff })
+  assert.deepEqual(after.items.map((item) => item.githubRunId), [2])
+})
+
+// ---- planReleaseDeploy — the pure decision logic behind redeploy/rollback ----
+
+test('planReleaseDeploy derives toRepoDigest only from the release, never from fromRepoDigest', () => {
+  const release = { repoDigest: `vknighthub/ips_o24cms@sha256:${'a'.repeat(64)}` }
+  const plan = planReleaseDeploy(release, 'redeploy', `sha256:${'b'.repeat(64)}`)
+  assert.deepEqual(plan, { ok: true, toRepoDigest: `sha256:${'a'.repeat(64)}` })
+})
+
+test('planReleaseDeploy rejects a snapshot with no usable digest', () => {
+  const plan = planReleaseDeploy({ repoDigest: 'not-a-digest' }, 'redeploy', undefined)
+  assert.deepEqual(plan, { ok: false, reason: 'missing_digest' })
+})
+
+test('planReleaseDeploy rejects rollback when the target digest is already running, but allows redeploy', () => {
+  const digest = 'c'.repeat(64)
+  const release = { repoDigest: `vknighthub/ips_o24cms@sha256:${digest}` }
+
+  assert.deepEqual(planReleaseDeploy(release, 'rollback', `sha256:${digest}`), { ok: false, reason: 'already_current' })
+  assert.deepEqual(planReleaseDeploy(release, 'redeploy', `sha256:${digest}`), { ok: true, toRepoDigest: `sha256:${digest}` })
+})
+
+test('planReleaseDeploy allows rollback when the current digest is unknown or different', () => {
+  const digest = 'd'.repeat(64)
+  const release = { repoDigest: `vknighthub/ips_o24cms@sha256:${digest}` }
+
+  assert.deepEqual(planReleaseDeploy(release, 'rollback', undefined), { ok: true, toRepoDigest: `sha256:${digest}` })
+  assert.deepEqual(planReleaseDeploy(release, 'rollback', `sha256:${'0'.repeat(64)}`), { ok: true, toRepoDigest: `sha256:${digest}` })
+})
+
+// ---- Regression: re-syncing a release written before `commitMessage`
+// existed must dedupe, not throw ReleaseConflictError (found live, against
+// real production data, while verifying this feature — see final report). ----
+
+test('create() dedupes a pre-existing stored record that has no commitMessage key at all', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'o24-release-repo-test-'))
+  const filePath = path.join(dir, 'releases.jsonl')
+  const repo = new FileReleaseRepository(filePath)
+
+  const input = makeRegistryInput({ repoDigest: `vknighthub/ips_o24cms@sha256:${'6'.repeat(64)}` })
+  const { record: prepared } = await repo.create(input)
+
+  // Simulate a record written before `commitMessage` was added to the
+  // schema: JSON.parse(JSON.stringify(...)) would keep an explicit `null`,
+  // so the key is deleted outright to reproduce "absent from old JSON".
+  const legacyRecord = { ...prepared } as Record<string, unknown>
+  delete legacyRecord.commitMessage
+  await fs.writeFile(filePath, `${JSON.stringify(legacyRecord)}\n`, 'utf8')
+
+  const result = await repo.create(input)
+  assert.equal(result.deduped, true)
+  assert.equal(result.record.id, prepared.id)
 })

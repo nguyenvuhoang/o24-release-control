@@ -1,3 +1,4 @@
+import type { ReleaseComparisonState, ResolvedReleaseSource, RunningRelease } from '../../../lib/types'
 import type { BuildTrackedStatus } from './useBuildTracker'
 
 export type BadgeTone = 'success' | 'danger' | 'warning' | 'neutral'
@@ -93,4 +94,82 @@ const BUILD_STATUS_LABELS: Record<BuildTrackedStatus, string> = {
 
 export function buildStatusLabel(status: BuildTrackedStatus): string {
   return BUILD_STATUS_LABELS[status]
+}
+
+// ---- Version comparison (Latest Build vs DEV vs UAT vs PROD) ----
+// See lib/releaseComparison.ts — this is display vocabulary only, the
+// state/status values themselves are decided entirely by that pure module.
+
+export function runningReleaseStatusTone(status: RunningRelease['containerStatus']): BadgeTone {
+  if (status === 'running') return 'success'
+  if (status === 'stopped') return 'danger'
+  return 'neutral' // missing / unknown
+}
+
+const RUNNING_RELEASE_STATUS_LABELS: Record<RunningRelease['containerStatus'], string> = {
+  running: 'ĐANG CHẠY',
+  stopped: 'ĐÃ DỪNG',
+  missing: 'CHƯA TRIỂN KHAI',
+  unknown: 'KHÔNG THỂ KIỂM TRA',
+}
+
+export function runningReleaseStatusLabel(status: RunningRelease['containerStatus']): string {
+  return RUNNING_RELEASE_STATUS_LABELS[status]
+}
+
+const RESOLVED_RELEASE_SOURCE_LABELS: Record<ResolvedReleaseSource, string> = {
+  'release-control': 'Release Control',
+  github: 'GitHub Actions',
+  telegram: 'Telegram',
+  external: 'Build ngoài hệ thống',
+  unknown: 'Không xác định',
+}
+
+export function resolvedReleaseSourceLabel(source: ResolvedReleaseSource): string {
+  return RESOLVED_RELEASE_SOURCE_LABELS[source]
+}
+
+export function resolvedReleaseSourceTone(source: ResolvedReleaseSource): BadgeTone {
+  if (source === 'release-control') return 'success'
+  if (source === 'external') return 'warning'
+  if (source === 'unknown') return 'danger'
+  return 'neutral' // github / telegram
+}
+
+const COMPARISON_STATE_LABELS: Record<ReleaseComparisonState, string> = {
+  NEW_BUILD_AVAILABLE: 'Có bản build mới',
+  DEV_SYNCED: 'DEV đã đồng bộ',
+  DEV_OUTDATED: 'DEV đang dùng bản cũ',
+  UAT_SYNCED_WITH_DEV: 'UAT đã đồng bộ với DEV',
+  UAT_DIFFERS_FROM_DEV: 'UAT khác DEV',
+  UAT_AHEAD_OR_UNKNOWN: 'UAT khác DEV (chưa xác định)',
+  PROD_SYNCED_WITH_UAT: 'PROD đã đồng bộ với UAT',
+  PROD_DIFFERS_FROM_UAT: 'PROD khác UAT',
+  UNTRACKED_BUILD: 'Bản build chưa được theo dõi',
+  ENVIRONMENT_UNAVAILABLE: 'Không thể kiểm tra',
+  NO_BUILD: 'Chưa có dữ liệu',
+  UNKNOWN: 'Không xác định',
+}
+
+export function comparisonStateLabel(state: ReleaseComparisonState): string {
+  return COMPARISON_STATE_LABELS[state]
+}
+
+const COMPARISON_STATE_TONES: Record<ReleaseComparisonState, BadgeTone> = {
+  NEW_BUILD_AVAILABLE: 'warning',
+  DEV_SYNCED: 'success',
+  DEV_OUTDATED: 'danger',
+  UAT_SYNCED_WITH_DEV: 'success',
+  UAT_DIFFERS_FROM_DEV: 'warning',
+  UAT_AHEAD_OR_UNKNOWN: 'warning',
+  PROD_SYNCED_WITH_UAT: 'success',
+  PROD_DIFFERS_FROM_UAT: 'warning',
+  UNTRACKED_BUILD: 'warning',
+  ENVIRONMENT_UNAVAILABLE: 'neutral',
+  NO_BUILD: 'neutral',
+  UNKNOWN: 'neutral',
+}
+
+export function comparisonStateTone(state: ReleaseComparisonState): BadgeTone {
+  return COMPARISON_STATE_TONES[state]
 }

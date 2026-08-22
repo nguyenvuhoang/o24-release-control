@@ -13,6 +13,8 @@ import type {
   RegistryServiceStatus,
   RegistryStatusResponse,
   RegistrySyncResponse,
+  ReleaseDeployIntent,
+  ReleaseSnapshot,
   ServiceStatus,
 } from '../../lib/types'
 import { githubServiceForAgentCode } from '../../lib/github/serviceMap'
@@ -26,10 +28,13 @@ import { BuildDialog } from './release-control/BuildDialog'
 import { DashboardHeader } from './release-control/DashboardHeader'
 import { EnvironmentPanel } from './release-control/EnvironmentPanel'
 import { EnvironmentTabs } from './release-control/EnvironmentTabs'
+import { LatestReleasePanel } from './release-control/LatestReleasePanel'
 import { LogsModal } from './release-control/LogsModal'
 import { OperationLogDrawer } from './release-control/OperationLogDrawer'
 import type { ActiveOperation } from './release-control/OperationLogDrawer'
+import { ReleaseTimelinePanel } from './release-control/ReleaseTimelinePanel'
 import { SummaryCards } from './release-control/SummaryCards'
+import { useReleaseComparison } from './release-control/useReleaseComparison'
 import type { BuildTrackedStatus } from './release-control/useBuildTracker'
 import { useBuildTracker } from './release-control/useBuildTracker'
 
@@ -94,6 +99,18 @@ export default function Dashboard({ username }: Props) {
   const [buildDialogTarget, setBuildDialogTarget] = useState<{ environment: EnvironmentDashboard; service: ServiceStatus } | null>(null)
   const [buildDetailTarget, setBuildDetailTarget] = useState<{ githubService: string; serviceLabel: string } | null>(null)
   const previousBuildStatuses = useRef<Record<string, BuildTrackedStatus>>({})
+
+  // "Latest Build vs DEV vs UAT vs PROD" — its own polling cadence (see the
+  // hook), fed by data this component already fetches (dashboard.environments
+  // + registryStatus below). refreshComparisons() is called explicitly after
+  // every action that can change what's running (build/import/deploy/
+  // promote/restart/rollback) instead of waiting for its own timer.
+  const [deployingLatestKeys, setDeployingLatestKeys] = useState<Set<string>>(new Set())
+  const {
+    comparisons,
+    lastCheckedAt: comparisonCheckedAt,
+    refresh: refreshComparisons,
+  } = useReleaseComparison(dashboard?.environments ?? [], registryStatus)
 
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
@@ -186,6 +203,7 @@ export default function Dashboard({ username }: Props) {
         if (state.status === 'success' && previousStatus !== undefined) {
           SwalAlert.toast(`Build ${service} thành công`)
           void refresh(true)
+          void refreshComparisons()
         } else if (state.status === 'failed' && previousStatus !== undefined) {
           SwalAlert.toast(`Build ${service} thất bại`, 'error')
           void refresh(true)
@@ -327,6 +345,7 @@ export default function Dashboard({ username }: Props) {
       setBusy(null)
       setTrackedOperation(null)
       await refresh(true)
+      void refreshComparisons()
       if (finalStatus === 'success') {
         await SwalAlert.success(`${operation.actionLabel} thành công`)
       } else {
@@ -432,6 +451,7 @@ export default function Dashboard({ username }: Props) {
       return
     }
     const serviceLabel = service.displayName || service.code
+    const expectedDigest = service.repoDigest
     const confirmed = await SwalAlert.confirm({
       title: 'Xác nhận chuyển tiếp',
       message: `${escapeHtml(serviceLabel)} sẽ được chuyển tiếp từ ${escapeHtml(environment.code)} sang ${escapeHtml(target.code)}.`,
@@ -439,6 +459,31 @@ export default function Dashboard({ username }: Props) {
       cancelText: 'Hủy',
     })
     if (!confirmed) return
+
+    // Race guard: the source's digest may have changed between opening this
+    // dialog and confirming it (another deploy/rollback/promote landed in
+    // the meantime). /api/promote always re-reads the source fresh itself
+    // (so correctness never depends on this), but the user deserves a
+    // warning if what they're about to promote no longer matches what they
+    // saw when they confirmed.
+    try {
+      const response = await fetch('/api/dashboard', { cache: 'no-store' })
+      const fresh = response.ok ? await readJsonSafe<DashboardResponse>(response) : null
+      const freshService = fresh?.environments
+        .find((item) => item.code === environment.code)
+        ?.services.find((item) => item.code === service.code)
+      if (freshService && freshService.repoDigest !== expectedDigest) {
+        await SwalAlert.error(
+          `Digest nguồn trên ${environment.code} đã thay đổi kể từ khi mở hộp thoại xác nhận. Vui lòng làm mới và kiểm tra lại.`,
+        )
+        await refresh(true)
+        return
+      }
+    } catch {
+      // Best-effort re-check — a failure here doesn't block the promote,
+      // since /api/promote re-validates the source fresh regardless.
+    }
+
     // The operation actually runs on the target agent (promote internally
     // triggers a deploy there), so the SSE stream must target `target`, not
     // the source environment the button lives on.
@@ -492,6 +537,57 @@ export default function Dashboard({ username }: Props) {
       '/api/rollback',
       { environment: environment.code, service: service.code },
       environment, service, 'rollback',
+    )
+  }
+
+  // "Deploy lại" and "rollback tới release cụ thể" from the Version
+  // Timeline — both dispatch through /api/releases/{id}/deploy, which loads
+  // the immutable repoDigest from the stored ReleaseSnapshot itself (never
+  // resolves "latest", never trusts a client-supplied digest). Reuses the
+  // exact same startOperation()/SSE tracking as deploy/promote/restart/rollback.
+  async function deployRelease(release: ReleaseSnapshot, environmentCode: string, intent: ReleaseDeployIntent) {
+    if (!dashboard) return
+    const environment = dashboard.environments.find((item) => item.code === environmentCode)
+    if (!environment) return
+    const service = environment.services.find((item) => githubServiceForAgentCode(item.code) === release.service)
+    if (!service) {
+      await SwalAlert.error(`Không tìm thấy dịch vụ ${release.service} trên ${environmentCode}`)
+      return
+    }
+
+    const isRollback = intent === 'rollback'
+    const serviceLabel = service.displayName || service.code
+    const commitLine = release.commitSha
+      ? `<div><span class="text-slate-500">Commit:</span> <span class="font-mono">${escapeHtml(release.commitSha.slice(0, 12))}</span></div>`
+      : ''
+    const details = [
+      `<div class="mt-3 space-y-1 text-left text-xs">`,
+      `<div><span class="text-slate-500">Service:</span> <span class="font-mono">${escapeHtml(release.service)}</span></div>`,
+      `<div><span class="text-slate-500">Môi trường:</span> <span class="font-mono">${escapeHtml(environmentCode)}</span></div>`,
+      `<div><span class="text-slate-500">Phiên bản:</span> <span class="font-mono">${escapeHtml(release.tag)}</span></div>`,
+      commitLine,
+      `<div><span class="text-slate-500">Digest:</span> <span class="font-mono break-all">${escapeHtml(release.repoDigest)}</span></div>`,
+      `<div class="mt-2 text-amber-400">Release hiện đang chạy trên ${escapeHtml(environmentCode)} sẽ bị thay thế.</div>`,
+      `</div>`,
+    ].join('')
+
+    const confirmed = await SwalAlert.confirm({
+      title: isRollback ? 'Xác nhận quay lại phiên bản' : 'Xác nhận triển khai lại',
+      message: `${escapeHtml(serviceLabel)} sẽ được ${isRollback ? 'quay lại' : 'triển khai lại'} trên ${escapeHtml(environmentCode)}.${details}`,
+      confirmText: isRollback ? 'Quay lại phiên bản' : 'Triển khai lại',
+      cancelText: 'Hủy',
+      danger: isRollback,
+    })
+    if (!confirmed) return
+
+    await startOperation(
+      `release-${intent}:${environmentCode}:${service.code}`,
+      `/api/releases/${encodeURIComponent(release.id)}/deploy`,
+      { environment: environmentCode, intent },
+      environment,
+      service,
+      isRollback ? 'rollback' : 'deploy',
+      { actionLabel: isRollback ? 'Quay lại phiên bản' : 'Triển khai lại', failVerb: isRollback ? 'quay lại phiên bản' : 'triển khai lại' },
     )
   }
 
@@ -575,10 +671,91 @@ export default function Dashboard({ username }: Props) {
           : `${githubService}: đã tạo Release Snapshot mới từ Docker Hub`,
       )
       await refresh(true)
+      void refreshComparisons()
     } catch (caught) {
       await SwalAlert.error(caught instanceof Error ? caught.message : 'Đồng bộ Docker Hub thất bại')
     } finally {
       setRegistrySyncingKeys((prev) => {
+        const next = new Set(prev)
+        next.delete(githubService)
+        return next
+      })
+    }
+  }
+
+  // "Triển khai bản mới → DEV": resolves the latest build via the
+  // comparison state machine (never re-resolved here), imports it as a
+  // Release Snapshot first if it's UNTRACKED_BUILD (no snapshot yet — the
+  // user is asked to confirm once for the whole action, not once per step),
+  // then deploys that snapshot's immutable repoDigest to DEV through the
+  // exact same /api/releases/{id}/deploy + startOperation()/SSE path the
+  // Version Timeline's "Triển khai lại" already uses. Never auto-promotes
+  // UAT/PROD.
+  async function deployLatestToDev(service: ServiceStatus) {
+    const githubService = githubServiceForAgentCode(service.code)
+    if (!githubService) return
+    const comparison = comparisons[githubService]
+    const latest = comparison?.latest
+    if (!latest || !comparison?.canDeployLatestToDev) return
+    const devEnvironment = (dashboard?.environments ?? []).find((item) => item.code === 'DEV')
+    if (!devEnvironment) return
+
+    const serviceLabel = service.displayName || service.code
+    const commitLine = latest.commitSha
+      ? `<div><span class="text-slate-500">Commit:</span> <span class="font-mono">${escapeHtml(latest.commitSha.slice(0, 12))}</span></div>`
+      : ''
+    const untrackedLine = !latest.snapshotId
+      ? `<div class="mt-2 text-amber-400">Bản build này chưa có Release Snapshot — hệ thống sẽ tự động đồng bộ trước khi triển khai.</div>`
+      : `<div class="mt-2 text-amber-400">Release hiện đang chạy trên DEV sẽ bị thay thế.</div>`
+    const details = [
+      `<div class="mt-3 space-y-1 text-left text-xs">`,
+      `<div><span class="text-slate-500">Service:</span> <span class="font-mono">${escapeHtml(githubService)}</span></div>`,
+      `<div><span class="text-slate-500">Môi trường:</span> <span class="font-mono">DEV</span></div>`,
+      `<div><span class="text-slate-500">Tag:</span> <span class="font-mono">${escapeHtml(latest.tag)}</span></div>`,
+      commitLine,
+      `<div><span class="text-slate-500">Digest:</span> <span class="font-mono break-all">${escapeHtml(latest.repoDigest)}</span></div>`,
+      untrackedLine,
+      `</div>`,
+    ].join('')
+
+    const confirmed = await SwalAlert.confirm({
+      title: 'Xác nhận triển khai bản mới',
+      message: `${escapeHtml(serviceLabel)} sẽ được triển khai bản mới nhất lên DEV.${details}`,
+      confirmText: 'Triển khai',
+      cancelText: 'Hủy',
+    })
+    if (!confirmed) return
+
+    setDeployingLatestKeys((prev) => new Set(prev).add(githubService))
+    try {
+      let releaseId = latest.snapshotId
+      if (!releaseId) {
+        const importResponse = await fetch('/api/registry/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ service: githubService }),
+        })
+        const importResult = await readJsonSafe<RegistrySyncResponse & { error?: string; details?: string }>(importResponse)
+        if (!importResponse.ok || !importResult?.success) {
+          throw new Error(importResult?.details ?? importResult?.error ?? `Đồng bộ Release Snapshot thất bại (mã ${importResponse.status})`)
+        }
+        releaseId = importResult.release.id
+        void refreshComparisons()
+      }
+
+      await startOperation(
+        `deploy-latest:DEV:${service.code}`,
+        `/api/releases/${encodeURIComponent(releaseId)}/deploy`,
+        { environment: 'DEV', intent: 'redeploy' },
+        devEnvironment,
+        service,
+        'deploy',
+        { actionLabel: 'Triển khai bản mới', failVerb: 'triển khai bản mới' },
+      )
+    } catch (caught) {
+      await SwalAlert.error(caught instanceof Error ? caught.message : 'Triển khai bản mới thất bại')
+    } finally {
+      setDeployingLatestKeys((prev) => {
         const next = new Set(prev)
         next.delete(githubService)
         return next
@@ -651,8 +828,9 @@ export default function Dashboard({ username }: Props) {
             lastUpdatedAt={lastUpdatedFull}
             busyKey={busy?.key ?? ''}
             getBuildState={getBuildStateForService}
-            registryStatus={registryStatus}
+            comparisons={comparisons}
             registrySyncingKeys={registrySyncingKeys}
+            deployingLatestKeys={deployingLatestKeys}
             onDeploy={deploy}
             onPromote={promote}
             onRestart={restart}
@@ -662,6 +840,7 @@ export default function Dashboard({ username }: Props) {
             onViewBuild={openBuildDetail}
             onSyncBuild={syncBuildStatus}
             onSyncRegistry={syncRegistry}
+            onDeployLatestToDev={deployLatestToDev}
             onRetry={() => void refresh(true)}
           />
         ) : !dashboard && loading ? (
@@ -670,6 +849,19 @@ export default function Dashboard({ username }: Props) {
           </div>
         ) : null}
       </section>
+
+      {environments.length > 0 ? (
+        <LatestReleasePanel
+          registryStatus={registryStatus}
+          environments={environments}
+          lastCheckedAt={comparisonCheckedAt}
+          onRefresh={() => void refreshComparisons()}
+        />
+      ) : null}
+
+      {environments.length > 0 ? (
+        <ReleaseTimelinePanel environments={environments} operationBusy={Boolean(busy)} onDeploy={deployRelease} />
+      ) : null}
 
       <AuditLogPanel
         records={audit}

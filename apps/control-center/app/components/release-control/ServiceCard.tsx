@@ -1,7 +1,22 @@
-import type { EnvironmentDashboard, RegistryServiceStatus, ServiceStatus } from '../../../lib/types'
+import type { EnvironmentDashboard, ReleaseComparison, ResolvedRelease, RunningRelease, ServiceStatus } from '../../../lib/types'
 import { imageRepositoryFor, githubServiceForAgentCode } from '../../../lib/github/serviceMap'
 import { CopyableValue } from './CopyableValue'
-import { StatusBadge, buildStatusLabel, buildStatusTone, containerStatusLabel, containerStatusTone, hasHealthCheck, healthLabel, healthTone } from './StatusBadge'
+import {
+  StatusBadge,
+  buildStatusLabel,
+  buildStatusTone,
+  comparisonStateLabel,
+  comparisonStateTone,
+  containerStatusLabel,
+  containerStatusTone,
+  hasHealthCheck,
+  healthLabel,
+  healthTone,
+  resolvedReleaseSourceLabel,
+  resolvedReleaseSourceTone,
+  runningReleaseStatusLabel,
+  runningReleaseStatusTone,
+} from './StatusBadge'
 import type { BuildTrackedState } from './useBuildTracker'
 
 type ServiceCardProps = {
@@ -10,11 +25,11 @@ type ServiceCardProps = {
   nextEnvironment?: EnvironmentDashboard
   previousEnvironment?: EnvironmentDashboard
   previousService?: ServiceStatus
-  // UAT's copy of this same service — only used to render the DEV card's
-  // Docker Hub Registry Sync comparison (Docker Hub / Release / DEV / UAT).
-  nextService?: ServiceStatus
-  registryStatus?: RegistryServiceStatus
+  // Latest Build vs DEV vs UAT vs PROD — see lib/releaseComparison.ts. Only
+  // rendered on the DEV card (same placement rule as Build below).
+  comparison?: ReleaseComparison
   registrySyncing?: boolean
+  deployingLatest?: boolean
   isBusy: boolean
   buildState?: BuildTrackedState
   onDeploy: (environment: EnvironmentDashboard, service: ServiceStatus, prefillDigest?: string) => Promise<void>
@@ -26,6 +41,7 @@ type ServiceCardProps = {
   onViewBuild: (service: ServiceStatus) => void
   onSyncBuild: (service: ServiceStatus) => void
   onSyncRegistry: (service: ServiceStatus) => Promise<void>
+  onDeployLatestToDev: (service: ServiceStatus) => Promise<void>
 }
 
 const BUTTON_BASE =
@@ -45,9 +61,9 @@ export function ServiceCard({
   nextEnvironment,
   previousEnvironment,
   previousService,
-  nextService,
-  registryStatus,
+  comparison,
   registrySyncing,
+  deployingLatest,
   isBusy,
   buildState,
   onDeploy,
@@ -59,6 +75,7 @@ export function ServiceCard({
   onViewBuild,
   onSyncBuild,
   onSyncRegistry,
+  onDeployLatestToDev,
 }: ServiceCardProps) {
   const disabled = isBusy || !environment.online
 
@@ -69,20 +86,13 @@ export function ServiceCard({
   const canBuild = Boolean(githubService)
   const buildBusy = buildState?.status === 'triggering' || buildState?.status === 'queued' || buildState?.status === 'in_progress'
 
-  // Docker Hub Registry Sync comparison — DEV card only (same placement rule
+  // Latest Build vs DEV vs UAT vs PROD — DEV card only (same placement rule
   // as Build above): team members sometimes build from Telegram or the DEV
   // server and push straight to Docker Hub, bypassing GitHub Actions, so
   // Docker Hub's current "latest" digest can be ahead of what Release
-  // Control knows about. Comparison/deploy always uses repoDigest, never
-  // localStorage.
-  const showRegistrySync = !previousEnvironment && Boolean(githubService) && Boolean(registryStatus)
-  const dockerHubDigest = registryStatus?.dockerHub?.repoDigest
-  const releaseDigest = registryStatus?.latestRelease?.repoDigest
-  const hasUnsyncedImage = Boolean(dockerHubDigest && dockerHubDigest !== releaseDigest)
-  const referenceDigest = releaseDigest ?? dockerHubDigest
-  const devUpToDate = Boolean(referenceDigest && service.repoDigest && service.repoDigest === referenceDigest)
-  const uatDiffersFromDev = Boolean(service.repoDigest && nextService?.repoDigest && service.repoDigest !== nextService.repoDigest)
-  const canDeployReleaseToDev = Boolean(releaseDigest && releaseDigest !== service.repoDigest)
+  // Control knows about. All state comes from lib/releaseComparison.ts —
+  // this component never re-derives sync/outdated itself.
+  const showComparison = !previousEnvironment && Boolean(githubService) && Boolean(comparison)
 
   const buttons: { key: string; label: string; variant: keyof typeof BUTTON_VARIANTS; disabled: boolean; onClick: () => void }[] = []
   if (canBuild) {
@@ -219,40 +229,29 @@ export function ServiceCard({
         </div>
       ) : null}
 
-      {showRegistrySync ? (
+      {showComparison && comparison ? (
         <div className="mb-2.5 rounded border border-slate-800/70 bg-slate-950/30 px-2.5 py-2 text-[11px] leading-relaxed">
-          {hasUnsyncedImage ? (
-            <div className="mb-1.5 inline-block rounded bg-amber-500/10 px-1.5 py-0.5 font-medium text-amber-400">
-              Có image mới trên Docker Hub chưa được đồng bộ
-            </div>
+          <div className="mb-1.5 flex items-center justify-between gap-2">
+            <StatusBadge tone={comparisonStateTone(comparison.state)} label={comparisonStateLabel(comparison.state)} />
+            {comparison.dev?.checkedAt ? <span className="text-slate-600">Kiểm tra lúc {formatTime(comparison.dev.checkedAt)}</span> : null}
+          </div>
+
+          {comparison.warnings.length > 0 ? (
+            <ul className="mb-1.5 list-none space-y-0.5 p-0 text-slate-500">
+              {comparison.warnings.map((warning) => (
+                <li key={warning}>• {warning}</li>
+              ))}
+            </ul>
           ) : null}
-          <dl className="space-y-1">
-            <div className="flex gap-1.5">
-              <dt className="w-20 shrink-0 text-slate-600">Docker Hub</dt>
-              <dd className="m-0 min-w-0 truncate font-mono text-slate-400">{shortDigest(dockerHubDigest)}</dd>
-            </div>
-            <div className="flex gap-1.5">
-              <dt className="w-20 shrink-0 text-slate-600">Release</dt>
-              <dd className="m-0 min-w-0 truncate font-mono text-slate-400">{shortDigest(releaseDigest)}</dd>
-            </div>
-            <div className="flex gap-1.5">
-              <dt className="w-20 shrink-0 text-slate-600">DEV</dt>
-              <dd className="m-0 min-w-0 truncate font-mono text-slate-400">{shortDigest(service.repoDigest)}</dd>
-            </div>
-            {nextEnvironment ? (
-              <div className="flex gap-1.5">
-                <dt className="w-20 shrink-0 text-slate-600">{nextEnvironment.code}</dt>
-                <dd className="m-0 min-w-0 truncate font-mono text-slate-400">{shortDigest(nextService?.repoDigest)}</dd>
-              </div>
-            ) : null}
-          </dl>
-          {devUpToDate ? <p className="mt-1.5 text-emerald-400">DEV đang chạy bản mới nhất</p> : null}
-          {uatDiffersFromDev && nextEnvironment ? (
-            <p className="mt-1.5 text-amber-400">
-              {nextEnvironment.code} khác DEV
-            </p>
-          ) : null}
-          <div className="mt-1.5 flex flex-wrap gap-3">
+
+          <div className="mb-1.5 grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+            <ComparisonRegion label="Latest Build" release={comparison.latest} />
+            <ComparisonRegion label="DEV" running={comparison.dev} />
+            <ComparisonRegion label="UAT" running={comparison.uat} />
+            <ComparisonRegion label="PROD" running={comparison.prod} />
+          </div>
+
+          <div className="flex flex-wrap gap-3">
             <button
               type="button"
               disabled={disabled || registrySyncing}
@@ -262,14 +261,15 @@ export function ServiceCard({
             >
               {registrySyncing ? 'Đang đồng bộ…' : 'Đồng bộ từ Docker Hub'}
             </button>
-            {canDeployReleaseToDev ? (
+            {comparison.canDeployLatestToDev ? (
               <button
                 type="button"
-                disabled={disabled}
-                onClick={() => void onDeploy(environment, service, releaseDigest)}
+                disabled={disabled || deployingLatest}
+                onClick={() => void onDeployLatestToDev(service)}
+                title="Nếu Latest Build chưa có Release Snapshot, sẽ tự động import trước khi triển khai."
                 className="font-medium text-slate-400 hover:underline disabled:cursor-not-allowed disabled:opacity-40"
               >
-                Triển khai → DEV
+                {deployingLatest ? 'Đang triển khai…' : 'Triển khai bản mới → DEV'}
               </button>
             ) : null}
           </div>
@@ -328,4 +328,49 @@ function formatDate(value?: string): string {
 function shortDigest(value?: string): string {
   if (!value) return '--'
   return value.length > 22 ? `${value.slice(0, 18)}…${value.slice(-6)}` : value
+}
+
+function formatTime(value?: string): string {
+  if (!value) return '--'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '--' : date.toLocaleTimeString('vi-VN')
+}
+
+// One of the four Latest Build / DEV / UAT / PROD regions. Accepts either a
+// ResolvedRelease (Latest Build) or a RunningRelease (DEV/UAT/PROD) — never
+// both — and renders the same shape either way so the four regions read
+// consistently. Full digest is always available via CopyableValue's
+// tooltip + copy button, never truncated-only.
+function ComparisonRegion({ label, release, running }: { label: string; release?: ResolvedRelease; running?: RunningRelease }) {
+  const digest = release?.repoDigest ?? running?.repoDigest
+  const tag = release?.tag ?? running?.tag
+  const commitSha = release?.commitSha
+  const time = release?.createdAt ?? running?.checkedAt
+  const timeLabel = release ? 'Build' : 'Kiểm tra'
+
+  return (
+    <div className="min-w-0 rounded border border-slate-800/60 bg-slate-900/40 p-2">
+      <p className="m-0 mb-1 text-[10px] tracking-wide text-slate-500 uppercase">{label}</p>
+      {digest ? (
+        <>
+          <CopyableValue value={digest} className="text-[11px]" />
+          {tag ? <p className="m-0 mt-0.5 truncate text-slate-400">Tag: {tag}</p> : null}
+          {commitSha ? <p className="m-0 truncate text-slate-500">Commit: {commitSha.slice(0, 10)}</p> : null}
+          {time ? (
+            <p className="m-0 text-slate-600">
+              {timeLabel}: {formatDate(time)}
+            </p>
+          ) : null}
+          <div className="mt-1 flex flex-wrap gap-1">
+            {release ? <StatusBadge tone={resolvedReleaseSourceTone(release.source)} label={resolvedReleaseSourceLabel(release.source)} /> : null}
+            {running ? <StatusBadge tone={runningReleaseStatusTone(running.containerStatus)} label={runningReleaseStatusLabel(running.containerStatus)} /> : null}
+          </div>
+        </>
+      ) : running?.error ? (
+        <p className="m-0 text-rose-400">Không thể kiểm tra</p>
+      ) : (
+        <p className="m-0 text-slate-600">Chưa có dữ liệu</p>
+      )}
+    </div>
+  )
 }

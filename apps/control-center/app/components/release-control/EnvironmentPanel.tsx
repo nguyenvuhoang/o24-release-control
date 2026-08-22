@@ -1,5 +1,6 @@
-import type { EnvironmentDashboard, RegistryServiceStatus, ServiceStatus } from '../../../lib/types'
+import type { BuildServiceCode } from '../../../lib/github/serviceMap'
 import { githubServiceForAgentCode } from '../../../lib/github/serviceMap'
+import type { EnvironmentDashboard, ReleaseComparison, ServiceStatus } from '../../../lib/types'
 import { displayEnvironmentName } from './environmentDisplay'
 import { ServiceCard } from './ServiceCard'
 import { StatusBadge, environmentLabel, environmentTone } from './StatusBadge'
@@ -12,8 +13,9 @@ type EnvironmentPanelProps = {
   lastUpdatedAt: string
   busyKey: string
   getBuildState: (service: ServiceStatus) => BuildTrackedState | undefined
-  registryStatus: RegistryServiceStatus[]
+  comparisons: Partial<Record<BuildServiceCode, ReleaseComparison>>
   registrySyncingKeys: Set<string>
+  deployingLatestKeys: Set<string>
   onDeploy: (environment: EnvironmentDashboard, service: ServiceStatus, prefillDigest?: string) => Promise<void>
   onPromote: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onRestart: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
@@ -23,6 +25,7 @@ type EnvironmentPanelProps = {
   onViewBuild: (service: ServiceStatus) => void
   onSyncBuild: (service: ServiceStatus) => void
   onSyncRegistry: (service: ServiceStatus) => Promise<void>
+  onDeployLatestToDev: (service: ServiceStatus) => Promise<void>
   onRetry: () => void
 }
 
@@ -33,8 +36,9 @@ export function EnvironmentPanel({
   lastUpdatedAt,
   busyKey,
   getBuildState,
-  registryStatus,
+  comparisons,
   registrySyncingKeys,
+  deployingLatestKeys,
   onDeploy,
   onPromote,
   onRestart,
@@ -44,6 +48,7 @@ export function EnvironmentPanel({
   onViewBuild,
   onSyncBuild,
   onSyncRegistry,
+  onDeployLatestToDev,
   onRetry,
 }: EnvironmentPanelProps) {
   return (
@@ -107,9 +112,9 @@ export function EnvironmentPanel({
                     nextEnvironment={nextEnvironment}
                     previousEnvironment={previousEnvironment}
                     previousService={previousEnvironment?.services.find((item) => item.code === service.code)}
-                    nextService={nextEnvironment?.services.find((item) => item.code === service.code)}
-                    registryStatus={githubService ? registryStatus.find((item) => item.service === githubService) : undefined}
+                    comparison={githubService ? comparisons[githubService] : undefined}
                     registrySyncing={githubService ? registrySyncingKeys.has(githubService) : false}
+                    deployingLatest={githubService ? deployingLatestKeys.has(githubService) : false}
                     isBusy={busyKey.includes(`${environment.code}:${service.code}`)}
                     buildState={getBuildState(service)}
                     onDeploy={onDeploy}
@@ -121,6 +126,7 @@ export function EnvironmentPanel({
                     onViewBuild={onViewBuild}
                     onSyncBuild={onSyncBuild}
                     onSyncRegistry={onSyncRegistry}
+                    onDeployLatestToDev={onDeployLatestToDev}
                   />
                 )
               })}

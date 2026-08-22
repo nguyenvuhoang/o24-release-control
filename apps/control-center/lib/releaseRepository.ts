@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { isRunningOnVercel, kvCommand, resolveKvConfig, type KvConfig } from './kv'
 import { BUILD_SERVICES, isBuildServiceCode, type BuildServiceCode } from './github/serviceMap'
-import type { ReleaseSnapshot, ReleaseSource } from './types'
+import type { ReleaseDeployIntent, ReleaseSnapshot, ReleaseSource } from './types'
 
 /**
  * Storage-agnostic Release Repository. A ReleaseSnapshot is immutable once
@@ -16,6 +16,8 @@ export interface ReleaseRepository {
   create(input: CreateReleaseInput): Promise<CreateReleaseResult>
   getById(id: string): Promise<ReleaseSnapshot | undefined>
   getByRun(runId: number, runAttempt: number): Promise<ReleaseSnapshot | undefined>
+  /** repoDigest may be the full "repo@sha256:<hex>" reference or the bare "sha256:<hex>" — only the hex is used to match. */
+  getByDigest(service: BuildServiceCode, repoDigest: string): Promise<ReleaseSnapshot | undefined>
   list(query?: ListReleasesQuery): Promise<ReleaseListResult>
 }
 
@@ -28,6 +30,7 @@ export type CreateReleaseInput = {
   // scan alone.
   branch?: string | null
   commitSha?: string | null
+  commitMessage?: string | null
   githubRunId?: number | null
   githubRunAttempt?: number | null
   dockerRepository: string
@@ -39,7 +42,20 @@ export type CreateReleaseInput = {
 
 export type CreateReleaseResult = { record: ReleaseSnapshot; deduped: boolean }
 
-export type ListReleasesQuery = { service?: BuildServiceCode; limit?: number; cursor?: string }
+export type ListReleasesQuery = {
+  service?: BuildServiceCode
+  limit?: number
+  cursor?: string
+  // Applied AFTER the underlying sorted-by-time page is read (see
+  // paginateReleases) — a returned page can have fewer than `limit` items
+  // even though more matches exist further back in the index.
+  branch?: string
+  source?: ReleaseSource
+  /** ISO 8601 — inclusive lower bound on createdAt. */
+  since?: string
+  /** ISO 8601 — inclusive upper bound on createdAt. */
+  until?: string
+}
 export type ReleaseListResult = { items: ReleaseSnapshot[]; nextCursor?: string }
 
 export class InvalidReleaseInputError extends Error {
@@ -63,14 +79,47 @@ export function buildReleaseId(service: BuildServiceCode, githubRunId: number, g
   return `release:${service}:${githubRunId}:${githubRunAttempt}`
 }
 
+// Extracts the bare 64-hex digest out of either form of a digest reference
+// ("repo@sha256:<hex>" or the bare "sha256:<hex>" the Deploy Agent reports)
+// so the two can always be compared/keyed on the same value. Returns null if
+// no valid digest is found.
+export function digestHexOf(value: string): string | null {
+  const match = value.match(/sha256:([0-9a-f]{64})/i)
+  return match ? match[1].toLowerCase() : null
+}
+
+export type ReleaseDeployPlan =
+  | { ok: true; toRepoDigest: string }
+  | { ok: false; reason: 'missing_digest' | 'already_current' }
+
+/**
+ * Pure decision logic behind POST /api/releases/[id]/deploy, factored out so
+ * the "always deploy exactly the stored snapshot's digest, never anything
+ * else" guarantee and the rollback no-op guard are directly unit-testable
+ * without Next.js/the agent/HTTP. `toRepoDigest` is derived ONLY from
+ * `release.repoDigest` — `fromRepoDigest` is consulted purely to decide
+ * whether to reject, never to decide what to deploy.
+ */
+export function planReleaseDeploy(
+  release: Pick<ReleaseSnapshot, 'repoDigest'>,
+  intent: ReleaseDeployIntent,
+  fromRepoDigest: string | undefined,
+): ReleaseDeployPlan {
+  const digestHex = digestHexOf(release.repoDigest)
+  if (!digestHex) return { ok: false, reason: 'missing_digest' }
+  const toRepoDigest = `sha256:${digestHex}`
+  if (intent === 'rollback' && fromRepoDigest && digestHexOf(fromRepoDigest) === digestHex) {
+    return { ok: false, reason: 'already_current' }
+  }
+  return { ok: true, toRepoDigest }
+}
+
 // docker-registry releases have no run+attempt to key off, so they're keyed
 // by the digest itself instead — re-syncing the same Docker Hub digest for a
 // service is therefore naturally idempotent, exactly like re-observing the
 // same run+attempt is for buildReleaseId above.
 export function buildRegistryReleaseId(service: BuildServiceCode, repoDigest: string): string {
-  const match = repoDigest.match(/sha256:([0-9a-f]{64})/i)
-  const digestHex = match ? match[1].toLowerCase() : repoDigest
-  return `release:${service}:digest:${digestHex}`
+  return `release:${service}:digest:${digestHexOf(repoDigest) ?? repoDigest}`
 }
 
 const GIT_SHA_PATTERN = /^[0-9a-f]{40}$/i
@@ -118,6 +167,7 @@ function prepareRelease(input: CreateReleaseInput): ReleaseSnapshot {
   }
   const branch = input.branch?.trim() || null
   const commitSha = input.commitSha?.trim() || null
+  const commitMessage = input.commitMessage?.trim() || null
   if (commitSha && !GIT_SHA_PATTERN.test(commitSha)) {
     throw new InvalidReleaseInputError('commitSha must be a 40-character hex Git SHA')
   }
@@ -143,6 +193,7 @@ function prepareRelease(input: CreateReleaseInput): ReleaseSnapshot {
     source,
     branch,
     commitSha,
+    commitMessage,
     dockerRepository,
     repoDigest: input.repoDigest,
     tag,
@@ -158,12 +209,22 @@ function prepareRelease(input: CreateReleaseInput): ReleaseSnapshot {
 // refreshed) fresh on every create() call, so a genuine repeat (same
 // release, called again — e.g. re-syncing an already-known Docker Hub
 // digest) would otherwise never compare equal to the stored original.
+//
+// commitMessage is compared with `?? null` on both sides: it's a field added
+// after the first releases were already written to KV/File storage, so an
+// old stored record has it as `undefined` (the key is simply absent from
+// its JSON) while a freshly prepared one always has it as `null` — without
+// normalizing, that mismatch alone would make re-syncing an already-known
+// pre-existing release wrongly throw ReleaseConflictError instead of
+// deduping. This is exactly the "keep backward compatibility with old data"
+// requirement in practice.
 function sameReleaseData(a: ReleaseSnapshot, b: ReleaseSnapshot): boolean {
   return (
     a.service === b.service &&
     a.source === b.source &&
     a.branch === b.branch &&
     a.commitSha === b.commitSha &&
+    (a.commitMessage ?? null) === (b.commitMessage ?? null) &&
     a.dockerRepository === b.dockerRepository &&
     a.repoDigest === b.repoDigest &&
     a.tag === b.tag &&
@@ -177,10 +238,23 @@ function runKeyString(runId: number, runAttempt: number): string {
   return `${runId}:${runAttempt}`
 }
 
+function digestIndexKeyString(service: BuildServiceCode, digestHex: string): string {
+  return `${service}:${digestHex}`
+}
+
+function matchesFilters(release: ReleaseSnapshot, query: ListReleasesQuery): boolean {
+  if (query.service && release.service !== query.service) return false
+  if (query.branch && release.branch !== query.branch) return false
+  if (query.source && release.source !== query.source) return false
+  if (query.since && release.createdAt < query.since) return false
+  if (query.until && release.createdAt > query.until) return false
+  return true
+}
+
 // ISO 8601 timestamps sort correctly as plain strings, so descending-by-time
 // needs no Date parsing.
 function paginateReleases(all: ReleaseSnapshot[], query: ListReleasesQuery): ReleaseListResult {
-  const filtered = query.service ? all.filter((release) => release.service === query.service) : all
+  const filtered = all.filter((release) => matchesFilters(release, query))
   const sorted = [...filtered].sort((a, b) => b.createdAt.localeCompare(a.createdAt))
   const limit = Math.min(Math.max(query.limit ?? 50, 1), 200)
   const offset = query.cursor ? Math.max(Number(query.cursor) || 0, 0) : 0
@@ -218,6 +292,13 @@ export class FileReleaseRepository implements ReleaseRepository {
     return all.find((release) => release.githubRunId === runId && release.githubRunAttempt === runAttempt)
   }
 
+  async getByDigest(service: BuildServiceCode, repoDigest: string): Promise<ReleaseSnapshot | undefined> {
+    const digestHex = digestHexOf(repoDigest)
+    if (!digestHex) return undefined
+    const all = await this.readAll()
+    return all.find((release) => release.service === service && digestHexOf(release.repoDigest) === digestHex)
+  }
+
   async list(query: ListReleasesQuery = {}): Promise<ReleaseListResult> {
     return paginateReleases(await this.readAll(), query)
   }
@@ -246,6 +327,15 @@ function kvRunKey(runId: number, runAttempt: number): string {
   return `o24:release:run:${runId}:attempt:${runAttempt}`
 }
 
+// Universal (both sources) digest -> releaseId pointer, so "which release is
+// this live repoDigest" (see /api/releases/environment-state) is a single
+// GET, never a scan. Two releases sharing an identical digest is a benign
+// edge case (byte-identical rebuild) — last write wins, and either answer is
+// equally correct since the image content is the same either way.
+function kvDigestKey(service: BuildServiceCode, digestHex: string): string {
+  return `o24:release:index:service:${service}:digest:${digestHex}`
+}
+
 export class KvReleaseRepository implements ReleaseRepository {
   constructor(private readonly config: KvConfig) {}
 
@@ -260,19 +350,34 @@ export class KvReleaseRepository implements ReleaseRepository {
       const existingRaw = await kvCommand(this.config, ['GET', key])
       const existing = typeof existingRaw === 'string' ? (JSON.parse(existingRaw) as ReleaseSnapshot) : prepared
       if (!sameReleaseData(existing, prepared)) throw new ReleaseConflictError(prepared.id)
+      // Self-heal: a record written before an index existed (e.g. the
+      // digest index added after this release was first created) would
+      // otherwise stay permanently unreachable through that index. SET/ZADD
+      // are idempotent, so re-writing them here on every dedupe is harmless
+      // once already up to date, and eventually backfills any old record
+      // that gets touched again (a build re-observed, a re-sync, etc.).
+      await this.writeIndexes(existing)
       return { record: existing, deduped: true }
     }
 
-    const score = Date.parse(prepared.createdAt)
-    await kvCommand(this.config, ['ZADD', KV_INDEX_KEY, score, prepared.id])
-    await kvCommand(this.config, ['ZADD', KV_INDEX_SERVICE_PREFIX + prepared.service, score, prepared.id])
+    await this.writeIndexes(prepared)
+    return { record: prepared, deduped: false }
+  }
+
+  private async writeIndexes(record: ReleaseSnapshot): Promise<void> {
+    const score = Date.parse(record.createdAt)
+    await kvCommand(this.config, ['ZADD', KV_INDEX_KEY, score, record.id])
+    await kvCommand(this.config, ['ZADD', KV_INDEX_SERVICE_PREFIX + record.service, score, record.id])
     // Only github-actions releases have a run+attempt to index by — a
     // docker-registry release leaves both null, and indexing that would
     // collide every such release for a service under one bogus key.
-    if (prepared.githubRunId != null && prepared.githubRunAttempt != null) {
-      await kvCommand(this.config, ['SET', kvRunKey(prepared.githubRunId, prepared.githubRunAttempt), prepared.id])
+    if (record.githubRunId != null && record.githubRunAttempt != null) {
+      await kvCommand(this.config, ['SET', kvRunKey(record.githubRunId, record.githubRunAttempt), record.id])
     }
-    return { record: prepared, deduped: false }
+    const digestHex = digestHexOf(record.repoDigest)
+    if (digestHex) {
+      await kvCommand(this.config, ['SET', kvDigestKey(record.service, digestHex), record.id])
+    }
   }
 
   async getById(id: string): Promise<ReleaseSnapshot | undefined> {
@@ -282,6 +387,14 @@ export class KvReleaseRepository implements ReleaseRepository {
 
   async getByRun(runId: number, runAttempt: number): Promise<ReleaseSnapshot | undefined> {
     const id = await kvCommand(this.config, ['GET', kvRunKey(runId, runAttempt)])
+    if (typeof id !== 'string') return undefined
+    return this.getById(id)
+  }
+
+  async getByDigest(service: BuildServiceCode, repoDigest: string): Promise<ReleaseSnapshot | undefined> {
+    const digestHex = digestHexOf(repoDigest)
+    if (!digestHex) return undefined
+    const id = await kvCommand(this.config, ['GET', kvDigestKey(service, digestHex)])
     if (typeof id !== 'string') return undefined
     return this.getById(id)
   }
@@ -297,6 +410,9 @@ export class KvReleaseRepository implements ReleaseRepository {
     const items = (raw ?? [])
       .filter((item): item is string => typeof item === 'string')
       .map((item) => JSON.parse(item) as ReleaseSnapshot)
+      // branch/source/since/until aren't part of the ZSET index — applied
+      // here, within this page, same tradeoff documented on ListReleasesQuery.
+      .filter((release) => matchesFilters(release, query))
     const nextCursor = ids.length === limit ? String(offset + limit) : undefined
     return { items, nextCursor }
   }
@@ -308,6 +424,7 @@ export class KvReleaseRepository implements ReleaseRepository {
 export class InMemoryReleaseRepository implements ReleaseRepository {
   private records = new Map<string, ReleaseSnapshot>()
   private byRun = new Map<string, string>()
+  private byDigest = new Map<string, string>()
 
   async create(input: CreateReleaseInput): Promise<CreateReleaseResult> {
     const prepared = prepareRelease(input)
@@ -320,6 +437,10 @@ export class InMemoryReleaseRepository implements ReleaseRepository {
     if (prepared.githubRunId != null && prepared.githubRunAttempt != null) {
       this.byRun.set(runKeyString(prepared.githubRunId, prepared.githubRunAttempt), prepared.id)
     }
+    const digestHex = digestHexOf(prepared.repoDigest)
+    if (digestHex) {
+      this.byDigest.set(digestIndexKeyString(prepared.service, digestHex), prepared.id)
+    }
     return { record: prepared, deduped: false }
   }
 
@@ -329,6 +450,13 @@ export class InMemoryReleaseRepository implements ReleaseRepository {
 
   async getByRun(runId: number, runAttempt: number): Promise<ReleaseSnapshot | undefined> {
     const id = this.byRun.get(runKeyString(runId, runAttempt))
+    return id ? this.records.get(id) : undefined
+  }
+
+  async getByDigest(service: BuildServiceCode, repoDigest: string): Promise<ReleaseSnapshot | undefined> {
+    const digestHex = digestHexOf(repoDigest)
+    if (!digestHex) return undefined
+    const id = this.byDigest.get(digestIndexKeyString(service, digestHex))
     return id ? this.records.get(id) : undefined
   }
 

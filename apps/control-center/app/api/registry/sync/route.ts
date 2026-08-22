@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server'
 import { requireApiSession } from '../../../../lib/api'
+import { appendAudit } from '../../../../lib/audit'
 import { fetchDockerHubTagDigest } from '../../../../lib/dockerHub'
 import { BUILD_SERVICES, imageRepositoryFor, isBuildServiceCode } from '../../../../lib/github/serviceMap'
-import { getReleaseRepository, InvalidReleaseInputError, ReleaseConflictError } from '../../../../lib/releaseRepository'
+import { digestHexOf, getReleaseRepository, InvalidReleaseInputError, ReleaseConflictError } from '../../../../lib/releaseRepository'
 import type { RegistrySyncResponse } from '../../../../lib/types'
 
 function syncError(error: string, status: number, details?: string) {
@@ -48,16 +49,51 @@ export async function POST(request: Request) {
       discoveredAt: new Date().toISOString(),
     })
 
+    // Only a genuinely NEW record is an auditable event — re-syncing an
+    // already-known digest (deduped) changed nothing, so it would just spam
+    // the trail with identical rows on every repeat click.
+    if (!deduped) {
+      const digestHex = digestHexOf(record.repoDigest)
+      await appendAudit({
+        idempotencyKey: `registry-import:${record.id}`,
+        username: session.username,
+        action: 'import',
+        service,
+        digest: digestHex ? `sha256:${digestHex}` : undefined,
+        toDigest: digestHex ? `sha256:${digestHex}` : undefined,
+        releaseId: record.id,
+        status: 'succeeded',
+        details: { dockerRepository, tag: record.tag },
+      })
+    }
+
     const response: RegistrySyncResponse = { success: true, release: record, deduped }
     return NextResponse.json(response)
   } catch (error) {
     if (error instanceof ReleaseConflictError) {
+      await appendAudit({
+        idempotencyKey: `registry-import-conflict:${error.releaseId}:${Date.now()}`,
+        username: session.username,
+        action: 'import',
+        service,
+        releaseId: error.releaseId,
+        status: 'failed',
+        error: error.message,
+      })
       return syncError('release_conflict', 409, error.message)
     }
     if (error instanceof InvalidReleaseInputError) {
       return syncError('invalid_release', 400, error.message)
     }
     console.error('[registry] sync failed', { service, error: error instanceof Error ? error.message : 'Unknown error' })
+    await appendAudit({
+      idempotencyKey: `registry-import-failed:${service}:${Date.now()}`,
+      username: session.username,
+      action: 'import',
+      service,
+      status: 'failed',
+      error: error instanceof Error ? error.message : 'Unknown error',
+    })
     return syncError('sync_failed', 502, error instanceof Error ? error.message : 'Unknown error')
   }
 }
