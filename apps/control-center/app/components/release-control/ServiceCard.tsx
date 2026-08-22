@@ -1,4 +1,4 @@
-import type { EnvironmentDashboard, ServiceStatus } from '../../../lib/types'
+import type { EnvironmentDashboard, RegistryServiceStatus, ServiceStatus } from '../../../lib/types'
 import { imageRepositoryFor, githubServiceForAgentCode } from '../../../lib/github/serviceMap'
 import { CopyableValue } from './CopyableValue'
 import { StatusBadge, buildStatusLabel, buildStatusTone, containerStatusLabel, containerStatusTone, hasHealthCheck, healthLabel, healthTone } from './StatusBadge'
@@ -10,9 +10,14 @@ type ServiceCardProps = {
   nextEnvironment?: EnvironmentDashboard
   previousEnvironment?: EnvironmentDashboard
   previousService?: ServiceStatus
+  // UAT's copy of this same service — only used to render the DEV card's
+  // Docker Hub Registry Sync comparison (Docker Hub / Release / DEV / UAT).
+  nextService?: ServiceStatus
+  registryStatus?: RegistryServiceStatus
+  registrySyncing?: boolean
   isBusy: boolean
   buildState?: BuildTrackedState
-  onDeploy: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
+  onDeploy: (environment: EnvironmentDashboard, service: ServiceStatus, prefillDigest?: string) => Promise<void>
   onPromote: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onRestart: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onRollback: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
@@ -20,6 +25,7 @@ type ServiceCardProps = {
   onBuild: (environment: EnvironmentDashboard, service: ServiceStatus) => void
   onViewBuild: (service: ServiceStatus) => void
   onSyncBuild: (service: ServiceStatus) => void
+  onSyncRegistry: (service: ServiceStatus) => Promise<void>
 }
 
 const BUTTON_BASE =
@@ -39,6 +45,9 @@ export function ServiceCard({
   nextEnvironment,
   previousEnvironment,
   previousService,
+  nextService,
+  registryStatus,
+  registrySyncing,
   isBusy,
   buildState,
   onDeploy,
@@ -49,6 +58,7 @@ export function ServiceCard({
   onBuild,
   onViewBuild,
   onSyncBuild,
+  onSyncRegistry,
 }: ServiceCardProps) {
   const disabled = isBusy || !environment.online
 
@@ -58,6 +68,21 @@ export function ServiceCard({
   const githubService = !previousEnvironment ? githubServiceForAgentCode(service.code) : null
   const canBuild = Boolean(githubService)
   const buildBusy = buildState?.status === 'triggering' || buildState?.status === 'queued' || buildState?.status === 'in_progress'
+
+  // Docker Hub Registry Sync comparison — DEV card only (same placement rule
+  // as Build above): team members sometimes build from Telegram or the DEV
+  // server and push straight to Docker Hub, bypassing GitHub Actions, so
+  // Docker Hub's current "latest" digest can be ahead of what Release
+  // Control knows about. Comparison/deploy always uses repoDigest, never
+  // localStorage.
+  const showRegistrySync = !previousEnvironment && Boolean(githubService) && Boolean(registryStatus)
+  const dockerHubDigest = registryStatus?.dockerHub?.repoDigest
+  const releaseDigest = registryStatus?.latestRelease?.repoDigest
+  const hasUnsyncedImage = Boolean(dockerHubDigest && dockerHubDigest !== releaseDigest)
+  const referenceDigest = releaseDigest ?? dockerHubDigest
+  const devUpToDate = Boolean(referenceDigest && service.repoDigest && service.repoDigest === referenceDigest)
+  const uatDiffersFromDev = Boolean(service.repoDigest && nextService?.repoDigest && service.repoDigest !== nextService.repoDigest)
+  const canDeployReleaseToDev = Boolean(releaseDigest && releaseDigest !== service.repoDigest)
 
   const buttons: { key: string; label: string; variant: keyof typeof BUTTON_VARIANTS; disabled: boolean; onClick: () => void }[] = []
   if (canBuild) {
@@ -189,6 +214,63 @@ export function ServiceCard({
                   Build lại
                 </button>
               </>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {showRegistrySync ? (
+        <div className="mb-2.5 rounded border border-slate-800/70 bg-slate-950/30 px-2.5 py-2 text-[11px] leading-relaxed">
+          {hasUnsyncedImage ? (
+            <div className="mb-1.5 inline-block rounded bg-amber-500/10 px-1.5 py-0.5 font-medium text-amber-400">
+              Có image mới trên Docker Hub chưa được đồng bộ
+            </div>
+          ) : null}
+          <dl className="space-y-1">
+            <div className="flex gap-1.5">
+              <dt className="w-20 shrink-0 text-slate-600">Docker Hub</dt>
+              <dd className="m-0 min-w-0 truncate font-mono text-slate-400">{shortDigest(dockerHubDigest)}</dd>
+            </div>
+            <div className="flex gap-1.5">
+              <dt className="w-20 shrink-0 text-slate-600">Release</dt>
+              <dd className="m-0 min-w-0 truncate font-mono text-slate-400">{shortDigest(releaseDigest)}</dd>
+            </div>
+            <div className="flex gap-1.5">
+              <dt className="w-20 shrink-0 text-slate-600">DEV</dt>
+              <dd className="m-0 min-w-0 truncate font-mono text-slate-400">{shortDigest(service.repoDigest)}</dd>
+            </div>
+            {nextEnvironment ? (
+              <div className="flex gap-1.5">
+                <dt className="w-20 shrink-0 text-slate-600">{nextEnvironment.code}</dt>
+                <dd className="m-0 min-w-0 truncate font-mono text-slate-400">{shortDigest(nextService?.repoDigest)}</dd>
+              </div>
+            ) : null}
+          </dl>
+          {devUpToDate ? <p className="mt-1.5 text-emerald-400">DEV đang chạy bản mới nhất</p> : null}
+          {uatDiffersFromDev && nextEnvironment ? (
+            <p className="mt-1.5 text-amber-400">
+              {nextEnvironment.code} khác DEV
+            </p>
+          ) : null}
+          <div className="mt-1.5 flex flex-wrap gap-3">
+            <button
+              type="button"
+              disabled={disabled || registrySyncing}
+              onClick={() => void onSyncRegistry(service)}
+              title="Đọc digest hiện tại của tag latest trên Docker Hub và tạo Release Snapshot nếu có bản mới — không build lại"
+              className="font-medium text-emerald-400 hover:underline disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {registrySyncing ? 'Đang đồng bộ…' : 'Đồng bộ từ Docker Hub'}
+            </button>
+            {canDeployReleaseToDev ? (
+              <button
+                type="button"
+                disabled={disabled}
+                onClick={() => void onDeploy(environment, service, releaseDigest)}
+                className="font-medium text-slate-400 hover:underline disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Triển khai → DEV
+              </button>
             ) : null}
           </div>
         </div>

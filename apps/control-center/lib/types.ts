@@ -1,3 +1,5 @@
+import type { BuildServiceCode } from './github/serviceMap'
+
 export type EnvironmentConfig = {
   code: string
   name: string
@@ -168,4 +170,76 @@ export type BuildJob = {
 export type BuildJobsResponse = {
   runId: number
   jobs: BuildJob[]
+}
+
+// Where a ReleaseSnapshot's repoDigest was learned from: a GitHub Actions
+// build this app dispatched/observed, or a scan of Docker Hub that found an
+// image nobody told control-center about (see lib/dockerHub.ts and
+// /api/registry/*) — team members sometimes build from Telegram or the DEV
+// server and push straight to Docker Hub, bypassing GitHub Actions entirely.
+export type ReleaseSource = 'github-actions' | 'docker-registry'
+
+// An immutable record of a built-and-pushed image. github-actions releases
+// are keyed deterministically by service+run+attempt (see buildReleaseId in
+// releaseRepository.ts); docker-registry releases are keyed by the digest
+// itself (see buildRegistryReleaseId) since they have no run to key off —
+// branch/commitSha/githubRunId/githubRunAttempt are unknowable for those and
+// stay null.
+export type ReleaseSnapshot = {
+  id: string
+  service: BuildServiceCode
+  source: ReleaseSource
+  branch: string | null
+  commitSha: string | null
+  dockerRepository: string
+  repoDigest: string
+  tag: string
+  githubRunId: number | null
+  githubRunAttempt: number | null
+  createdAt: string
+  createdBy: string
+  /** Set only for source: 'docker-registry' — when the Docker Hub scan found this digest. */
+  discoveredAt?: string
+}
+
+// Recorded the moment control-center successfully dispatches a GitHub
+// Actions build — "who asked for this build, and what did they ask for" —
+// independent of whether/when that run ever produces a ReleaseSnapshot.
+export type BuildIntent = {
+  runId: number
+  service: BuildServiceCode
+  branch: string
+  tag: string
+  requestedBy: string
+  requestedAt: string
+}
+
+// GET /api/registry/status — per-service comparison between Docker Hub's
+// current "latest" tag and Release Control's own record of it. DEV/UAT/PROD
+// digests are deliberately NOT included here: the client already has them
+// from /api/dashboard and derives the comparison from that, so this endpoint
+// doesn't have to call every Deploy Agent a second time just to answer it.
+export type DockerHubTagInfo = {
+  repoDigest: string
+  tag: string
+  lastUpdated?: string
+}
+
+export type RegistryServiceStatus = {
+  service: BuildServiceCode
+  dockerRepository: string
+  /** Undefined only if the Docker Hub lookup itself failed or found no "latest" tag. */
+  dockerHub?: DockerHubTagInfo
+  latestRelease?: ReleaseSnapshot
+}
+
+export type RegistryStatusResponse = {
+  generatedAt: string
+  services: RegistryServiceStatus[]
+}
+
+export type RegistrySyncResponse = {
+  success: true
+  release: ReleaseSnapshot
+  deduped: boolean
 }

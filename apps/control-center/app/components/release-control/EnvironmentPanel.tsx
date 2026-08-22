@@ -1,4 +1,5 @@
-import type { EnvironmentDashboard, ServiceStatus } from '../../../lib/types'
+import type { EnvironmentDashboard, RegistryServiceStatus, ServiceStatus } from '../../../lib/types'
+import { githubServiceForAgentCode } from '../../../lib/github/serviceMap'
 import { displayEnvironmentName } from './environmentDisplay'
 import { ServiceCard } from './ServiceCard'
 import { StatusBadge, environmentLabel, environmentTone } from './StatusBadge'
@@ -11,7 +12,9 @@ type EnvironmentPanelProps = {
   lastUpdatedAt: string
   busyKey: string
   getBuildState: (service: ServiceStatus) => BuildTrackedState | undefined
-  onDeploy: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
+  registryStatus: RegistryServiceStatus[]
+  registrySyncingKeys: Set<string>
+  onDeploy: (environment: EnvironmentDashboard, service: ServiceStatus, prefillDigest?: string) => Promise<void>
   onPromote: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onRestart: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
   onRollback: (environment: EnvironmentDashboard, service: ServiceStatus) => Promise<void>
@@ -19,6 +22,7 @@ type EnvironmentPanelProps = {
   onBuild: (environment: EnvironmentDashboard, service: ServiceStatus) => void
   onViewBuild: (service: ServiceStatus) => void
   onSyncBuild: (service: ServiceStatus) => void
+  onSyncRegistry: (service: ServiceStatus) => Promise<void>
   onRetry: () => void
 }
 
@@ -29,6 +33,8 @@ export function EnvironmentPanel({
   lastUpdatedAt,
   busyKey,
   getBuildState,
+  registryStatus,
+  registrySyncingKeys,
   onDeploy,
   onPromote,
   onRestart,
@@ -37,6 +43,7 @@ export function EnvironmentPanel({
   onBuild,
   onViewBuild,
   onSyncBuild,
+  onSyncRegistry,
   onRetry,
 }: EnvironmentPanelProps) {
   return (
@@ -90,26 +97,33 @@ export function EnvironmentPanel({
             // has to wrap — the number of columns adapts to available width
             // instead of being hard-coded per viewport size.
             <div className="grid w-full grid-cols-[repeat(auto-fit,minmax(min(340px,100%),1fr))] gap-4">
-              {environment.services.map((service) => (
-                <ServiceCard
-                  key={service.code}
-                  environment={environment}
-                  service={service}
-                  nextEnvironment={nextEnvironment}
-                  previousEnvironment={previousEnvironment}
-                  previousService={previousEnvironment?.services.find((item) => item.code === service.code)}
-                  isBusy={busyKey.includes(`${environment.code}:${service.code}`)}
-                  buildState={getBuildState(service)}
-                  onDeploy={onDeploy}
-                  onPromote={onPromote}
-                  onRestart={onRestart}
-                  onRollback={onRollback}
-                  onLogs={onLogs}
-                  onBuild={onBuild}
-                  onViewBuild={onViewBuild}
-                  onSyncBuild={onSyncBuild}
-                />
-              ))}
+              {environment.services.map((service) => {
+                const githubService = githubServiceForAgentCode(service.code)
+                return (
+                  <ServiceCard
+                    key={service.code}
+                    environment={environment}
+                    service={service}
+                    nextEnvironment={nextEnvironment}
+                    previousEnvironment={previousEnvironment}
+                    previousService={previousEnvironment?.services.find((item) => item.code === service.code)}
+                    nextService={nextEnvironment?.services.find((item) => item.code === service.code)}
+                    registryStatus={githubService ? registryStatus.find((item) => item.service === githubService) : undefined}
+                    registrySyncing={githubService ? registrySyncingKeys.has(githubService) : false}
+                    isBusy={busyKey.includes(`${environment.code}:${service.code}`)}
+                    buildState={getBuildState(service)}
+                    onDeploy={onDeploy}
+                    onPromote={onPromote}
+                    onRestart={onRestart}
+                    onRollback={onRollback}
+                    onLogs={onLogs}
+                    onBuild={onBuild}
+                    onViewBuild={onViewBuild}
+                    onSyncBuild={onSyncBuild}
+                    onSyncRegistry={onSyncRegistry}
+                  />
+                )
+              })}
             </div>
           ) : (
             <div className="rounded border border-dashed border-slate-800 p-6 text-center text-sm text-slate-500">

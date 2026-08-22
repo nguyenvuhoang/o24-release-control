@@ -10,6 +10,9 @@ import type {
   OperationLogLine,
   OperationSnapshot,
   OperationStatus,
+  RegistryServiceStatus,
+  RegistryStatusResponse,
+  RegistrySyncResponse,
   ServiceStatus,
 } from '../../lib/types'
 import { githubServiceForAgentCode } from '../../lib/github/serviceMap'
@@ -61,6 +64,8 @@ export default function Dashboard({ username }: Props) {
   const searchParams = useSearchParams()
 
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null)
+  const [registryStatus, setRegistryStatus] = useState<RegistryServiceStatus[]>([])
+  const [registrySyncingKeys, setRegistrySyncingKeys] = useState<Set<string>>(new Set())
   const [audit, setAudit] = useState<AuditRecord[]>([])
   const [auditStorageNotConfigured, setAuditStorageNotConfigured] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -93,11 +98,12 @@ export default function Dashboard({ username }: Props) {
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
     try {
-      const [dashboardResponse, auditResponse] = await Promise.all([
+      const [dashboardResponse, auditResponse, registryResponse] = await Promise.all([
         fetch('/api/dashboard', { cache: 'no-store' }),
         fetch('/api/audit?limit=30', { cache: 'no-store' }),
+        fetch('/api/registry/status', { cache: 'no-store' }),
       ])
-      if (dashboardResponse.status === 401 || auditResponse.status === 401) {
+      if (dashboardResponse.status === 401 || auditResponse.status === 401 || registryResponse.status === 401) {
         window.location.href = '/login'
         return
       }
@@ -106,6 +112,14 @@ export default function Dashboard({ username }: Props) {
       if (!dashboardResponse.ok) throw new Error(dashboardBody?.details ?? dashboardBody?.error ?? 'Không tải được dashboard')
       if (!dashboardBody) throw new Error('Không tải được dashboard')
       setDashboard(dashboardBody)
+
+      // Registry Sync comparison is best-effort, non-critical UI: a failure
+      // here (e.g. Docker Hub transiently unreachable) must never take the
+      // rest of the dashboard down with it.
+      if (registryResponse.ok) {
+        const registryBody = await readJsonSafe<RegistryStatusResponse>(registryResponse)
+        setRegistryStatus(registryBody?.services ?? [])
+      }
 
       // Audit storage not being configured (Vercel without KV) must not take
       // the whole dashboard down — only the audit panel needs to know, so it
@@ -373,13 +387,13 @@ export default function Dashboard({ username }: Props) {
     }
   }
 
-  async function deploy(environment: EnvironmentDashboard, service: ServiceStatus) {
+  async function deploy(environment: EnvironmentDashboard, service: ServiceStatus, prefillDigest?: string) {
     const serviceLabel = service.displayName || service.code
     const digest = await SwalAlert.prompt({
       title: 'Nhập image digest',
       message: `Digest cho ${escapeHtml(serviceLabel)} tại ${escapeHtml(environment.name)}`,
       placeholder: 'sha256:...',
-      defaultValue: service.repoDigest ?? 'sha256:',
+      defaultValue: prefillDigest ?? service.repoDigest ?? 'sha256:',
       confirmText: 'Tiếp tục',
       validator: (value) => {
         const normalized = value.trim().toLowerCase()
@@ -536,6 +550,42 @@ export default function Dashboard({ username }: Props) {
     [getBuildState],
   )
 
+  // Imports whatever Docker Hub's "latest" tag currently points to as a
+  // Release Snapshot — never triggers a build. Deploying that snapshot to
+  // DEV is a separate, explicit action (the card's own "Triển khai" /
+  // "Triển khai → DEV" buttons); this only makes it visible to Release
+  // Control.
+  async function syncRegistry(service: ServiceStatus) {
+    const githubService = githubServiceForAgentCode(service.code)
+    if (!githubService) return
+    setRegistrySyncingKeys((prev) => new Set(prev).add(githubService))
+    try {
+      const response = await fetch('/api/registry/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ service: githubService }),
+      })
+      const result = await readJsonSafe<RegistrySyncResponse & { error?: string; details?: string }>(response)
+      if (!response.ok || !result?.success) {
+        throw new Error(result?.details ?? result?.error ?? `Đồng bộ Docker Hub thất bại (mã ${response.status})`)
+      }
+      SwalAlert.toast(
+        result.deduped
+          ? `${githubService}: đã đồng bộ trước đó, không có bản mới`
+          : `${githubService}: đã tạo Release Snapshot mới từ Docker Hub`,
+      )
+      await refresh(true)
+    } catch (caught) {
+      await SwalAlert.error(caught instanceof Error ? caught.message : 'Đồng bộ Docker Hub thất bại')
+    } finally {
+      setRegistrySyncingKeys((prev) => {
+        const next = new Set(prev)
+        next.delete(githubService)
+        return next
+      })
+    }
+  }
+
   const environments = dashboard?.environments ?? []
   const agentsOnlineCount = environments.filter((item) => item.online).length
   const healthyServicesCount = environments
@@ -601,6 +651,8 @@ export default function Dashboard({ username }: Props) {
             lastUpdatedAt={lastUpdatedFull}
             busyKey={busy?.key ?? ''}
             getBuildState={getBuildStateForService}
+            registryStatus={registryStatus}
+            registrySyncingKeys={registrySyncingKeys}
             onDeploy={deploy}
             onPromote={promote}
             onRestart={restart}
@@ -609,6 +661,7 @@ export default function Dashboard({ username }: Props) {
             onBuild={openBuildDialog}
             onViewBuild={openBuildDetail}
             onSyncBuild={syncBuildStatus}
+            onSyncRegistry={syncRegistry}
             onRetry={() => void refresh(true)}
           />
         ) : !dashboard && loading ? (

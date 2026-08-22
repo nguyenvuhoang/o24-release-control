@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { requireApiSession } from '../../../lib/api'
-import { recordDispatchedRun } from '../../../lib/buildPointerStore'
+import { recordBuildIntent, recordDispatchedRun } from '../../../lib/buildPointerStore'
 import { getConfiguredBuildBranch, triggerWorkflowBuild } from '../../../lib/github/client'
 import { isDispatchLocked, markDispatched } from '../../../lib/github/dispatchLock'
 import { isBuildServiceCode, BUILD_SERVICES } from '../../../lib/github/serviceMap'
@@ -57,6 +57,25 @@ export async function POST(request: Request) {
         service,
         runId: run.runId,
         error: pointerError instanceof Error ? pointerError.message : 'Unknown error',
+      })
+    }
+    try {
+      // Same best-effort contract: a GitHub build that already dispatched
+      // successfully must never fail the request just because recording who
+      // asked for it hit a storage hiccup.
+      await recordBuildIntent({
+        runId: run.runId,
+        service,
+        branch,
+        tag,
+        requestedBy: session.username,
+        requestedAt: new Date().toISOString(),
+      })
+    } catch (intentError) {
+      console.error('[builds] recordBuildIntent failed', {
+        service,
+        runId: run.runId,
+        error: intentError instanceof Error ? intentError.message : 'Unknown error',
       })
     }
     const response: BuildTriggerResponse = {
