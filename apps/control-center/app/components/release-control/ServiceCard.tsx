@@ -112,6 +112,11 @@ export function ServiceCard({
   // digest entry) stays the primary action there — unchanged from before.
   const hasComparisonData = showComparison && Boolean(comparison)
   const canDeployLatest = hasComparisonData && Boolean(comparison?.canDeployLatestToDev)
+  // Whether clicking the primary button will import a Release Snapshot
+  // first (see onDeployLatestToDev in Dashboard.tsx) — the label must say so
+  // up front, not just "Triển khai bản mới", so the user isn't surprised by
+  // an extra import step happening before the deploy they asked for.
+  const needsImportFirst = canDeployLatest && Boolean(comparison?.canImportSnapshot)
   // Reuses the resolver's OWN conclusion (already computed in `warnings`)
   // instead of re-deriving a digest comparison here — this component must
   // never decide sync/outdated facts itself, only render what
@@ -242,7 +247,7 @@ export function ServiceCard({
             title={comparison?.dev?.repoDigest ? `Digest nguồn: ${comparison.latest?.repoDigest}\nDigest DEV hiện tại: ${comparison.dev.repoDigest}` : undefined}
             className={`${BUTTON_BASE} ${BUTTON_VARIANTS.primary} flex-1`}
           >
-            {primaryBusy ? 'Đang triển khai…' : 'Triển khai bản mới → DEV'}
+            {primaryBusy ? 'Đang triển khai…' : needsImportFirst ? 'Đồng bộ & triển khai → DEV' : 'Triển khai bản mới → DEV'}
           </button>
         ) : !hasComparisonData ? (
           <button

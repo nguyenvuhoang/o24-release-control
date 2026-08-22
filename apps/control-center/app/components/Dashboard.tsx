@@ -720,12 +720,16 @@ export default function Dashboard({ username }: Props) {
     const devEnvironment = (dashboard?.environments ?? []).find((item) => item.code === 'DEV')
     if (!devEnvironment) return
 
+    // canImportSnapshot is the resolver's own conclusion (lib/releaseComparison.ts)
+    // — this component never re-derives "does a snapshot exist" itself, it
+    // only branches the confirmation copy/flow on what was already decided.
+    const needsImport = Boolean(comparison.canImportSnapshot)
     const serviceLabel = service.displayName || service.code
     const commitLine = latest.commitSha
       ? `<div><span class="text-slate-500">Commit:</span> <span class="font-mono">${escapeHtml(latest.commitSha.slice(0, 12))}</span></div>`
       : ''
-    const untrackedLine = !latest.snapshotId
-      ? `<div class="mt-2 text-amber-400">Bản build này chưa có Release Snapshot — hệ thống sẽ tự động đồng bộ trước khi triển khai.</div>`
+    const importLine = needsImport
+      ? `<div class="mt-2 text-amber-400">Bản build này chưa có Release Snapshot — sẽ đồng bộ từ Docker Hub trước, chỉ triển khai nếu đồng bộ thành công.</div>`
       : ''
     const devDigestLine = comparison.dev?.repoDigest
       ? `<div><span class="text-slate-500">Digest DEV hiện tại (sẽ bị thay thế):</span> <span class="font-mono break-all">${escapeHtml(comparison.dev.repoDigest)}</span></div>`
@@ -734,18 +738,19 @@ export default function Dashboard({ username }: Props) {
       `<div class="mt-3 space-y-1 text-left text-xs">`,
       `<div><span class="text-slate-500">Service:</span> <span class="font-mono">${escapeHtml(githubService)}</span></div>`,
       `<div><span class="text-slate-500">Môi trường:</span> <span class="font-mono">DEV</span></div>`,
+      `<div><span class="text-slate-500">Repository:</span> <span class="font-mono break-all">${escapeHtml(latest.repository)}</span></div>`,
       `<div><span class="text-slate-500">Tag:</span> <span class="font-mono">${escapeHtml(latest.tag)}</span></div>`,
       commitLine,
       `<div><span class="text-slate-500">Digest nguồn (Latest Build):</span> <span class="font-mono break-all">${escapeHtml(latest.repoDigest)}</span></div>`,
       devDigestLine,
-      untrackedLine,
+      importLine,
       `</div>`,
     ].join('')
 
     const confirmed = await SwalAlert.confirm({
-      title: 'Xác nhận triển khai bản mới',
-      message: `${escapeHtml(serviceLabel)} sẽ được triển khai bản mới nhất lên DEV.${details}`,
-      confirmText: 'Triển khai',
+      title: needsImport ? 'Xác nhận đồng bộ & triển khai' : 'Xác nhận triển khai bản mới',
+      message: `${escapeHtml(serviceLabel)} sẽ được ${needsImport ? 'đồng bộ và ' : ''}triển khai bản mới nhất lên DEV.${details}`,
+      confirmText: needsImport ? 'Đồng bộ & triển khai' : 'Triển khai',
       cancelText: 'Hủy',
     })
     if (!confirmed) return
@@ -754,6 +759,10 @@ export default function Dashboard({ username }: Props) {
     try {
       let releaseId = latest.snapshotId
       if (!releaseId) {
+        // Step 1/2: import. A separate audit row is written by
+        // /api/registry/sync itself (action: 'import') — this call and the
+        // deploy below are two distinct, separately-audited operations by
+        // design, not one combined action.
         const importResponse = await fetch('/api/registry/sync', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -761,12 +770,20 @@ export default function Dashboard({ username }: Props) {
         })
         const importResult = await readJsonSafe<RegistrySyncResponse & { error?: string; details?: string }>(importResponse)
         if (!importResponse.ok || !importResult?.success) {
+          // Import failed — stop here. Deliberately never falls through to
+          // the deploy call below.
           throw new Error(importResult?.details ?? importResult?.error ?? `Đồng bộ Release Snapshot thất bại (mã ${importResponse.status})`)
         }
         releaseId = importResult.release.id
         void refreshComparisons()
       }
 
+      // Step 2/2: deploy — only reached if the import above succeeded (or
+      // wasn't needed). /api/releases/{id}/deploy always re-reads the
+      // immutable repoDigest from the snapshot it just imported/already had,
+      // gets its own audit row (action: 'redeploy') once the operation
+      // settles, and is guarded server-side against a concurrent duplicate
+      // for the same service+environment (see lib/operationLock.ts).
       await startOperation(
         `deploy-latest:DEV:${service.code}`,
         `/api/releases/${encodeURIComponent(releaseId)}/deploy`,
@@ -774,10 +791,13 @@ export default function Dashboard({ username }: Props) {
         devEnvironment,
         service,
         'deploy',
-        { actionLabel: 'Triển khai bản mới', failVerb: 'triển khai bản mới' },
+        {
+          actionLabel: needsImport ? 'Đồng bộ & triển khai' : 'Triển khai bản mới',
+          failVerb: needsImport ? 'đồng bộ & triển khai' : 'triển khai bản mới',
+        },
       )
     } catch (caught) {
-      await SwalAlert.error(caught instanceof Error ? caught.message : 'Triển khai bản mới thất bại')
+      await SwalAlert.error(caught instanceof Error ? caught.message : 'Đồng bộ & triển khai thất bại')
     } finally {
       setDeployingLatestKeys((prev) => {
         const next = new Set(prev)
