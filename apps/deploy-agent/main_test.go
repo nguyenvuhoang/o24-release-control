@@ -110,6 +110,39 @@ func TestResolveRepoDigest(t *testing.T) {
 	})
 }
 
+func TestRequestedDigestOf(t *testing.T) {
+	svc := ServiceConfig{ImageRepository: "vknighthub/ips_o24cms"}
+	digest := "sha256:d7ab5595faa22357b23bdd3dd1b5db4d77c27738d55209eb0a03524ec88a7a03"
+
+	t.Run("extracts the bare digest from a repository@sha256 image", func(t *testing.T) {
+		got := requestedDigestOf(svc, svc.ImageRepository+"@"+digest)
+		if got != digest {
+			t.Fatalf("expected %s, got %s", digest, got)
+		}
+	})
+
+	t.Run("returns empty for a mutable tag reference", func(t *testing.T) {
+		got := requestedDigestOf(svc, svc.ImageRepository+":latest")
+		if got != "" {
+			t.Fatalf("expected empty, got %q", got)
+		}
+	})
+
+	t.Run("returns empty for a different repository's pinned reference", func(t *testing.T) {
+		got := requestedDigestOf(svc, "unrelated/repo@"+digest)
+		if got != "" {
+			t.Fatalf("expected empty, got %q", got)
+		}
+	})
+
+	t.Run("returns empty for a malformed digest suffix", func(t *testing.T) {
+		got := requestedDigestOf(svc, svc.ImageRepository+"@sha256:not-hex")
+		if got != "" {
+			t.Fatalf("expected empty, got %q", got)
+		}
+	})
+}
+
 func TestOperationLogAndComplete(t *testing.T) {
 	op := newOperation("op-test-1", "dev", "wfo", "deploy", "repo@sha256:abc")
 
@@ -196,6 +229,48 @@ func TestComposeArgsUsesBaseThenDeployEnvFile(t *testing.T) {
 	// Each --env-file flag must immediately precede its path.
 	if args[baseIdx-1] != "--env-file" || args[deployIdx-1] != "--env-file" {
 		t.Fatalf("expected --env-file immediately before each env file path, got args: %v", args)
+	}
+}
+
+// TestComposeArgsDerivesDirectoryFromConfigNotHardcoded proves composeArgs —
+// used for both `docker compose pull` and `docker compose up` — never
+// assumes "/app" — deploy/promote/rollback must work with whatever
+// projectDirectory/env file paths the server's agent-config.json declares,
+// and pull/up must resolve the image from the same two --env-file flags.
+func TestComposeArgsDerivesDirectoryFromConfigNotHardcoded(t *testing.T) {
+	app := &App{
+		cfg: Config{
+			Compose: ComposeConfig{
+				ProjectDirectory: "/srv/o24/uat",
+				Files:            []string{"/srv/o24/uat/docker-compose.yml"},
+				BaseEnvFile:      "/srv/o24/uat/.env",
+				DeployEnvFile:    "/srv/o24/uat/.env.deploy",
+			},
+		},
+	}
+
+	pullArgs := app.composeArgs("pull", "o24-cms")
+	wantPull := []string{
+		"compose", "--project-directory", "/srv/o24/uat",
+		"-f", "/srv/o24/uat/docker-compose.yml",
+		"--env-file", "/srv/o24/uat/.env",
+		"--env-file", "/srv/o24/uat/.env.deploy",
+		"pull", "o24-cms",
+	}
+	if strings.Join(pullArgs, " ") != strings.Join(wantPull, " ") {
+		t.Fatalf("pull args mismatch:\n got: %v\nwant: %v", pullArgs, wantPull)
+	}
+
+	upArgs := app.composeArgs("up", "-d", "--no-deps", "--force-recreate", "o24-cms")
+	wantUp := []string{
+		"compose", "--project-directory", "/srv/o24/uat",
+		"-f", "/srv/o24/uat/docker-compose.yml",
+		"--env-file", "/srv/o24/uat/.env",
+		"--env-file", "/srv/o24/uat/.env.deploy",
+		"up", "-d", "--no-deps", "--force-recreate", "o24-cms",
+	}
+	if strings.Join(upArgs, " ") != strings.Join(wantUp, " ") {
+		t.Fatalf("up args mismatch:\n got: %v\nwant: %v", upArgs, wantUp)
 	}
 }
 

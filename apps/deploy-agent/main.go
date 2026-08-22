@@ -315,7 +315,7 @@ var rollbackStepLabels = deployLabels{
 var digestPattern = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 var requestIDPattern = regexp.MustCompile(`^[a-zA-Z0-9._:-]{1,120}$`)
 
-const version = "1.2.1"
+const version = "1.3.0"
 
 func main() {
 	configPath := getenv("AGENT_CONFIG_PATH", "/config/agent-config.json")
@@ -687,7 +687,7 @@ func (a *App) runRestart(parent context.Context, op *Operation, svc ServiceConfi
 	}
 	op.log("Starting container")
 	op.log("Waiting for running state")
-	if err := a.waitHealthy(ctx, svc); err != nil {
+	if _, err := a.waitHealthy(ctx, svc); err != nil {
 		op.log("Restart failed")
 		op.complete("failed", err.Error())
 		return
@@ -698,8 +698,19 @@ func (a *App) runRestart(parent context.Context, op *Operation, svc ServiceConfi
 
 // runDeploy pulls the target image, updates the environment file and
 // recreates the container, narrating whitelisted progress steps to the
-// operation log as it goes. It backs both /api/deploy (deployStepLabels) and
-// /api/services/{service}/rollback (rollbackStepLabels).
+// operation log as it goes. It backs /api/deploy (deployStepLabels — this
+// covers both a plain redeploy and a promote, since promote is just a deploy
+// request against the target environment carrying the source environment's
+// current digest) and /api/services/{service}/rollback (rollbackStepLabels).
+// Deliberately NOT used by restart (runRestart): a restart never changes
+// which image is configured, so none of this — env file writes, compose
+// pull, digest verification — applies there.
+//
+// Both `docker compose pull` and `docker compose up` go through
+// composeArgs(), which resolves the project directory and --env-file flags
+// entirely from config (never a hardcoded path) and merges baseEnvFile with
+// deployEnvFile — so pull/up always resolve the service's image from the
+// exact same merged env files, in the exact order compose sees them.
 func (a *App) runDeploy(parent context.Context, op *Operation, svc ServiceConfig, image string, req DeployRequest, labels deployLabels) {
 	op.log(labels.starting)
 	a.mu.Lock()
@@ -717,20 +728,10 @@ func (a *App) runDeploy(parent context.Context, op *Operation, svc ServiceConfig
 	defer cancel()
 	var output strings.Builder
 
-	op.log(labels.pulling)
-	pullOutput, err := runStreamedCommand(ctx, op, "docker", "pull", image)
-	output.WriteString("$ docker pull " + image + "\n" + pullOutput + "\n")
-	if err != nil {
-		exitCode := exitCodeOf(err)
-		op.log(fmt.Sprintf("Docker pull exited with code %d", exitCode))
-		op.log(labels.failed)
-		record.Status, record.Error = "failed", composeFailureMessage("docker pull", exitCode, pullOutput, err)
-		a.finishDeployment(record, output.String())
-		op.complete("failed", record.Error)
-		return
-	}
-	op.log(labels.pulled)
-
+	// The env file must carry the target image BEFORE pull/up run: both now
+	// go through `docker compose`, which resolves the service's `image:`
+	// from the merged --env-file values rather than from a literal string
+	// passed on the command line.
 	op.log(labels.updatingEnv)
 	if err := updateEnvAtomic(a.cfg.Compose.DeployEnvFile, svc.ImageEnvKey, image); err != nil {
 		op.log(labels.failed)
@@ -740,34 +741,45 @@ func (a *App) runDeploy(parent context.Context, op *Operation, svc ServiceConfig
 		return
 	}
 
-	op.log(labels.recreating)
-	composeArgs := a.composeArgs("up", "-d", "--no-deps", "--force-recreate", svc.ComposeService)
-	upOutput, composeErr := runStreamedCommand(ctx, op, "docker", composeArgs...)
-	output.WriteString("$ docker " + strings.Join(composeArgs, " ") + "\n" + upOutput + "\n")
+	composeUpArgs := a.composeArgs("up", "-d", "--no-deps", "--force-recreate", svc.ComposeService)
 
+	op.log(labels.pulling)
+	composePullArgs := a.composeArgs("pull", svc.ComposeService)
+	pullOutput, err := runStreamedCommand(ctx, op, "docker", composePullArgs...)
+	output.WriteString("$ docker " + strings.Join(composePullArgs, " ") + "\n" + pullOutput + "\n")
+	if err != nil {
+		exitCode := exitCodeOf(err)
+		op.log(fmt.Sprintf("Docker Compose pull exited with code %d", exitCode))
+		op.log(labels.failed)
+		record.Status, record.Error = "failed", composeFailureMessage("docker compose pull", exitCode, pullOutput, err)
+		if previous != "" && previous != image {
+			// Nothing was recreated yet — just revert the env file so it
+			// doesn't keep pointing at an image that failed to pull.
+			_ = updateEnvAtomic(a.cfg.Compose.DeployEnvFile, svc.ImageEnvKey, previous)
+		}
+		a.finishDeployment(record, output.String())
+		op.complete("failed", record.Error)
+		return
+	}
+	op.log(labels.pulled)
+
+	op.log(labels.recreating)
+	upOutput, composeErr := runStreamedCommand(ctx, op, "docker", composeUpArgs...)
+	output.WriteString("$ docker " + strings.Join(composeUpArgs, " ") + "\n" + upOutput + "\n")
+
+	var final ServiceStatus
 	if composeErr != nil {
 		exitCode := exitCodeOf(composeErr)
 		op.log(fmt.Sprintf("Docker Compose exited with code %d", exitCode))
 		err = errors.New(composeFailureMessage("docker compose", exitCode, upOutput, composeErr))
 	} else {
 		op.log(labels.waiting)
-		err = a.waitHealthy(ctx, svc)
+		final, err = a.waitHealthy(ctx, svc)
 	}
 	if err != nil {
 		op.log(labels.failed)
 		record.Status, record.Error = "failed", err.Error()
-		if previous != "" && previous != image {
-			output.WriteString("Automatic rollback to " + previous + "\n")
-			op.log("Automatic rollback to " + previous)
-			_ = updateEnvAtomic(a.cfg.Compose.DeployEnvFile, svc.ImageEnvKey, previous)
-			rollbackOutput, rollbackErr := runStreamedCommand(ctx, op, "docker", composeArgs...)
-			output.WriteString(rollbackOutput + "\n")
-			if rollbackErr != nil {
-				rollbackExitCode := exitCodeOf(rollbackErr)
-				op.log(fmt.Sprintf("Automatic rollback exited with code %d", rollbackExitCode))
-				record.Error += "; automatic rollback failed: " + composeFailureMessage("docker compose", rollbackExitCode, rollbackOutput, rollbackErr)
-			}
-		}
+		a.attemptRollback(ctx, op, svc, composeUpArgs, previous, image, &record, &output)
 		a.finishDeployment(record, output.String())
 		op.complete("failed", record.Error)
 		return
@@ -776,27 +788,101 @@ func (a *App) runDeploy(parent context.Context, op *Operation, svc ServiceConfig
 		op.log(labels.checking)
 	}
 
+	// Digest verification gate: `docker compose up` exiting 0 and the
+	// container reporting healthy do NOT by themselves prove it is running
+	// the requested image — e.g. if docker-compose.yml's `image:` line isn't
+	// actually wired to ImageEnvKey, compose can happily "succeed" against a
+	// stale local tag. SUCCESS is reported only once `final` (the inspect
+	// waitHealthy just confirmed "running" against) shows the container's
+	// own resolved repoDigest equals what was requested; requestedDigest is
+	// "" (verification skipped, never treated as failure) only for image
+	// strings not in the standard repository@sha256 form produced by
+	// requestedImage/findRollbackImage.
+	if requestedDigest := requestedDigestOf(svc, image); requestedDigest != "" {
+		actual := strings.ToLower(strings.TrimPrefix(final.RepoDigest, "sha256:"))
+		wanted := strings.ToLower(strings.TrimPrefix(requestedDigest, "sha256:"))
+		if actual == "" || actual != wanted {
+			shown := final.RepoDigest
+			if shown == "" {
+				shown = "(không xác định được digest đang chạy)"
+			}
+			verifyErr := fmt.Sprintf(
+				"deploy verification failed: container running digest %s, expected sha256:%s — docker-compose có thể chưa đọc đúng %s (kiểm tra image: trong docker-compose.yml trỏ tới biến này)",
+				shown, wanted, svc.ImageEnvKey,
+			)
+			op.log(verifyErr)
+			op.log(labels.failed)
+			record.Status, record.Error = "failed", verifyErr
+			a.attemptRollback(ctx, op, svc, composeUpArgs, previous, image, &record, &output)
+			a.finishDeployment(record, output.String())
+			op.complete("failed", record.Error)
+			return
+		}
+	}
+
 	record.Status = "succeeded"
 	a.finishDeployment(record, output.String())
 	op.log(labels.completed)
 	op.complete("success", "")
 }
 
-func (a *App) waitHealthy(ctx context.Context, svc ServiceConfig) error {
+// requestedDigestOf extracts the bare "sha256:<hex>" digest from an image
+// string built by requestedImage/findRollbackImage ("repository@sha256:..."),
+// returning "" when image isn't in that exact form (e.g. legacy stored
+// data). Callers must treat "" as "digest verification not possible", never
+// as a mismatch — this function only ever reads back what was itself just
+// requested, so it can't produce a false failure.
+func requestedDigestOf(svc ServiceConfig, image string) string {
+	prefix := svc.ImageRepository + "@"
+	if !strings.HasPrefix(image, prefix) {
+		return ""
+	}
+	digest := strings.TrimPrefix(image, prefix)
+	if !digestPattern.MatchString(digest) {
+		return ""
+	}
+	return digest
+}
+
+// attemptRollback best-effort reverts svc.ImageEnvKey to previous and
+// re-recreates the container via upArgs, appending its own progress to
+// output/record.Error. No-ops when there is no distinct previous image to
+// fall back to (e.g. this was the service's first-ever deploy).
+func (a *App) attemptRollback(ctx context.Context, op *Operation, svc ServiceConfig, upArgs []string, previous, image string, record *DeploymentRecord, output *strings.Builder) {
+	if previous == "" || previous == image {
+		return
+	}
+	output.WriteString("Automatic rollback to " + previous + "\n")
+	op.log("Automatic rollback to " + previous)
+	_ = updateEnvAtomic(a.cfg.Compose.DeployEnvFile, svc.ImageEnvKey, previous)
+	rollbackOutput, rollbackErr := runStreamedCommand(ctx, op, "docker", upArgs...)
+	output.WriteString(rollbackOutput + "\n")
+	if rollbackErr != nil {
+		rollbackExitCode := exitCodeOf(rollbackErr)
+		op.log(fmt.Sprintf("Automatic rollback exited with code %d", rollbackExitCode))
+		record.Error += "; automatic rollback failed: " + composeFailureMessage("docker compose", rollbackExitCode, rollbackOutput, rollbackErr)
+	}
+}
+
+// waitHealthy polls until svc reports running+healthy, returning the last
+// inspected ServiceStatus either way so callers that need to act on it
+// afterwards (e.g. runDeploy's digest verification gate) don't have to pay
+// for a second `docker inspect` round-trip.
+func (a *App) waitHealthy(ctx context.Context, svc ServiceConfig) (ServiceStatus, error) {
 	deadline := time.Now().Add(time.Duration(svc.HealthTimeoutSeconds) * time.Second)
 	var last ServiceStatus
 	for time.Now().Before(deadline) {
 		last = a.inspectService(ctx, svc)
 		if last.Status == "running" && (last.Health == "healthy" || last.Health == "none") {
-			return nil
+			return last, nil
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return last, ctx.Err()
 		case <-time.After(2 * time.Second):
 		}
 	}
-	return fmt.Errorf("health check timed out: status=%s health=%s error=%s", last.Status, last.Health, last.Error)
+	return last, fmt.Errorf("health check timed out: status=%s health=%s error=%s", last.Status, last.Health, last.Error)
 }
 
 func (a *App) finishDeployment(record DeploymentRecord, output string) DeploymentRecord {
@@ -885,6 +971,7 @@ func (a *App) inspectService(parent context.Context, svc ServiceConfig) ServiceS
 //     ("docker.io/", "index.docker.io/") stripped first, since Docker
 //     sometimes reports RepoDigests fully-qualified even though
 //     imageRepository is configured in short form.
+//
 // Returns "" if neither path yields a digest for imageRepository — this
 // function never falls back to the local Docker image ID.
 func resolveRepoDigest(configImage, imageRepository string, repoDigests []string) string {
