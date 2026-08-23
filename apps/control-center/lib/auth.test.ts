@@ -11,12 +11,19 @@ const { decodeSessionCookie, encodeSessionCookie, validateCredentials } = await 
 // A tiny fake UserRepository — inline since it's only needed in this file.
 type FakeRecord = { username: string; passwordHash: string; role: 'admin' | 'user'; mustChangePassword: boolean; createdAt: string; createdBy: string }
 
+// Mirrors lib/userRepository.ts's normalizeUsername() exactly (trim + lowercase)
+// — this fake diverging from the real normalization contract is exactly the
+// kind of mock/reality gap that would have masked a real bug here.
+function normalizeUsername(username: string): string {
+  return username.trim().toLowerCase()
+}
+
 class FakeUserRepository {
   private records = new Map<string, FakeRecord>()
 
   async seed(username: string, plaintextPassword: string, opts: { role?: 'admin' | 'user'; mustChangePassword?: boolean } = {}) {
-    this.records.set(username.toLowerCase(), {
-      username: username.toLowerCase(),
+    this.records.set(normalizeUsername(username), {
+      username: normalizeUsername(username),
       passwordHash: await bcrypt.hash(plaintextPassword, 4), // low cost factor — tests only
       role: opts.role ?? 'user',
       mustChangePassword: opts.mustChangePassword ?? true,
@@ -26,7 +33,7 @@ class FakeUserRepository {
   }
 
   async getByUsername(username: string) {
-    return this.records.get(username.toLowerCase())
+    return this.records.get(normalizeUsername(username))
   }
 
   async createIfAbsent(): Promise<never> {
@@ -69,6 +76,51 @@ test('a Redis-backed user fails to log in with the wrong password', async () => 
 test('an unknown username with no user repository configured (Redis absent) fails closed, not throws', async () => {
   const identity = await validateCredentials('nobody', 'whatever', null)
   assert.equal(identity, null)
+})
+
+test('a Redis-backed user with a mixed-case/whitespace username at login still succeeds', async () => {
+  const repo = new FakeUserRepository()
+  await repo.seed('linhnq', 'linhnq', { role: 'user', mustChangePassword: true })
+  const identity = await validateCredentials('  LinhNQ  ', 'linhnq', repo as never)
+  assert.ok(identity)
+  assert.equal(identity.username, 'linhnq')
+})
+
+// ---- safe, distinguishable server-side failure logging (never leaked to the caller's return value) ----
+
+test('logFailure receives "user_not_found" for an unknown username, and the public result is still just null', async () => {
+  const repo = new FakeUserRepository()
+  const logs: { reason: string; username: string }[] = []
+  const identity = await validateCredentials('nobody', 'whatever', repo as never, (reason, ctx) => logs.push({ reason, ...ctx }))
+  assert.equal(identity, null)
+  assert.deepEqual(logs, [{ reason: 'user_not_found', username: 'nobody' }])
+})
+
+test('logFailure receives "password_mismatch" (not "user_not_found") when the user exists but the password is wrong', async () => {
+  const repo = new FakeUserRepository()
+  await repo.seed('linhnq', 'linhnq')
+  const logs: { reason: string; username: string }[] = []
+  const identity = await validateCredentials('linhnq', 'totally-wrong', repo as never, (reason, ctx) => logs.push({ reason, ...ctx }))
+  assert.equal(identity, null)
+  assert.deepEqual(logs, [{ reason: 'password_mismatch', username: 'linhnq' }])
+})
+
+test('logFailure receives "no_user_store_configured" when Redis is not set up at all', async () => {
+  const logs: { reason: string; username: string }[] = []
+  const identity = await validateCredentials('linhnq', 'linhnq', null, (reason, ctx) => logs.push({ reason, ...ctx }))
+  assert.equal(identity, null)
+  assert.deepEqual(logs, [{ reason: 'no_user_store_configured', username: 'linhnq' }])
+})
+
+test('logFailure is never called on a successful login (admin or Redis user)', async () => {
+  const repo = new FakeUserRepository()
+  await repo.seed('linhnq', 'linhnq')
+  const logs: unknown[] = []
+  const track = (reason: string, ctx: { username: string }) => logs.push({ reason, ...ctx })
+
+  await validateCredentials('admin', 'super-secret-admin-password', null, track)
+  await validateCredentials('linhnq', 'linhnq', repo as never, track)
+  assert.deepEqual(logs, [])
 })
 
 // ---- encodeSessionCookie / decodeSessionCookie ----

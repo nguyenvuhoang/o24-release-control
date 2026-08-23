@@ -49,34 +49,61 @@ function matchesEnvAdmin(username: string, password: string): boolean {
   return timingSafeEqual(usernameA, usernameB) && timingSafeEqual(passwordA, passwordB)
 }
 
+// Safe to log: a category label + the (already-not-secret) attempted
+// username. NEVER the password or a password hash. The client-facing
+// response (app/api/auth/login/route.ts) stays the single generic "Tên
+// đăng nhập hoặc mật khẩu không đúng" regardless of which of these fired —
+// this is purely for server-side diagnosis (see the linhnq login
+// investigation this was added for). 'user_disabled' is reserved for a
+// future `enabled` flag on UserRecord — no such flag exists yet, so this
+// reason can never actually fire today; it's listed so a future disable
+// feature has an obvious place to log into.
+export type LoginFailureReason = 'no_user_store_configured' | 'user_not_found' | 'user_disabled' | 'password_mismatch'
+
+function defaultLogLoginFailure(reason: LoginFailureReason, context: { username: string }): void {
+  console.error('[auth] login failed', { reason, username: context.username })
+}
+
 /**
  * Tries the env-based admin account first (unchanged behavior — always
  * available regardless of Redis config), then falls back to the Redis user
  * store (see lib/userRepository.ts) with a bcrypt-verified password. Returns
- * null on any mismatch — never distinguishes "unknown user" from "wrong
- * password" to the caller.
+ * null on any mismatch — the CALLER never sees which reason applied (see
+ * LoginFailureReason's doc comment), only `logFailure` does.
  *
- * `userRepositoryOverride` exists purely for tests to inject a fake
- * repository (or `null` to simulate "Redis not configured") — real callers
- * never pass it, letting this resolve the real repository itself.
+ * `userRepositoryOverride`/`logFailure` exist purely for tests to inject a
+ * fake repository (or `null` to simulate "Redis not configured") and to
+ * assert on which reason fired without polluting real console output —
+ * real callers never pass either, letting this resolve the real
+ * repository and log to the real console itself.
  */
 export async function validateCredentials(
   username: string,
   password: string,
   userRepositoryOverride?: UserRepository | null,
+  logFailure: (reason: LoginFailureReason, context: { username: string }) => void = defaultLogLoginFailure,
 ): Promise<AuthenticatedIdentity | null> {
   if (matchesEnvAdmin(username, password)) {
     return { username: process.env.ADMIN_USERNAME ?? 'admin', role: 'admin', mustChangePassword: false }
   }
 
   const userRepository = userRepositoryOverride !== undefined ? userRepositoryOverride : getUserRepository()
-  if (!userRepository) return null
+  if (!userRepository) {
+    logFailure('no_user_store_configured', { username })
+    return null
+  }
 
   const record = await userRepository.getByUsername(username)
-  if (!record) return null
+  if (!record) {
+    logFailure('user_not_found', { username })
+    return null
+  }
 
   const matches = await bcrypt.compare(password, record.passwordHash)
-  if (!matches) return null
+  if (!matches) {
+    logFailure('password_mismatch', { username: record.username })
+    return null
+  }
 
   return { username: record.username, role: record.role, mustChangePassword: record.mustChangePassword }
 }

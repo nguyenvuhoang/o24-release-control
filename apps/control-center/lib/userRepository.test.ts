@@ -117,3 +117,23 @@ test('updatePassword on a nonexistent user returns undefined and creates nothing
   assert.equal(result, undefined)
   assert.equal(store.size, 0)
 })
+
+// Regression test for the linhnq login investigation: seed (createIfAbsent)
+// and login (getByUsername) must resolve to the EXACT same Redis key
+// regardless of case/whitespace differences between how a username is
+// typed at seed time vs login time — both go through userKey()'s shared
+// normalizeUsername(), but this pins that contract directly so a future
+// change to either path can't silently diverge them again.
+test('createIfAbsent (seed path) and getByUsername (login path) resolve to the identical key for any case/whitespace variant', async () => {
+  const { repo, store } = makeRepository()
+  await repo.createIfAbsent({ username: '  LinhNQ  ', passwordHash: 'h', role: 'user', mustChangePassword: true, createdBy: 'seed-script' })
+
+  assert.equal(store.size, 1)
+  assert.ok(store.has('o24:user:record:linhnq'), 'expected the seeded record under the normalized key')
+
+  for (const variant of ['linhnq', 'LINHNQ', 'LinhNq', ' linhnq ', 'linhnq\t']) {
+    const found = await repo.getByUsername(variant)
+    assert.ok(found, `expected getByUsername(${JSON.stringify(variant)}) to find the seeded user`)
+    assert.equal(found.username, 'linhnq')
+  }
+})
