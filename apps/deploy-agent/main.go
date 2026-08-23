@@ -222,6 +222,13 @@ func (o *Operation) log(message string) {
 	o.logs = append(o.logs, OperationLogLine{Index: len(o.logs), Timestamp: time.Now().UTC(), Message: message})
 	close(o.notify)
 	o.notify = make(chan struct{})
+	// Mirrored to stdout/stderr (captured by `docker logs`) so every step —
+	// including the final failure — stays diagnosable even if nobody was
+	// watching the SSE stream live, or the process restarted before anyone
+	// read GET /api/operations/{id}. This is the ONLY place operation
+	// narration reaches docker logs; callers must keep using op.log rather
+	// than a separate log.Printf so nothing silently stays SSE-only.
+	log.Printf("[op %s] env=%s service=%s action=%s %s", o.id, o.environment, o.service, o.action, message)
 }
 
 func (o *Operation) complete(status, errMsg string) {
@@ -315,7 +322,7 @@ var rollbackStepLabels = deployLabels{
 var digestPattern = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 var requestIDPattern = regexp.MustCompile(`^[a-zA-Z0-9._:-]{1,120}$`)
 
-const version = "1.3.0"
+const version = "1.3.1"
 
 func main() {
 	configPath := getenv("AGENT_CONFIG_PATH", "/config/agent-config.json")
@@ -423,22 +430,33 @@ func loadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
+// auth rejects every request that isn't a validly HMAC-signed one — a
+// request failing here for /api/deploy never reaches handleDeploy, so it
+// never produces an operation, never writes .env.deploy, and (before this
+// change) left no trace anywhere. Every rejection branch logs the request's
+// method/path (never secret) plus which check failed, but NEVER the
+// apiKey/apiSecret, the received or expected HMAC signature, or the raw
+// X-O24-Agent-Key header value — only whether they matched.
 func (a *App) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("X-O24-Agent-Key")
 		timestamp := r.Header.Get("X-O24-Timestamp")
 		signature := r.Header.Get("X-O24-Signature")
 		if subtle.ConstantTimeCompare([]byte(key), []byte(a.apiKey)) != 1 {
+			log.Printf("[deploy-request] event=auth_key_mismatch method=%s path=%s", r.Method, sanitizeForLog(r.URL.Path))
 			writeJSON(w, http.StatusUnauthorized, APIError{Error: "unauthorized"})
 			return
 		}
 		ts, err := strconv.ParseInt(timestamp, 10, 64)
 		if err != nil || abs64(time.Now().Unix()-ts) > 300 {
+			log.Printf("[deploy-request] event=auth_invalid_timestamp method=%s path=%s rawTimestamp=%s parseError=%v",
+				r.Method, sanitizeForLog(r.URL.Path), sanitizeForLog(timestamp), err)
 			writeJSON(w, http.StatusUnauthorized, APIError{Error: "invalid_timestamp"})
 			return
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
 		if err != nil {
+			log.Printf("[deploy-request] event=auth_invalid_body method=%s path=%s error=%v", r.Method, sanitizeForLog(r.URL.Path), err)
 			writeJSON(w, http.StatusBadRequest, APIError{Error: "invalid_body"})
 			return
 		}
@@ -449,6 +467,8 @@ func (a *App) auth(next http.Handler) http.Handler {
 		_, _ = mac.Write([]byte(canonical))
 		expected := hex.EncodeToString(mac.Sum(nil))
 		if !hmac.Equal([]byte(strings.ToLower(signature)), []byte(expected)) {
+			log.Printf("[deploy-request] event=auth_invalid_signature method=%s path=%s timestamp=%s bodyLen=%d",
+				r.Method, sanitizeForLog(r.URL.Path), sanitizeForLog(timestamp), len(body))
 			writeJSON(w, http.StatusUnauthorized, APIError{Error: "invalid_signature"})
 			return
 		}
@@ -519,10 +539,15 @@ func (a *App) handleRestart(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDeploy starts a deploy operation in the background and returns the
-// operationId immediately; clients follow progress via the operations endpoints.
+// operationId immediately; clients follow progress via the operations
+// endpoints. Every step up to operation creation is logged to stdout/stderr
+// (captured by `docker logs`) via logPreOp, since a request rejected here
+// never reaches runDeploy/Operation.log at all — this is the only trace of
+// why a deploy never even started (no operationId, no SSE, nothing).
 func (a *App) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	var req DeployRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[deploy-request] event=decode_failed error=%v", err)
 		writeJSON(w, http.StatusBadRequest, APIError{Error: "invalid_request", Details: err.Error()})
 		return
 	}
@@ -530,21 +555,37 @@ func (a *App) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		req.RequestID = fmt.Sprintf("deploy-%d", time.Now().UnixNano())
 	}
 	if !requestIDPattern.MatchString(req.RequestID) {
+		logPreOp(req.RequestID, req.Service, "invalid_request_id")
 		writeJSON(w, http.StatusBadRequest, APIError{Error: "invalid_request_id"})
 		return
 	}
+	logPreOp(req.RequestID, req.Service, "received",
+		"rawDigest="+sanitizeForLog(req.Digest),
+		"rawImage="+sanitizeForLog(req.Image),
+		"requestedBy="+sanitizeForLog(req.RequestedBy),
+	)
 	svc, ok := a.findService(req.Service)
 	if !ok {
+		logPreOp(req.RequestID, req.Service, "service_not_found")
 		writeJSON(w, http.StatusNotFound, APIError{Error: "service_not_found"})
 		return
 	}
 	image, err := requestedImage(svc, req)
 	if err != nil {
+		logPreOp(req.RequestID, req.Service, "validation_failed",
+			"resolvedRepository="+svc.ImageRepository,
+			"error="+sanitizeForLog(err.Error()),
+		)
 		writeJSON(w, http.StatusBadRequest, APIError{Error: "invalid_image", Details: err.Error()})
 		return
 	}
+	logPreOp(req.RequestID, req.Service, "validated_ok",
+		"resolvedRepository="+svc.ImageRepository,
+		"resolvedImage="+image,
+	)
 
 	op := a.createOperation(a.cfg.Environment, svc.Code, "deploy", image)
+	logPreOp(req.RequestID, req.Service, "operation_created", "operationId="+op.id)
 	go a.runDeploy(context.Background(), op, svc, image, req, deployStepLabels)
 	writeJSON(w, http.StatusAccepted, map[string]any{"operationId": op.id, "status": "running"})
 }
@@ -554,11 +595,13 @@ func (a *App) handleDeploy(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleRollback(w http.ResponseWriter, r *http.Request) {
 	svc, ok := a.findService(r.PathValue("service"))
 	if !ok {
+		log.Printf("[deploy-request] event=service_not_found action=rollback service=%s", sanitizeForLog(r.PathValue("service")))
 		writeJSON(w, http.StatusNotFound, APIError{Error: "service_not_found"})
 		return
 	}
 	previous, err := a.findRollbackImage(svc.Code)
 	if err != nil {
+		logPreOp("-", svc.Code, "rollback_unavailable", "error="+sanitizeForLog(err.Error()))
 		writeJSON(w, http.StatusConflict, APIError{Error: "rollback_unavailable", Details: err.Error()})
 		return
 	}
@@ -567,6 +610,7 @@ func (a *App) handleRollback(w http.ResponseWriter, r *http.Request) {
 		RequestID: fmt.Sprintf("rollback-%d", time.Now().UnixNano()),
 		Service:   svc.Code, Image: previous, RequestedBy: "control-center", Reason: "rollback",
 	}
+	logPreOp(req.RequestID, svc.Code, "operation_created", "operationId="+op.id, "resolvedImage="+previous)
 	go a.runDeploy(context.Background(), op, svc, previous, req, rollbackStepLabels)
 	writeJSON(w, http.StatusAccepted, map[string]any{"operationId": op.id, "status": "running"})
 }
@@ -712,11 +756,12 @@ func (a *App) runRestart(parent context.Context, op *Operation, svc ServiceConfi
 // deployEnvFile — so pull/up always resolve the service's image from the
 // exact same merged env files, in the exact order compose sees them.
 func (a *App) runDeploy(parent context.Context, op *Operation, svc ServiceConfig, image string, req DeployRequest, labels deployLabels) {
+	started := time.Now().UTC()
+	op.log(fmt.Sprintf("runDeploy started: requestId=%s image=%s startedAt=%s", req.RequestID, image, started.Format(time.RFC3339)))
 	op.log(labels.starting)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	started := time.Now().UTC()
 	previous, _ := readEnvValue(a.cfg.Compose.DeployEnvFile, svc.ImageEnvKey)
 	record := DeploymentRecord{
 		RequestID: req.RequestID, Environment: a.cfg.Environment, Service: svc.Code,
@@ -733,13 +778,16 @@ func (a *App) runDeploy(parent context.Context, op *Operation, svc ServiceConfig
 	// from the merged --env-file values rather than from a literal string
 	// passed on the command line.
 	op.log(labels.updatingEnv)
+	op.log(fmt.Sprintf("env_write_begin path=%s key=%s value=%s", a.cfg.Compose.DeployEnvFile, svc.ImageEnvKey, image))
 	if err := updateEnvAtomic(a.cfg.Compose.DeployEnvFile, svc.ImageEnvKey, image); err != nil {
+		op.log(fmt.Sprintf("env_write_failed path=%s key=%s error=%v", a.cfg.Compose.DeployEnvFile, svc.ImageEnvKey, err))
 		op.log(labels.failed)
 		record.Status, record.Error = "failed", "update deployment env failed: "+err.Error()
 		a.finishDeployment(record, output.String())
 		op.complete("failed", record.Error)
 		return
 	}
+	op.log(fmt.Sprintf("env_write_ok path=%s key=%s", a.cfg.Compose.DeployEnvFile, svc.ImageEnvKey))
 
 	composeUpArgs := a.composeArgs("up", "-d", "--no-deps", "--force-recreate", svc.ComposeService)
 
@@ -818,6 +866,7 @@ func (a *App) runDeploy(parent context.Context, op *Operation, svc ServiceConfig
 			op.complete("failed", record.Error)
 			return
 		}
+		op.log(fmt.Sprintf("digest_verified wanted=sha256:%s actual=%s", wanted, final.RepoDigest))
 	}
 
 	record.Status = "succeeded"
@@ -1108,6 +1157,43 @@ func runStreamedCommand(ctx context.Context, op *Operation, name string, args ..
 	_ = pw.Close()
 	<-done
 	return output.String(), waitErr
+}
+
+// sanitizeForLog makes an externally-supplied value (a request field, never
+// a secret — apiKey/apiSecret/HMAC signatures never pass through this)
+// safe to place in a single stdout log line: control characters (newlines
+// in particular, which could otherwise forge additional log lines) are
+// stripped, and the value is capped in length so a malformed/oversized
+// input can't flood the log.
+func sanitizeForLog(value string) string {
+	value = strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\t':
+			return ' '
+		}
+		if r < 0x20 {
+			return -1
+		}
+		return r
+	}, value)
+	value = strings.TrimSpace(value)
+	const maxLen = 200
+	if len(value) > maxLen {
+		return value[:maxLen] + "...(truncated)"
+	}
+	return value
+}
+
+// logPreOp logs a request-handling step that happens BEFORE an Operation
+// exists (request decoding, service lookup, requestedImage validation) —
+// none of that is reachable through Operation.log, so without this, a
+// request rejected before an operationId is ever issued would leave no
+// trace anywhere, including docker logs. requestId correlates these lines
+// with the operation_created line and, once running, with the "[op ...]"
+// lines Operation.log emits.
+func logPreOp(requestID, service, event string, extra ...string) {
+	parts := append([]string{"requestId=" + sanitizeForLog(requestID), "service=" + sanitizeForLog(service), "event=" + event}, extra...)
+	log.Printf("[deploy-request] %s", strings.Join(parts, " "))
 }
 
 // exitCodeOf extracts the process exit code from a command error, or -1 if

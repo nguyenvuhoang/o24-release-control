@@ -143,6 +143,32 @@ func TestRequestedDigestOf(t *testing.T) {
 	})
 }
 
+func TestSanitizeForLog(t *testing.T) {
+	t.Run("strips newlines and control characters to prevent log line injection", func(t *testing.T) {
+		got := sanitizeForLog("sha256:abc\ndef\r\nghi\tjkl")
+		if strings.ContainsAny(got, "\n\r") {
+			t.Fatalf("expected no newlines in sanitized output, got %q", got)
+		}
+	})
+
+	t.Run("truncates oversized input instead of logging it unbounded", func(t *testing.T) {
+		got := sanitizeForLog(strings.Repeat("a", 1000))
+		if len(got) > 220 {
+			t.Fatalf("expected truncated output, got length %d", len(got))
+		}
+		if !strings.Contains(got, "truncated") {
+			t.Fatalf("expected truncation marker, got %q", got)
+		}
+	})
+
+	t.Run("leaves a normal digest value untouched", func(t *testing.T) {
+		digest := "sha256:d7ab5595faa22357b23bdd3dd1b5db4d77c27738d55209eb0a03524ec88a7a03"
+		if got := sanitizeForLog(digest); got != digest {
+			t.Fatalf("expected %s unchanged, got %s", digest, got)
+		}
+	})
+}
+
 func TestOperationLogAndComplete(t *testing.T) {
 	op := newOperation("op-test-1", "dev", "wfo", "deploy", "repo@sha256:abc")
 

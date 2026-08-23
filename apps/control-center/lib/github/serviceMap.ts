@@ -24,3 +24,17 @@ export function githubServiceForAgentCode(agentServiceCode: string): BuildServic
   const candidate = match[1].toUpperCase()
   return isBuildServiceCode(candidate) ? candidate : null
 }
+
+/**
+ * Resolves a BuildServiceCode ("CMS") to the Deploy Agent's own item for
+ * that service, by matching against a live /api/services list — the only
+ * safe source, since it's what the agent actually reports rather than a
+ * guessed "o24-<name>" transformation. Sending BuildServiceCode directly as
+ * a deploy request's `service` field (instead of the matched item's own
+ * `code`, e.g. "o24-cms") is exactly the bug that made every redeploy/
+ * rollback through /api/releases/[id]/deploy 404 with "service_not_found"
+ * before ever reaching the agent's runDeploy — see that route's usage.
+ */
+export function resolveAgentServiceCode<T extends { code: string }>(items: T[], service: BuildServiceCode): T | undefined {
+  return items.find((item) => githubServiceForAgentCode(item.code) === service)
+}

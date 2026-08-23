@@ -4,7 +4,7 @@ import { callAgent } from '../../../../../lib/agent'
 import { requireApiSession, errorResponse } from '../../../../../lib/api'
 import { appendAudit } from '../../../../../lib/audit'
 import { getEnvironment } from '../../../../../lib/config'
-import { githubServiceForAgentCode } from '../../../../../lib/github/serviceMap'
+import { resolveAgentServiceCode } from '../../../../../lib/github/serviceMap'
 import { isOperationLocked, releaseOperationLock, tryAcquireOperationLock } from '../../../../../lib/operationLock'
 import { registerReleaseOperation } from '../../../../../lib/operationContext'
 import { getReleaseRepository, planReleaseDeploy } from '../../../../../lib/releaseRepository'
@@ -69,21 +69,42 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     )
   }
 
+  // The Deploy Agent's own service code (e.g. "o24-cms") is NOT the same
+  // string as release.service (BuildServiceCode, e.g. "CMS") — the agent's
+  // findService() does an exact, case-sensitive match against its
+  // agent-config.json, so sending release.service directly always 404s
+  // with "service_not_found" before any operation is even created (this
+  // was exactly the 23:28 CMS failure: every redeploy/rollback through this
+  // route failed here, never reaching runDeploy, hence no .env.deploy write
+  // and no container recreate). Resolving it from the live /api/services
+  // list — the same call already needed for fromRepoDigest — is the only
+  // safe source: it's what the agent actually reports itself, not a
+  // guessed naming convention.
   let fromRepoDigest: string | undefined
+  let agentServiceCode: string
   try {
     const current = await callAgent<{ items: RawServiceStatus[] }>(environment, '/api/services')
-    fromRepoDigest = current.items
-      .map(normalizeServiceStatus)
-      .find((item) => githubServiceForAgentCode(item.code) === release.service)?.repoDigest
+    const matched = resolveAgentServiceCode(current.items.map(normalizeServiceStatus), release.service)
+    if (!matched) {
+      return deployError(
+        'agent_service_not_found',
+        502,
+        `Deploy Agent on ${environment.code} does not report any service matching ${release.service}`,
+      )
+    }
+    fromRepoDigest = matched.repoDigest
+    agentServiceCode = matched.code
   } catch (error) {
-    console.error('[releases] failed to read current service status before deploy', {
+    const message = error instanceof Error ? error.message : 'Unknown error'
+    console.error('[releases] failed to resolve Deploy Agent service code before deploy', {
       environment: environment.code,
       service: release.service,
-      error: error instanceof Error ? error.message : 'Unknown error',
+      error: message,
     })
-    // Best-effort only — fromRepoDigest stays undefined, and the audit entry
-    // will simply have no "before" value. Not knowing the current digest is
-    // not a reason to block a redeploy.
+    // Unlike fromRepoDigest alone, this can no longer be best-effort: without
+    // agentServiceCode we cannot know what to send as `service` to the agent
+    // without guessing — and guessing is exactly the bug this fixes.
+    return deployError('agent_unreachable', 502, message)
   }
 
   const plan = planReleaseDeploy(release, intent, fromRepoDigest)
@@ -109,7 +130,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       timeoutMs: 30_000,
       body: {
         requestId: randomUUID(),
-        service: release.service,
+        service: agentServiceCode,
         digest: toRepoDigest,
         requestedBy: session.username,
         reason: `${INTENT_LABEL[intent]} release ${release.id}`,
