@@ -60,6 +60,8 @@ export type DashboardResponse = {
   generatedAt: string
   environments: EnvironmentDashboard[]
   buildBranch: string
+  /** Max concurrent GitHub Actions dispatches for the batch "build affected services" flow. See getConfiguredBuildBatchConcurrency. */
+  buildBatchConcurrency: number
 }
 
 export type AuditRecord = {
@@ -436,3 +438,59 @@ export type ReleaseDeployResponse = {
   toRepoDigest: string
   intent: ReleaseDeployIntent
 }
+
+// POST /api/builds/affected-services — compares two w4s refs and resolves
+// which of the 7 buildable services actually need a rebuild. See
+// lib/affectedServices/resolver.ts (the pure classification logic) and
+// lib/github/w4sGraph.ts (the live, non-hardcoded dependency graph it's
+// evaluated against).
+export type AffectedServicesRequest = {
+  base: string
+  head?: string
+}
+
+export type AffectedServiceChangedFile = {
+  filename: string
+  status: string
+  previousFilename?: string
+}
+
+// One rule application against one changed file — 'direct' (own service
+// source), 'shared-dependency' (APIContracts/GrpcContracts/OData-style
+// ProjectReference closure), 'shared-props' (Directory.Packages.props /
+// Directory.Build.props actually COPYd by a service's Dockerfile),
+// 'workflow-change' (build-o24.yml itself — scope unknowable), 'known-
+// unrelated' (a real w4s module, verified NOT referenced by any of the 7
+// services), 'unknown' (matched nothing — always triggers fellBackToAll).
+export type AffectedServiceRuleKind = 'direct' | 'shared-dependency' | 'shared-props' | 'workflow-change' | 'known-unrelated' | 'unknown'
+
+export type AffectedServiceMatchedRule = {
+  file: string
+  rule: AffectedServiceRuleKind
+  services: BuildServiceCode[]
+  reason: string
+}
+
+export type AffectedServicesCompareMeta = {
+  base: string
+  head: string
+  baseSha: string
+  headSha: string
+  status: 'identical' | 'ahead' | 'behind' | 'diverged'
+  totalFiles: number
+  truncated: boolean
+}
+
+export type AffectedServicesResult = {
+  affectedServices: BuildServiceCode[]
+  unaffectedServices: BuildServiceCode[]
+  changedFiles: AffectedServiceChangedFile[]
+  matchedRules: AffectedServiceMatchedRule[]
+  reasons: Partial<Record<BuildServiceCode, string[]>>
+  warnings: string[]
+  fellBackToAll: boolean
+  compareMeta: AffectedServicesCompareMeta
+}
+
+export type AffectedServicesResponse = { success: true } & AffectedServicesResult
+export type AffectedServicesError = { success: false; error: string; details?: string }

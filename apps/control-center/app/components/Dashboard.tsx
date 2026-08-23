@@ -22,6 +22,7 @@ import type { BuildServiceCode } from '../../lib/github/serviceMap'
 import { readJsonSafe } from '../../lib/http'
 import { escapeHtml, SwalAlert } from '../../lib/swalAlert'
 import type { AuditFilter } from './release-control/AuditLogPanel'
+import { AffectedServicesPanel } from './release-control/AffectedServicesPanel'
 import { AuditLogPanel } from './release-control/AuditLogPanel'
 import { BuildDetailDrawer } from './release-control/BuildDetailDrawer'
 import { BuildDialog } from './release-control/BuildDialog'
@@ -104,6 +105,7 @@ export default function Dashboard({ username }: Props) {
   const { builds, getBuildState, triggerBuild, syncBuild, hydrateFromServer } = useBuildTracker()
   const [buildDialogTarget, setBuildDialogTarget] = useState<{ environment: EnvironmentDashboard; service: ServiceStatus } | null>(null)
   const [buildDetailTarget, setBuildDetailTarget] = useState<{ githubService: string; serviceLabel: string } | null>(null)
+  const [affectedServicesOpen, setAffectedServicesOpen] = useState(false)
   const previousBuildStatuses = useRef<Record<string, BuildTrackedStatus>>({})
 
   // "Latest Build vs DEV vs UAT vs PROD" — its own polling cadence (see the
@@ -829,6 +831,7 @@ export default function Dashboard({ username }: Props) {
         username={username}
         loading={loading}
         onRefresh={() => void refresh()}
+        onCheckAffectedServices={() => setAffectedServicesOpen(true)}
       />
 
       {error ? (
@@ -984,6 +987,16 @@ export default function Dashboard({ username }: Props) {
           htmlUrl={buildDetailState.htmlUrl}
           status={buildDetailState.status}
           onClose={() => setBuildDetailTarget(null)}
+        />
+      ) : null}
+
+      {affectedServicesOpen ? (
+        <AffectedServicesPanel
+          buildBranch={dashboard?.buildBranch ?? 'developer'}
+          buildBatchConcurrency={dashboard?.buildBatchConcurrency ?? 2}
+          triggerBuild={triggerBuild}
+          getBuildState={getBuildState}
+          onClose={() => setAffectedServicesOpen(false)}
         />
       ) : null}
     </main>

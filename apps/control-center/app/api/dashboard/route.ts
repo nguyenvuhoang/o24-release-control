@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { callAgent } from '../../../lib/agent'
 import { requireApiSession, errorResponse } from '../../../lib/api'
 import { loadControlConfig } from '../../../lib/config'
-import { getConfiguredBuildBranch } from '../../../lib/github/client'
+import { getConfiguredBuildBatchConcurrency, getConfiguredBuildBranch } from '../../../lib/github/client'
 import { normalizeServiceStatus } from '../../../lib/serviceStatus'
 import type { RawServiceStatus } from '../../../lib/serviceStatus'
 import type { AgentStatus, DashboardResponse, EnvironmentDashboard } from '../../../lib/types'
@@ -55,6 +55,7 @@ export async function GET() {
       generatedAt: new Date().toISOString(),
       environments,
       buildBranch: getConfiguredBuildBranch(),
+      buildBatchConcurrency: getConfiguredBuildBatchConcurrency(),
     }
     return NextResponse.json(response)
   } catch (error) {

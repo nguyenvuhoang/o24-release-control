@@ -1,7 +1,7 @@
 import { readJsonSafe } from '../http'
 import type { BuildJob, BuildJobsResponse, BuildRunSnapshot } from '../types'
 
-const GITHUB_API_BASE = 'https://api.github.com'
+export const GITHUB_API_BASE = 'https://api.github.com'
 
 function requireEnv(name: string): string {
   const value = process.env[name]
@@ -9,7 +9,10 @@ function requireEnv(name: string): string {
   return value
 }
 
-function githubConfig() {
+// Exported so other server-only GitHub modules (compare.ts, w4sGraph.ts) can
+// reuse the same owner/repo/token/apiVersion resolution instead of
+// duplicating requireEnv calls — still never imported by client code.
+export function githubConfig() {
   return {
     token: requireEnv('GITHUB_TOKEN'),
     owner: requireEnv('GITHUB_OWNER'),
@@ -25,6 +28,14 @@ function githubConfig() {
 // branch name.
 export function getConfiguredBuildBranch(): string {
   return process.env.GITHUB_BUILD_BRANCH || 'developer'
+}
+
+// How many services the "Build các service bị thay đổi" batch flow dispatches
+// concurrently — safe default of 2 (never unbounded-parallel), overridable
+// via env for deployments that want a different cap.
+export function getConfiguredBuildBatchConcurrency(): number {
+  const raw = Number(process.env.BUILD_BATCH_CONCURRENCY)
+  return Number.isInteger(raw) && raw > 0 ? raw : 2
 }
 
 async function githubRequest<T>(path: string, init: RequestInit = {}): Promise<T | null> {

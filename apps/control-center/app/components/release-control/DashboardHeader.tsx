@@ -5,9 +5,10 @@ type DashboardHeaderProps = {
   username: string
   loading: boolean
   onRefresh: () => void
+  onCheckAffectedServices: () => void
 }
 
-export function DashboardHeader({ applicationName, username, loading, onRefresh }: DashboardHeaderProps) {
+export function DashboardHeader({ applicationName, username, loading, onRefresh, onCheckAffectedServices }: DashboardHeaderProps) {
   return (
     <header className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
       <div className="flex items-start gap-3">
@@ -40,6 +41,13 @@ export function DashboardHeader({ applicationName, username, loading, onRefresh 
           className="min-h-[34px] rounded border border-slate-800 bg-slate-900/40 px-3.5 text-sm font-medium text-slate-200 transition-colors duration-150 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-45 focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-600"
         >
           {loading ? 'Đang làm mới…' : 'Làm mới'}
+        </button>
+        <button
+          type="button"
+          onClick={onCheckAffectedServices}
+          className="min-h-[34px] rounded border border-slate-800 bg-slate-900/40 px-3.5 text-sm font-medium text-slate-200 transition-colors duration-150 hover:bg-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-600"
+        >
+          Kiểm tra service bị ảnh hưởng
         </button>
         <form action="/api/auth/logout" method="post">
           <button
