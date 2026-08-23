@@ -421,7 +421,7 @@ function ReleaseFlow({ comparison, nextEnvironmentCode }: { comparison: ReleaseC
 
   return (
     <div className="mb-3 flex flex-wrap items-center gap-1.5">
-      <FlowNode label="Latest" value={comparison.latest?.repoDigest} tone="neutral" />
+      <FlowNode label="Latest" value={comparison.latest?.repoDigest} tone={latestNodeTone(comparison)} />
       <FlowArrow />
       {/* No "Rollback" note here: DEV differing from Latest only means DEV
           hasn't (yet) run this build — it is NOT evidence of a rollback.
@@ -453,6 +453,26 @@ function nodeTone(digest: string | undefined, reference: string | undefined, run
   if (running?.error) return 'danger'
   if (!digest || !reference) return 'neutral'
   return digest === reference ? 'success' : 'warning'
+}
+
+// LATEST has no `running` container to compare against (it's Docker Hub's
+// tag, not a deployed environment) — its tone instead reflects whether
+// Release Control actually knows this digest yet, reusing the resolver's own
+// conclusion (comparison.canImportSnapshot, from lib/releaseComparison.ts)
+// instead of re-deriving that here:
+//   neutral (gray)  — no digest at all (nothing loaded / Docker Hub empty)
+//   warning (amber) — valid digest, but no Release Snapshot yet (external
+//                      build not imported/synced — see "Đồng bộ từ Docker
+//                      Hub")
+//   success (green) — digest resolves to a known Release Snapshot
+// There is deliberately no `danger` (red) case: ResolvedRelease carries no
+// "Docker Hub fetch actually failed" signal today (a failed lookup and "no
+// latest tag published" both collapse to `comparison.latest` being
+// undefined — see resolveLatestRelease) — inventing a red state here would
+// be guessing, not deriving.
+function latestNodeTone(comparison: ReleaseComparison): BadgeTone {
+  if (!comparison.latest?.repoDigest) return 'neutral'
+  return comparison.canImportSnapshot ? 'warning' : 'success'
 }
 
 function FlowArrow() {

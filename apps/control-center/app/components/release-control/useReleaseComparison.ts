@@ -41,14 +41,24 @@ export function useReleaseComparison(environments: EnvironmentDashboard[], regis
   registryStatusRef.current = registryStatus
   const fetchingRef = useRef(false)
 
-  const refresh = useCallback(async () => {
-    const envs = environmentsRef.current
+  // `overrides` lets a caller that just fetched fresh environments/registry
+  // data (e.g. right after a mutation) pass it straight in, instead of this
+  // reading environmentsRef/registryStatusRef — which are only updated when
+  // THIS hook's owning component re-renders. A caller that does
+  // `setState(...)` and, in the same tick, immediately calls refresh() would
+  // otherwise race that re-render and read the value from BEFORE the
+  // mutation, silently no-op'ing the "refresh after sync/deploy/promote"
+  // requirement. The interval timer and the visibility handler below still
+  // call refresh() with no args, which is correct for them: by the time they
+  // fire, a render has long since happened and the refs are current.
+  const refresh = useCallback(async (overrides?: { environments?: EnvironmentDashboard[]; registryStatus?: RegistryServiceStatus[] }) => {
+    const envs = overrides?.environments ?? environmentsRef.current
     if (envs.length === 0 || fetchingRef.current) return
     fetchingRef.current = true
     setLoading(true)
     setError(undefined)
     try {
-      const registry = registryStatusRef.current
+      const registry = overrides?.registryStatus ?? registryStatusRef.current
       const checkedAt = new Date().toISOString()
 
       const entries = await Promise.all(

@@ -120,6 +120,11 @@ export default function Dashboard({ username }: Props) {
     refresh: refreshComparisons,
   } = useReleaseComparison(dashboard?.environments ?? [], registryStatus)
 
+  // Returns the freshly-fetched environments/registryStatus (undefined if
+  // either request failed) so a caller that just triggered a mutation can
+  // feed them straight into refreshComparisons() — see the comment on
+  // useReleaseComparison's refresh() for why reading registryStatus/dashboard
+  // state right after this resolves would otherwise race React's re-render.
   const refresh = useCallback(async (silent = false) => {
     if (!silent) setLoading(true)
     try {
@@ -130,7 +135,7 @@ export default function Dashboard({ username }: Props) {
       ])
       if (dashboardResponse.status === 401 || auditResponse.status === 401 || registryResponse.status === 401) {
         window.location.href = '/login'
-        return
+        return undefined
       }
       const dashboardBody = await readJsonSafe<DashboardResponse & { details?: string; error?: string }>(dashboardResponse)
       const auditBody = await readJsonSafe<{ items?: AuditRecord[]; details?: string; error?: string }>(auditResponse)
@@ -141,9 +146,11 @@ export default function Dashboard({ username }: Props) {
       // Registry Sync comparison is best-effort, non-critical UI: a failure
       // here (e.g. Docker Hub transiently unreachable) must never take the
       // rest of the dashboard down with it.
+      let freshRegistryStatus: RegistryServiceStatus[] | undefined
       if (registryResponse.ok) {
         const registryBody = await readJsonSafe<RegistryStatusResponse>(registryResponse)
-        setRegistryStatus(registryBody?.services ?? [])
+        freshRegistryStatus = registryBody?.services ?? []
+        setRegistryStatus(freshRegistryStatus)
       }
 
       // Audit storage not being configured (Vercel without KV) must not take
@@ -159,8 +166,10 @@ export default function Dashboard({ username }: Props) {
         setAuditStorageNotConfigured(auditBody?.error === 'audit_storage_not_configured')
       }
       setError('')
+      return { environments: dashboardBody.environments, registryStatus: freshRegistryStatus }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Không tải được dữ liệu')
+      return undefined
     } finally {
       setLoading(false)
     }
@@ -352,8 +361,8 @@ export default function Dashboard({ username }: Props) {
       setConnectionState('connected')
       setBusy(null)
       setTrackedOperation(null)
-      await refresh(true)
-      void refreshComparisons()
+      const fresh = await refresh(true)
+      void refreshComparisons(fresh)
       if (finalStatus === 'success') {
         await SwalAlert.success(`${operation.actionLabel} thành công`)
       } else {
@@ -692,8 +701,8 @@ export default function Dashboard({ username }: Props) {
           ? `${githubService}: đã đồng bộ trước đó, không có bản mới`
           : `${githubService}: đã tạo Release Snapshot mới từ Docker Hub`,
       )
-      await refresh(true)
-      void refreshComparisons()
+      const fresh = await refresh(true)
+      void refreshComparisons(fresh)
     } catch (caught) {
       await SwalAlert.error(caught instanceof Error ? caught.message : 'Đồng bộ Docker Hub thất bại')
     } finally {
@@ -777,7 +786,14 @@ export default function Dashboard({ username }: Props) {
           throw new Error(importResult?.details ?? importResult?.error ?? `Đồng bộ Release Snapshot thất bại (mã ${importResponse.status})`)
         }
         releaseId = importResult.release.id
-        void refreshComparisons()
+        // The import just created a Release Snapshot server-side — Dashboard's
+        // own registryStatus state doesn't know about it yet, so re-fetch
+        // before recomputing comparisons (matches syncRegistry below).
+        // Passing the response straight into refreshComparisons() avoids
+        // reading it back from a ref that only updates on this component's
+        // NEXT render — see useReleaseComparison.ts.
+        const fresh = await refresh(true)
+        void refreshComparisons(fresh)
       }
 
       // Step 2/2: deploy — only reached if the import above succeeded (or
