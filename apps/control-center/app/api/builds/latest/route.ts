@@ -4,6 +4,7 @@ import { requireApiSession, errorResponse } from '../../../../lib/api'
 import { getLastDispatchedRun } from '../../../../lib/buildPointerStore'
 import { findLatestGithubRunForService, getWorkflowRun } from '../../../../lib/github/client'
 import { BUILD_SERVICES, isBuildServiceCode } from '../../../../lib/github/serviceMap'
+import { attemptSnapshotAndPersistPending } from '../../../../lib/snapshotReconciliation'
 import type { LatestBuildResponse } from '../../../../lib/types'
 
 // Server-side "what is the latest build for this service" lookup — the
@@ -41,6 +42,18 @@ export async function GET(request: Request) {
     // in this app. Idempotent: harmless if the per-run poll route already
     // recorded the same runId+attempt.
     await appendBuildAudit(run, service, session.username)
+    try {
+      // Fallback/reconciliation path (the webhook is primary) — see
+      // app/api/builds/[runId]/route.ts's identical comment.
+      await attemptSnapshotAndPersistPending(run, service, session.username)
+    } catch (snapshotError) {
+      // Best-effort, same non-blocking contract as appendBuildAudit above.
+      console.error('[builds/latest] attemptSnapshotAndPersistPending failed', {
+        service,
+        runId: run.runId,
+        error: snapshotError instanceof Error ? snapshotError.message : 'Unknown error',
+      })
+    }
 
     const response: LatestBuildResponse = { service, ...run }
     return NextResponse.json(response)

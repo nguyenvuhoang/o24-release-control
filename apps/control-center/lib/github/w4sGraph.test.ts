@@ -1,14 +1,22 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import {
+
+process.env.GITHUB_TOKEN = 'test-token'
+process.env.GITHUB_OWNER = 'test-owner'
+process.env.GITHUB_REPO = 'test-repo'
+process.env.GITHUB_WORKFLOW = 'build-o24.yml'
+
+const {
   dirOf,
   extractProjectReferences,
+  fetchDependencyGraph,
   parseDockerfileRootCsproj,
   parseDockerfileSharedPropsFiles,
   parseServiceDockerfileMap,
   parseSlnProjects,
+  resetDependencyGraphCacheForTests,
   stripXmlComments,
-} from './w4sGraph'
+} = await import('./w4sGraph')
 
 // ---- Fixtures: verbatim content pulled from nguyenvuhoang/w4s (branch
 // "developer", commit 1c3ca549e6259a32bfadf9014c53cd36dcff575d) during the
@@ -266,4 +274,177 @@ test('parseSlnProjects extracts every .csproj path and normalizes backslashes', 
 
 test('dirOf returns the parent directory of a .csproj path', () => {
   assert.equal(dirOf('O24OpenAPI/O24OpenAPI.CMS/O24OpenAPI.CMS.API/O24OpenAPI.CMS.API.csproj'), 'O24OpenAPI/O24OpenAPI.CMS/O24OpenAPI.CMS.API')
+})
+
+// ---- fetchDependencyGraph caching (memory -> redis -> github) ----
+//
+// Minimal single-service fixture (not the real w4s data above) — these
+// tests are about the CACHE layer, not the parsing logic already covered
+// above, so the fixture is kept as small as possible to build successfully.
+
+const MINI_YML = `
+case "${'$'}{{ inputs.service }}" in
+  CMS)
+    echo "dockerfile=X/CMS.API/Dockerfile" >> "$GITHUB_OUTPUT"
+    echo "image=test/cms" >> "$GITHUB_OUTPUT"
+    ;;
+esac
+`
+const MINI_DOCKERFILE = `
+WORKDIR "/src/X/CMS.API"
+RUN dotnet build "./CMS.API.csproj" -c Release
+`
+const MINI_CSPROJ = '<Project></Project>'
+const MINI_SLN = 'Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CMS.API", "X\\\\CMS.API\\\\CMS.API.csproj", "{X}"\nEndProject\n'
+
+const MINI_FIXTURES: Record<string, string> = {
+  '.github/workflows/build-o24.yml': MINI_YML,
+  'O24OpenAPI.sln': MINI_SLN,
+  'X/CMS.API/Dockerfile': MINI_DOCKERFILE,
+  'X/CMS.API/CMS.API.csproj': MINI_CSPROJ,
+}
+
+type MockKvStore = Map<string, { value: string; expiresAt: number | null }>
+
+function handleKvCommand(store: MockKvStore, command: unknown[]): unknown {
+  const [op, ...args] = command as string[]
+  if (op === 'GET') {
+    const entry = store.get(args[0])
+    if (!entry) return null
+    if (entry.expiresAt !== null && Date.now() > entry.expiresAt) {
+      store.delete(args[0])
+      return null
+    }
+    return entry.value
+  }
+  if (op === 'SET') {
+    const [key, value, ...rest] = args
+    const nx = rest.includes('NX')
+    if (nx && store.has(key)) return null
+    let expiresAt: number | null = null
+    const pxIndex = rest.indexOf('PX')
+    const exIndex = rest.indexOf('EX')
+    if (pxIndex !== -1) expiresAt = Date.now() + Number(rest[pxIndex + 1])
+    if (exIndex !== -1) expiresAt = Date.now() + Number(rest[exIndex + 1]) * 1000
+    store.set(key, { value, expiresAt })
+    return 'OK'
+  }
+  throw new Error(`Mock KV does not support command: ${op}`)
+}
+
+function installMocks(fixtures: Record<string, string>, kvStore: MockKvStore | null) {
+  const originalFetch = globalThis.fetch
+  const originalKvUrl = process.env.KV_REST_API_URL
+  const originalKvToken = process.env.KV_REST_API_TOKEN
+  const githubFetchCount = { count: 0 }
+
+  if (kvStore) {
+    process.env.KV_REST_API_URL = 'https://fake-kv.example.com'
+    process.env.KV_REST_API_TOKEN = 'fake-kv-token'
+  } else {
+    delete process.env.KV_REST_API_URL
+    delete process.env.KV_REST_API_TOKEN
+  }
+
+  globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+    const href = typeof url === 'string' ? url : url.toString()
+    if (href.startsWith('https://fake-kv.example.com')) {
+      const command = JSON.parse(String(init?.body))
+      const result = handleKvCommand(kvStore as MockKvStore, command)
+      return new Response(JSON.stringify({ result }), { status: 200 })
+    }
+    if (href.startsWith('https://api.github.com/repos/test-owner/test-repo/contents/')) {
+      githubFetchCount.count += 1
+      const path = decodeURIComponent(href.split('/contents/')[1].split('?')[0])
+      const content = fixtures[path]
+      if (content === undefined) return new Response('Not found', { status: 404 })
+      return new Response(content, { status: 200 })
+    }
+    throw new Error(`Unexpected fetch in test: ${href}`)
+  }) as typeof fetch
+
+  return {
+    githubFetchCount,
+    restore() {
+      globalThis.fetch = originalFetch
+      if (originalKvUrl === undefined) delete process.env.KV_REST_API_URL
+      else process.env.KV_REST_API_URL = originalKvUrl
+      if (originalKvToken === undefined) delete process.env.KV_REST_API_TOKEN
+      else process.env.KV_REST_API_TOKEN = originalKvToken
+    },
+  }
+}
+
+test('fetchDependencyGraph: cache miss fetches from GitHub and reports source "github"', async () => {
+  resetDependencyGraphCacheForTests()
+  const mocks = installMocks(MINI_FIXTURES, null)
+  try {
+    const { graph, source } = await fetchDependencyGraph('sha-miss-1')
+    assert.equal(source, 'github')
+    assert.ok(graph.services.CMS)
+    assert.ok(mocks.githubFetchCount.count > 0)
+  } finally {
+    mocks.restore()
+  }
+})
+
+test('fetchDependencyGraph: a second call for the same SHA hits the in-memory cache and makes zero GitHub requests', async () => {
+  resetDependencyGraphCacheForTests()
+  const mocks = installMocks(MINI_FIXTURES, null)
+  try {
+    await fetchDependencyGraph('sha-miss-2')
+    const countAfterFirst = mocks.githubFetchCount.count
+    const { source } = await fetchDependencyGraph('sha-miss-2')
+    assert.equal(source, 'memory')
+    assert.equal(mocks.githubFetchCount.count, countAfterFirst)
+  } finally {
+    mocks.restore()
+  }
+})
+
+test('fetchDependencyGraph: a different SHA is a cache miss even right after caching another SHA (keys do not collide)', async () => {
+  resetDependencyGraphCacheForTests()
+  const mocks = installMocks(MINI_FIXTURES, null)
+  try {
+    await fetchDependencyGraph('sha-aaaa')
+    const countAfterFirst = mocks.githubFetchCount.count
+    const { source } = await fetchDependencyGraph('sha-bbbb')
+    assert.equal(source, 'github')
+    assert.ok(mocks.githubFetchCount.count > countAfterFirst)
+  } finally {
+    mocks.restore()
+  }
+})
+
+test('fetchDependencyGraph: a Redis hit (simulating another instance/cold start) skips GitHub entirely', async () => {
+  resetDependencyGraphCacheForTests()
+  const kvStore: MockKvStore = new Map()
+  const mocks = installMocks(MINI_FIXTURES, kvStore)
+  try {
+    // First call populates Redis (and memory).
+    await fetchDependencyGraph('sha-redis-1')
+    // A fresh memory cache (simulating a cold start on a NEW instance) must
+    // still find it in "Redis" without calling GitHub again.
+    resetDependencyGraphCacheForTests()
+    const countBeforeSecondCall = mocks.githubFetchCount.count
+    const { source } = await fetchDependencyGraph('sha-redis-1')
+    assert.equal(source, 'redis')
+    assert.equal(mocks.githubFetchCount.count, countBeforeSecondCall)
+  } finally {
+    mocks.restore()
+  }
+})
+
+test('fetchDependencyGraph: two concurrent requests for the same never-cached SHA only fetch from GitHub once (in-process singleflight)', async () => {
+  resetDependencyGraphCacheForTests()
+  const mocks = installMocks(MINI_FIXTURES, null)
+  try {
+    const [a, b] = await Promise.all([fetchDependencyGraph('sha-concurrent'), fetchDependencyGraph('sha-concurrent')])
+    assert.equal(a.source, 'github')
+    assert.equal(b.source, 'github')
+    // Sanity: the two results describe the same graph (piggybacked, not a second independent build).
+    assert.deepEqual(a.graph.services.CMS?.dirs, b.graph.services.CMS?.dirs)
+  } finally {
+    mocks.restore()
+  }
 })

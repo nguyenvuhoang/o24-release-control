@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      bcryptjs:
+        specifier: ^3.0.3
+        version: 3.0.3
       next:
         specifier: 16.2.11
         version: 16.2.11(react-dom@19.2.0(react@19.2.0))(react@19.2.0)
@@ -385,6 +388,10 @@ packages:
   baseline-browser-mapping@2.11.12:
     resolution: {integrity: sha512-r7WnVImvVCeFpf2DOXfy41aPWzeNg3H/A2X4dKmy1QL0MSyyk/e7z8ihJ3N6Nn2PsdhkVlqnEfnUE4a05P2aTA==}
     engines: {node: '>=6.0.0'}
+    hasBin: true
+
+  bcryptjs@3.0.3:
+    resolution: {integrity: sha512-GlF5wPWnSa/X5LKM1o0wz0suXIINz1iHRLvTS+sLyi7XPbe5ycmYI3DlZqVGZZtDgl4DmasFg7gOB3JYbphV5g==}
     hasBin: true
 
   caniuse-lite@1.0.30001807:
@@ -821,6 +828,8 @@ snapshots:
       csstype: 3.2.3
 
   baseline-browser-mapping@2.11.12: {}
+
+  bcryptjs@3.0.3: {}
 
   caniuse-lite@1.0.30001807: {}
 

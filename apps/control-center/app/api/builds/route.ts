@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { requireApiSession } from '../../../lib/api'
 import { recordBuildIntent, recordDispatchedRun } from '../../../lib/buildPointerStore'
-import { getConfiguredBuildBranch, triggerWorkflowBuild } from '../../../lib/github/client'
+import { GithubPermissionError, getConfiguredBuildBranch, triggerWorkflowBuild } from '../../../lib/github/client'
 import { isDispatchLocked, markDispatched } from '../../../lib/github/dispatchLock'
 import { isBuildServiceCode, BUILD_SERVICES } from '../../../lib/github/serviceMap'
 import type { BuildTriggerResponse } from '../../../lib/types'
@@ -89,6 +89,10 @@ export async function POST(request: Request) {
     }
     return NextResponse.json(response)
   } catch (error) {
+    if (error instanceof GithubPermissionError) {
+      console.error('[builds] trigger failed — GitHub token missing required permission', { service, branch, path: error.path })
+      return buildError('github_permission_denied', 403, error.message)
+    }
     console.error('[builds] trigger failed', {
       service,
       branch,

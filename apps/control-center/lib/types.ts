@@ -490,6 +490,8 @@ export type AffectedServicesResult = {
   warnings: string[]
   fellBackToAll: boolean
   compareMeta: AffectedServicesCompareMeta
+  /** Where the dependency graph came from — see lib/github/w4sGraph.ts's GraphSource. 'none' only when the graph fetch failed entirely (see fellBackToAll/warnings). */
+  graphSource: 'memory' | 'redis' | 'github' | 'none'
 }
 
 export type AffectedServicesResponse = { success: true } & AffectedServicesResult

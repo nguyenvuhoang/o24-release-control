@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
-import { createSession, validateCredentials } from '../../../../lib/auth'
+import { validateCredentials } from '../../../../lib/auth'
+import { createSession } from '../../../../lib/sessionCookies'
 
 export async function POST(request: Request) {
   const form = await request.formData()
@@ -7,7 +8,8 @@ export async function POST(request: Request) {
   const username = String(form.get('username') ?? '').trim()
   const password = String(form.get('password') ?? '')
 
-  if (!validateCredentials(username, password)) {
+  const identity = await validateCredentials(username, password)
+  if (!identity) {
     return new NextResponse(null, {
       status: 303,
       headers: {
@@ -16,7 +18,7 @@ export async function POST(request: Request) {
     })
   }
 
-  await createSession(username)
+  await createSession(identity)
 
   return new NextResponse(null, {
     status: 303,

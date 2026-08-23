@@ -1,12 +1,12 @@
 import Image from 'next/image'
 import { redirect } from 'next/navigation'
-import { getSession } from '../../lib/auth'
+import { getSession } from '../../lib/sessionCookies'
 
 export const dynamic = 'force-dynamic'
 
 export default async function LoginPage({ searchParams }: { searchParams: Promise<{ error?: string }> }) {
   const session = await getSession()
-  if (session) redirect('/')
+  if (session) redirect(session.mustChangePassword ? '/change-password' : '/')
   const params = await searchParams
 
   return (

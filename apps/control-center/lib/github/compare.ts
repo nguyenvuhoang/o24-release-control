@@ -1,5 +1,5 @@
 import { readJsonSafe } from '../http'
-import { GITHUB_API_BASE, githubConfig } from './client'
+import { GITHUB_API_BASE, GithubPermissionError, githubConfig } from './client'
 
 // GitHub's compare API caps the `files` array at 300 entries — beyond that
 // the array is silently truncated (no explicit "truncated" flag in the
@@ -119,7 +119,7 @@ export async function compareCommits(base: string, head: string): Promise<Compar
     if (remaining === '0') {
       throw new CompareRateLimitedError('GitHub API rate limit exceeded', resetAt)
     }
-    throw new Error(`GitHub compare forbidden (${response.status})`)
+    throw new GithubPermissionError('/compare', `GitHub token thiếu quyền Contents: Read-only để so sánh base="${base}" head="${head}"`)
   }
 
   const data = await readJsonSafe<GithubCompareResponse & { message?: string }>(response)

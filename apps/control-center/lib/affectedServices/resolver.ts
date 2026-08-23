@@ -100,7 +100,11 @@ function classifyOneFile(
  * result fall back to "build every service", per the safety requirement:
  * never silently under-build because a path went unrecognized.
  */
-export function resolveAffectedServices(compare: ResolverCompareInput, graph: DependencyGraph | null): AffectedServicesResult {
+export function resolveAffectedServices(
+  compare: ResolverCompareInput,
+  graph: DependencyGraph | null,
+  graphSource: AffectedServicesResult['graphSource'] = graph ? 'github' : 'none',
+): AffectedServicesResult {
   const warnings: string[] = []
   const matchedRules: AffectedServiceMatchedRule[] = []
   const reasons: Partial<Record<BuildServiceCode, string[]>> = {}
@@ -167,5 +171,6 @@ export function resolveAffectedServices(compare: ResolverCompareInput, graph: De
       totalFiles: compare.files.length,
       truncated: compare.truncated,
     },
+    graphSource,
   }
 }

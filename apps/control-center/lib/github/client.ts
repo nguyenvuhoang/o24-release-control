@@ -38,6 +38,25 @@ export function getConfiguredBuildBatchConcurrency(): number {
   return Number.isInteger(raw) && raw > 0 ? raw : 2
 }
 
+// Thrown specifically for GitHub's 403 "Resource not accessible by personal
+// access token" — the exact, verified signature of a fine-grained PAT
+// missing a required permission (Contents: Read-only for repo/tree/compare
+// reads, Actions: Read and write for workflow_dispatch). Verified empirically
+// (see Chat 06 hardening notes): a dispatch with a deliberately invalid ref
+// against a token that HAS Actions:Write returns 422 "No ref found" (passed
+// the permission check, failed only on the ref) — 403 only ever appears when
+// the permission itself is missing. Callers must never fall back to a
+// generic "trigger failed" message for this case.
+export class GithubPermissionError extends Error {
+  constructor(
+    public readonly path: string,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'GithubPermissionError'
+  }
+}
+
 async function githubRequest<T>(path: string, init: RequestInit = {}): Promise<T | null> {
   const { token, apiVersion } = githubConfig()
   const response = await fetch(`${GITHUB_API_BASE}${path}`, {
@@ -64,6 +83,9 @@ async function githubRequest<T>(path: string, init: RequestInit = {}): Promise<T
     const message = parsed && typeof parsed === 'object' && 'message' in parsed
       ? String((parsed as { message?: unknown }).message ?? response.statusText)
       : response.statusText
+    if (response.status === 403) {
+      throw new GithubPermissionError(path, `GitHub token thiếu quyền cần thiết cho ${path}: ${message}`)
+    }
     throw new Error(`GitHub API ${response.status}: ${message}`)
   }
 

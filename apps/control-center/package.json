@@ -7,9 +7,11 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-transform-types --import ./scripts/test-ts-hooks.mjs --test lib/**/*.test.ts app/components/**/*.test.ts"
+    "test": "node --experimental-transform-types --import ./scripts/test-ts-hooks.mjs --test lib/**/*.test.ts app/components/**/*.test.ts app/api/**/*.test.ts",
+    "seed:users": "node --experimental-transform-types --import ./scripts/test-ts-hooks.mjs scripts/seed-users.mjs"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "next": "16.2.11",
     "react": "19.2.0",
     "react-dom": "19.2.0",

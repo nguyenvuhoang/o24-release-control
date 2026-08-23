@@ -1,5 +1,6 @@
 import path from 'node:path'
-import { GITHUB_API_BASE, githubConfig } from './client'
+import { kvCommand, resolveKvConfig } from '../kv'
+import { GITHUB_API_BASE, GithubPermissionError, githubConfig } from './client'
 import { BUILD_SERVICES, isBuildServiceCode, type BuildServiceCode } from './serviceMap'
 
 // Live-derives the w4s monorepo's dependency graph for the 7 buildable
@@ -172,6 +173,12 @@ async function fetchRawFile(filePath: string, ref: string): Promise<string> {
       cache: 'no-store',
     },
   )
+  if (response.status === 403) {
+    throw new GithubPermissionError(
+      `/contents/${filePath}`,
+      `GitHub token thiếu quyền Contents: Read-only cho ${filePath}@${ref}`,
+    )
+  }
   if (!response.ok) {
     throw new Error(`GitHub content fetch failed for ${filePath}@${ref}: ${response.status} ${response.statusText}`)
   }
@@ -205,31 +212,23 @@ async function resolveClosure(rootCsproj: string, ref: string, cache: Map<string
   return [...seen]
 }
 
-const GRAPH_CACHE_TTL_MS = 10 * 60 * 1000
-const graphCache = new Map<string, { at: number; graph: DependencyGraph }>()
-
 /**
- * Builds the full live dependency graph for `ref` (a branch name or SHA).
- * Throws if any required file can't be fetched or parsed as expected —
- * callers (the affected-services resolver) must treat that as "graph
- * unavailable" and fall back to building every service, never as "nothing
- * is affected".
+ * Fetches every file needed and builds the full dependency graph for `sha` —
+ * no caching concerns here, this is the expensive ~40-request path that the
+ * cache layers below exist to avoid repeating. Throws if any required file
+ * can't be fetched or parsed as expected — callers (the affected-services
+ * resolver) must treat that as "graph unavailable" and fall back to building
+ * every service, never as "nothing is affected".
  */
-export async function fetchDependencyGraph(ref: string): Promise<DependencyGraph> {
-  const cached = graphCache.get(ref)
-  if (cached && Date.now() - cached.at < GRAPH_CACHE_TTL_MS) {
-    return cached.graph
-  }
-
+async function buildGraphFromGitHub(sha: string): Promise<DependencyGraph> {
   const [ymlContent, slnContent] = await Promise.all([
-    fetchRawFile('.github/workflows/build-o24.yml', ref),
-    fetchRawFile('O24OpenAPI.sln', ref),
+    fetchRawFile('.github/workflows/build-o24.yml', sha),
+    fetchRawFile('O24OpenAPI.sln', sha),
   ])
 
   const serviceDockerMap = parseServiceDockerfileMap(ymlContent)
   const missingServices = BUILD_SERVICES.filter((service) => !serviceDockerMap[service])
 
-  const dockerfileCache = new Map<string, string>()
   const csprojCache = new Map<string, string>()
   const services: Partial<Record<BuildServiceCode, ServiceDependencyInfo>> = {}
 
@@ -237,15 +236,14 @@ export async function fetchDependencyGraph(ref: string): Promise<DependencyGraph
     const info = serviceDockerMap[service]
     if (!info) continue
 
-    const dockerfileContent = await fetchRawFile(info.dockerfile, ref)
-    dockerfileCache.set(info.dockerfile, dockerfileContent)
+    const dockerfileContent = await fetchRawFile(info.dockerfile, sha)
 
     const rootCsproj = parseDockerfileRootCsproj(dockerfileContent)
     if (!rootCsproj) {
       throw new Error(`Could not determine root .csproj for service ${service} from ${info.dockerfile}`)
     }
 
-    const projects = await resolveClosure(rootCsproj, ref, csprojCache)
+    const projects = await resolveClosure(rootCsproj, sha, csprojCache)
     const dirs = [...new Set(projects.map(dirOf))]
     const sharedPropsFiles = parseDockerfileSharedPropsFiles(dockerfileContent)
     const ownDir = dirOf(dirOf(rootCsproj))
@@ -267,12 +265,128 @@ export async function fetchDependencyGraph(ref: string): Promise<DependencyGraph
   const knownUnrelatedDirs = [...new Set(allSlnProjects.map(dirOf).filter((dir) => !referencedDirs.has(dir)))]
   const solutionRoot = commonTopLevelDir(allSlnProjects)
 
-  const graph: DependencyGraph = { ref, services, missingServices, knownUnrelatedDirs, solutionRoot }
-  graphCache.set(ref, { at: Date.now(), graph })
+  return { ref: sha, services, missingServices, knownUnrelatedDirs, solutionRoot }
+}
+
+// ---- Caching: memory (fast, per-instance) -> Redis (persistent, shared
+// across instances/cold starts) -> live GitHub fetch. Keyed by the resolved
+// commit SHA (never a branch name — branches move, SHAs don't), so a hit is
+// valid forever in principle; TTLs below exist only to bound growth, not
+// because the data can go stale. ----
+
+export type GraphSource = 'memory' | 'redis' | 'github'
+
+const MEMORY_TTL_MS = 60 * 60 * 1000 // 1h safety net for a long-lived instance; irrelevant on Vercel's short-lived ones
+const REDIS_TTL_SECONDS = 60 * 60 * 24 * 30 // 30 days — long-lived since the SHA is immutable, bounded so old previews eventually fall out
+const LOCK_TTL_MS = 30_000
+const LOCK_WAIT_TIMEOUT_MS = 15_000
+const LOCK_POLL_INTERVAL_MS = 500
+
+const memoryCache = new Map<string, { at: number; graph: DependencyGraph }>()
+// In-process singleflight: a second concurrent request for the same SHA on
+// the same warm instance piggybacks on the first's in-flight fetch instead
+// of starting a duplicate one.
+const inflight = new Map<string, Promise<DependencyGraph>>()
+
+function redisGraphKey(owner: string, repo: string, sha: string): string {
+  return `o24:depgraph:${owner}/${repo}:${sha}`
+}
+
+function redisLockKey(owner: string, repo: string, sha: string): string {
+  return `o24:depgraph:lock:${owner}/${repo}:${sha}`
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Best-effort cross-instance dedup — NOT a strict distributed lock. If this
+ * instance can't acquire the Redis lock (another instance is already
+ * building the same SHA), it polls the cache key briefly for that other
+ * instance's result; if the wait times out, it builds anyway rather than
+ * risk starving the request. This trades a small chance of two instances
+ * both fetching the same SHA once for never deadlocking or hanging a
+ * request indefinitely.
+ */
+async function buildWithCrossInstanceDedup(
+  kvConfig: NonNullable<ReturnType<typeof resolveKvConfig>>,
+  owner: string,
+  repo: string,
+  sha: string,
+): Promise<DependencyGraph> {
+  const lockKey = redisLockKey(owner, repo, sha)
+  const gotLock = await kvCommand(kvConfig, ['SET', lockKey, '1', 'NX', 'PX', LOCK_TTL_MS]).catch(() => null)
+
+  if (gotLock !== 'OK') {
+    const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS
+    while (Date.now() < deadline) {
+      await sleep(LOCK_POLL_INTERVAL_MS)
+      const raw = await kvCommand(kvConfig, ['GET', redisGraphKey(owner, repo, sha)]).catch(() => null)
+      if (typeof raw === 'string') {
+        console.log('[w4sGraph] cache hit (redis, after waiting on cross-instance lock)', { sha })
+        return JSON.parse(raw) as DependencyGraph
+      }
+    }
+    console.log('[w4sGraph] cross-instance lock wait timed out — building locally', { sha })
+  }
+
+  const graph = await buildGraphFromGitHub(sha)
+  await kvCommand(kvConfig, ['SET', redisGraphKey(owner, repo, sha), JSON.stringify(graph), 'EX', REDIS_TTL_SECONDS]).catch((error) => {
+    console.error('[w4sGraph] failed to persist graph to redis', { sha, error: error instanceof Error ? error.message : 'Unknown error' })
+  })
   return graph
 }
 
-/** Test-only: forces the next fetchDependencyGraph(ref) call to re-fetch instead of using the cache. */
+/**
+ * Resolves the dependency graph for `sha` (must already be a resolved commit
+ * SHA, not a branch name — see the affected-services route, which resolves
+ * `head` via compareCommits before calling this). Checks memory, then Redis,
+ * then falls back to a live GitHub fetch (deduped in-process, best-effort
+ * deduped cross-instance via Redis lock). Never logs the token.
+ */
+export async function fetchDependencyGraph(sha: string): Promise<{ graph: DependencyGraph; source: GraphSource }> {
+  const cachedMemory = memoryCache.get(sha)
+  if (cachedMemory && Date.now() - cachedMemory.at < MEMORY_TTL_MS) {
+    console.log('[w4sGraph] cache hit (memory)', { sha })
+    return { graph: cachedMemory.graph, source: 'memory' }
+  }
+
+  const { owner, repo } = githubConfig()
+  const kvConfig = resolveKvConfig()
+  if (kvConfig) {
+    const raw = await kvCommand(kvConfig, ['GET', redisGraphKey(owner, repo, sha)]).catch(() => null)
+    if (typeof raw === 'string') {
+      const graph = JSON.parse(raw) as DependencyGraph
+      memoryCache.set(sha, { at: Date.now(), graph })
+      console.log('[w4sGraph] cache hit (redis)', { sha })
+      return { graph, source: 'redis' }
+    }
+  }
+
+  const existingInflight = inflight.get(sha)
+  if (existingInflight) {
+    console.log('[w4sGraph] piggybacking on in-flight fetch for this instance', { sha })
+    return { graph: await existingInflight, source: 'github' }
+  }
+
+  const promise = kvConfig ? buildWithCrossInstanceDedup(kvConfig, owner, repo, sha) : buildGraphFromGitHub(sha)
+  inflight.set(sha, promise)
+  try {
+    console.log('[w4sGraph] cache miss -> fetching from GitHub', { sha })
+    const graph = await promise
+    memoryCache.set(sha, { at: Date.now(), graph })
+    if (!kvConfig) {
+      console.log('[w4sGraph] Redis not configured — graph will not persist across cold starts/instances', { sha })
+    }
+    return { graph, source: 'github' }
+  } finally {
+    inflight.delete(sha)
+  }
+}
+
+/** Test-only: forces the next fetchDependencyGraph(sha) call to re-fetch instead of using any cache. */
 export function resetDependencyGraphCacheForTests(): void {
-  graphCache.clear()
+  memoryCache.clear()
+  inflight.clear()
 }

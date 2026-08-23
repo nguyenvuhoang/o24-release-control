@@ -1,12 +1,18 @@
 import { NextResponse } from 'next/server'
-import { getSession } from './auth'
+import { decideApiAccess, type ApiAccessOptions } from './apiAccess'
+import { getSession } from './sessionCookies'
+import type { UserRole } from './userRepository'
 
-export async function requireApiSession(): Promise<{ username: string } | NextResponse> {
+export async function requireApiSession(
+  options?: ApiAccessOptions,
+): Promise<{ username: string; role: UserRole; mustChangePassword: boolean } | NextResponse> {
   const session = await getSession()
-  if (!session) {
-    return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
+  const decision = decideApiAccess(session, options)
+  if (!decision.allowed) {
+    return NextResponse.json({ error: decision.error }, { status: decision.status })
   }
-  return { username: session.username }
+  // session is non-null whenever decision.allowed is true (see decideApiAccess).
+  return { username: session!.username, role: session!.role, mustChangePassword: session!.mustChangePassword }
 }
 
 export function errorResponse(error: unknown, status = 500): NextResponse {

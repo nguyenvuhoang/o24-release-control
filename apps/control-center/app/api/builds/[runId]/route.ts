@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server'
 import { appendBuildAudit } from '../../../../lib/audit'
 import { requireApiSession, errorResponse } from '../../../../lib/api'
 import { getWorkflowRun } from '../../../../lib/github/client'
+import { isBuildServiceCode } from '../../../../lib/github/serviceMap'
+import { attemptSnapshotAndPersistPending } from '../../../../lib/snapshotReconciliation'
 
 export async function GET(request: Request, { params }: { params: Promise<{ runId: string }> }) {
   const session = await requireApiSession()
@@ -20,6 +22,25 @@ export async function GET(request: Request, { params }: { params: Promise<{ runI
   try {
     const run = await getWorkflowRun(numericRunId)
     await appendBuildAudit(run, service, session.username)
+    if (service && isBuildServiceCode(service)) {
+      try {
+        // Poll route = fallback/reconciliation path (the webhook is
+        // primary) — a single attempt is enough here since this route gets
+        // hit repeatedly anyway; attemptSnapshotAndPersistPending also
+        // hands off to the durable job queue on 'digest_not_found', same as
+        // the webhook.
+        await attemptSnapshotAndPersistPending(run, service, session.username)
+      } catch (snapshotError) {
+        // Best-effort, same non-blocking contract as appendBuildAudit above —
+        // a snapshot-creation hiccup must never fail an otherwise-successful
+        // status poll.
+        console.error('[builds/runId] attemptSnapshotAndPersistPending failed', {
+          service,
+          runId: numericRunId,
+          error: snapshotError instanceof Error ? snapshotError.message : 'Unknown error',
+        })
+      }
+    }
     return NextResponse.json(run)
   } catch (error) {
     return errorResponse(error, 502)
