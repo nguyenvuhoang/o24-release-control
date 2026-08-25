@@ -466,6 +466,25 @@ export type ReleaseEnvironmentStateResponse = {
   items: ReleaseEnvironmentState[]
 }
 
+// POST /api/releases/backfill-metadata — admin-triggered metadata
+// enrichment for releases already on file (never creates/deletes a release,
+// never touches artifact identity — see lib/releaseMetadataBackfill.ts).
+// Omitting `service` scans across all services; `limit` bounds how many
+// releases this one call processes (idempotent — call again for more).
+export type BackfillMetadataRequest = {
+  service?: string
+  limit?: number
+}
+
+export type BackfillMetadataResponse = {
+  success: true
+  scanned: number
+  updated: number
+  skippedComplete: number
+  unresolved: number
+  items: Array<{ id: string; service: BuildServiceCode; outcome: 'updated' | 'unresolved'; filled?: Array<'commitSha' | 'commitMessage'> }>
+}
+
 // GET /api/releases/[id]/history — deployment operations (deploy/promote/
 // restart/rollback/redeploy) that touched this release's digest, newest
 // first. Sourced from the audit trail's bounded recent-record window (see

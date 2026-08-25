@@ -347,3 +347,82 @@ test('create() dedupes a pre-existing stored record that has no commitMessage ke
   assert.equal(result.deduped, true)
   assert.equal(result.record.id, prepared.id)
 })
+
+// ---- updateMetadata: metadata enrichment (backfill), never artifact identity ----
+
+test('updateMetadata (InMemory) fills only missing commitSha/commitMessage, never overwrites an existing value', async () => {
+  const repo = new InMemoryReleaseRepository()
+  const { record: original } = await repo.create(makeRegistryInput({ commitSha: 'a'.repeat(40) }))
+  assert.equal(original.commitMessage, null)
+
+  const updated = await repo.updateMetadata(original.id, {
+    commitSha: 'b'.repeat(40), // already set — must be ignored
+    commitMessage: 'feat: implement SimpleSearchResidents feature',
+  })
+  assert.ok(updated)
+  assert.equal(updated!.commitSha, 'a'.repeat(40)) // unchanged, NOT overwritten to 'b'.repeat(40)
+  assert.equal(updated!.commitMessage, 'feat: implement SimpleSearchResidents feature')
+  // Artifact identity untouched.
+  assert.equal(updated!.repoDigest, original.repoDigest)
+  assert.equal(updated!.tag, original.tag)
+  assert.equal(updated!.source, original.source)
+  assert.equal(updated!.createdAt, original.createdAt)
+})
+
+test('updateMetadata (InMemory) is a no-op (same object, no write) once both fields are already set', async () => {
+  const repo = new InMemoryReleaseRepository()
+  const { record: original } = await repo.create(
+    makeRegistryInput({ commitSha: 'a'.repeat(40), commitMessage: 'feat: already here' }),
+  )
+  const result = await repo.updateMetadata(original.id, { commitSha: 'c'.repeat(40), commitMessage: 'should never apply' })
+  assert.equal(result!.commitSha, 'a'.repeat(40))
+  assert.equal(result!.commitMessage, 'feat: already here')
+})
+
+test('updateMetadata (InMemory) returns undefined for an unknown release id', async () => {
+  const repo = new InMemoryReleaseRepository()
+  const result = await repo.updateMetadata('release:CMS:digest:doesnotexist', { commitSha: 'a'.repeat(40) })
+  assert.equal(result, undefined)
+})
+
+test('updateMetadata (InMemory) rejects a malformed commitSha instead of silently storing it', async () => {
+  const repo = new InMemoryReleaseRepository()
+  const { record: original } = await repo.create(makeRegistryInput())
+  await assert.rejects(() => repo.updateMetadata(original.id, { commitSha: 'not-a-sha' }), InvalidReleaseInputError)
+})
+
+test('updateMetadata (File) persists the patch across a fresh repository instance reading the same file', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'o24-release-repo-test-'))
+  const filePath = path.join(dir, 'releases.jsonl')
+  const repoA = new FileReleaseRepository(filePath)
+  const { record: original } = await repoA.create(makeRegistryInput({ repoDigest: `vknighthub/ips_o24cms@sha256:${'7'.repeat(64)}` }))
+
+  const updated = await repoA.updateMetadata(original.id, { commitSha: 'a'.repeat(40), commitMessage: 'feat: backfilled' })
+  assert.equal(updated!.commitSha, 'a'.repeat(40))
+  assert.equal(updated!.commitMessage, 'feat: backfilled')
+
+  // Re-read through a brand new instance (own in-memory cache none) to
+  // prove the rewrite actually landed on disk, not just in a local var.
+  const repoB = new FileReleaseRepository(filePath)
+  const reread = await repoB.getById(original.id)
+  assert.equal(reread?.commitSha, 'a'.repeat(40))
+  assert.equal(reread?.commitMessage, 'feat: backfilled')
+  // Every other stored field must be byte-identical to before the patch.
+  assert.equal(reread?.repoDigest, original.repoDigest)
+  assert.equal(reread?.id, original.id)
+})
+
+test('updateMetadata (File) with multiple releases in the file only rewrites the targeted one', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'o24-release-repo-test-'))
+  const filePath = path.join(dir, 'releases.jsonl')
+  const repo = new FileReleaseRepository(filePath)
+  const { record: first } = await repo.create(makeRegistryInput({ repoDigest: `vknighthub/ips_o24cms@sha256:${'8'.repeat(64)}` }))
+  const { record: second } = await repo.create(makeRegistryInput({ repoDigest: `vknighthub/ips_o24cms@sha256:${'9'.repeat(64)}` }))
+
+  await repo.updateMetadata(first.id, { commitSha: 'a'.repeat(40) })
+
+  const untouched = await repo.getById(second.id)
+  assert.equal(untouched?.commitSha, null)
+  const patched = await repo.getById(first.id)
+  assert.equal(patched?.commitSha, 'a'.repeat(40))
+})

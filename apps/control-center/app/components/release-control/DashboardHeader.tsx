@@ -6,9 +6,19 @@ type DashboardHeaderProps = {
   loading: boolean
   onRefresh: () => void
   onCheckAffectedServices: () => void
+  onBackfillMetadata: () => void
+  backfillingMetadata: boolean
 }
 
-export function DashboardHeader({ applicationName, username, loading, onRefresh, onCheckAffectedServices }: DashboardHeaderProps) {
+export function DashboardHeader({
+  applicationName,
+  username,
+  loading,
+  onRefresh,
+  onCheckAffectedServices,
+  onBackfillMetadata,
+  backfillingMetadata,
+}: DashboardHeaderProps) {
   return (
     <header className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
       <div className="flex items-start gap-3">
@@ -48,6 +58,15 @@ export function DashboardHeader({ applicationName, username, loading, onRefresh,
           className="min-h-[34px] rounded border border-slate-800 bg-slate-900/40 px-3.5 text-sm font-medium text-slate-200 transition-colors duration-150 hover:bg-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-600"
         >
           Kiểm tra service bị ảnh hưởng
+        </button>
+        <button
+          type="button"
+          onClick={onBackfillMetadata}
+          disabled={backfillingMetadata}
+          title="Điền commit SHA/commit message còn thiếu cho các Release Snapshot cũ — không tạo release mới, không đổi digest/tag/artifact"
+          className="min-h-[34px] rounded border border-slate-800 bg-slate-900/40 px-3.5 text-sm font-medium text-slate-200 transition-colors duration-150 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-45 focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-600"
+        >
+          {backfillingMetadata ? 'Đang điền bổ sung…' : 'Điền bổ sung Commit'}
         </button>
         <form action="/api/auth/logout" method="post">
           <button

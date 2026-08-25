@@ -19,6 +19,21 @@ export interface ReleaseRepository {
   /** repoDigest may be the full "repo@sha256:<hex>" reference or the bare "sha256:<hex>" — only the hex is used to match. */
   getByDigest(service: BuildServiceCode, repoDigest: string): Promise<ReleaseSnapshot | undefined>
   list(query?: ListReleasesQuery): Promise<ReleaseListResult>
+  /**
+   * Metadata enrichment, NOT a general update: fills ONLY commitSha/
+   * commitMessage, and ONLY when the stored value is currently missing —
+   * never overwrites a field that already has one, never touches
+   * repoDigest/tag/source/branch/githubRunId/githubRunAttempt/createdAt/
+   * createdBy/id (artifact identity stays immutable). Returns the
+   * (possibly unchanged) stored record, or undefined if no release exists
+   * with this id. See lib/releaseMetadataBackfill.ts, the only caller.
+   */
+  updateMetadata(id: string, patch: ReleaseMetadataPatch): Promise<ReleaseSnapshot | undefined>
+}
+
+export type ReleaseMetadataPatch = {
+  commitSha?: string | null
+  commitMessage?: string | null
 }
 
 export type CreateReleaseInput = {
@@ -239,6 +254,29 @@ function sameReleaseData(a: ReleaseSnapshot, b: ReleaseSnapshot): boolean {
   )
 }
 
+// Shared by every backend's updateMetadata so "fill only what's missing,
+// never overwrite" is enforced identically everywhere, not re-implemented
+// per storage backend. Returns null when the patch has nothing new to apply
+// (both fields already set, or the patch is empty/no-op) — callers use that
+// to skip an unnecessary write.
+function mergeMetadataPatch(existing: ReleaseSnapshot, patch: ReleaseMetadataPatch): ReleaseSnapshot | null {
+  let changed = false
+  const next: ReleaseSnapshot = { ...existing }
+  if (!next.commitSha && patch.commitSha) {
+    const commitSha = patch.commitSha.trim()
+    if (!GIT_SHA_PATTERN.test(commitSha)) {
+      throw new InvalidReleaseInputError('commitSha must be a 40-character hex Git SHA')
+    }
+    next.commitSha = commitSha.toLowerCase()
+    changed = true
+  }
+  if (!next.commitMessage && patch.commitMessage) {
+    next.commitMessage = patch.commitMessage.trim()
+    changed = true
+  }
+  return changed ? next : null
+}
+
 function runKeyString(runId: number, runAttempt: number): string {
   return `${runId}:${runAttempt}`
 }
@@ -308,6 +346,25 @@ export class FileReleaseRepository implements ReleaseRepository {
     return paginateReleases(await this.readAll(), query)
   }
 
+  // Rewrites the whole file (unlike create()'s append-only write) — the
+  // JSONL format has no in-place "patch this one line" primitive, and
+  // getById/readAll take the FIRST match for an id, so appending an updated
+  // copy would never actually be seen. Single-instance self-hosted use only
+  // (same assumption FileReleaseRepository already makes elsewhere): a
+  // concurrent create() append racing this rewrite could be lost, which is
+  // an acceptable tradeoff for a manual, idempotent, admin-triggered backfill
+  // — re-running it later fills in whatever is still missing.
+  async updateMetadata(id: string, patch: ReleaseMetadataPatch): Promise<ReleaseSnapshot | undefined> {
+    const all = await this.readAll()
+    const index = all.findIndex((release) => release.id === id)
+    if (index === -1) return undefined
+    const merged = mergeMetadataPatch(all[index], patch)
+    if (!merged) return all[index]
+    all[index] = merged
+    await this.writeAll(all)
+    return merged
+  }
+
   private async readAll(): Promise<ReleaseSnapshot[]> {
     try {
       const raw = await fs.readFile(this.filePath, 'utf8')
@@ -319,6 +376,14 @@ export class FileReleaseRepository implements ReleaseRepository {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
       throw error
     }
+  }
+
+  private async writeAll(all: ReleaseSnapshot[]): Promise<void> {
+    await fs.mkdir(path.dirname(this.filePath), { recursive: true })
+    const content = all.map((release) => JSON.stringify(release)).join('\n') + (all.length > 0 ? '\n' : '')
+    const tmpPath = `${this.filePath}.tmp-${process.pid}-${Date.now()}`
+    await fs.writeFile(tmpPath, content, { encoding: 'utf8', mode: 0o640 })
+    await fs.rename(tmpPath, this.filePath)
   }
 }
 
@@ -421,6 +486,22 @@ export class KvReleaseRepository implements ReleaseRepository {
     const nextCursor = ids.length === limit ? String(offset + limit) : undefined
     return { items, nextCursor }
   }
+
+  // In-place overwrite of the SAME key (not a new id) — no index changes
+  // needed, since identity fields (repoDigest/runId/runAttempt/etc.) never
+  // change. GET-then-SET isn't atomic, but this is a manual, idempotent,
+  // admin-triggered backfill: a lost update from a rare concurrent race just
+  // means that field is still missing and gets filled by re-running it.
+  async updateMetadata(id: string, patch: ReleaseMetadataPatch): Promise<ReleaseSnapshot | undefined> {
+    const key = KV_RECORD_PREFIX + id
+    const raw = await kvCommand(this.config, ['GET', key])
+    if (typeof raw !== 'string') return undefined
+    const existing = JSON.parse(raw) as ReleaseSnapshot
+    const merged = mergeMetadataPatch(existing, patch)
+    if (!merged) return existing
+    await kvCommand(this.config, ['SET', key, JSON.stringify(merged)])
+    return merged
+  }
 }
 
 // ---- In-memory (used only when NOT on Vercel and KV isn't configured — see
@@ -467,6 +548,15 @@ export class InMemoryReleaseRepository implements ReleaseRepository {
 
   async list(query: ListReleasesQuery = {}): Promise<ReleaseListResult> {
     return paginateReleases([...this.records.values()], query)
+  }
+
+  async updateMetadata(id: string, patch: ReleaseMetadataPatch): Promise<ReleaseSnapshot | undefined> {
+    const existing = this.records.get(id)
+    if (!existing) return undefined
+    const merged = mergeMetadataPatch(existing, patch)
+    if (!merged) return existing
+    this.records.set(id, merged)
+    return merged
   }
 }
 

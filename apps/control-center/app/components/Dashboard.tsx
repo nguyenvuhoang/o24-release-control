@@ -4,6 +4,7 @@ import { usePathname, useRouter, useSearchParams } from 'next/navigation'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
   AuditRecord,
+  BackfillMetadataResponse,
   DashboardResponse,
   EnvironmentDashboard,
   OperationAction,
@@ -107,6 +108,7 @@ export default function Dashboard({ username }: Props) {
   const [buildDialogTarget, setBuildDialogTarget] = useState<{ environment: EnvironmentDashboard; service: ServiceStatus } | null>(null)
   const [buildDetailTarget, setBuildDetailTarget] = useState<{ githubService: string; serviceLabel: string } | null>(null)
   const [affectedServicesOpen, setAffectedServicesOpen] = useState(false)
+  const [backfillingMetadata, setBackfillingMetadata] = useState(false)
   const previousBuildStatuses = useRef<Record<string, BuildTrackedStatus>>({})
 
   // "Latest Build vs DEV vs UAT vs PROD" — its own polling cadence (see the
@@ -737,6 +739,39 @@ export default function Dashboard({ username }: Props) {
     }
   }
 
+  // "Điền bổ sung Commit": admin-triggered metadata enrichment for releases
+  // already on file (never creates a release, never touches artifact
+  // identity — see lib/releaseMetadataBackfill.ts). One call is bounded
+  // server-side, so a large backlog may need clicking this more than once;
+  // it's idempotent, so repeating it is always safe. Refreshes
+  // dashboard+comparisons afterward so a card whose running digest just
+  // gained a commitMessage shows "Commit" immediately, without a manual
+  // page reload.
+  async function backfillMetadata() {
+    setBackfillingMetadata(true)
+    try {
+      const response = await fetch('/api/releases/backfill-metadata', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const result = await readJsonSafe<BackfillMetadataResponse & { error?: string; details?: string }>(response)
+      if (!response.ok || !result?.success) {
+        throw new Error(result?.details ?? result?.error ?? `Điền bổ sung thất bại (mã ${response.status})`)
+      }
+      SwalAlert.toast(
+        `Đã quét ${result.scanned} release: cập nhật ${result.updated}, chưa resolve được ${result.unresolved}` +
+          (result.scanned === 0 ? ' (không còn release nào thiếu commit)' : ''),
+      )
+      const fresh = await refresh(true)
+      void refreshComparisons(fresh)
+    } catch (caught) {
+      await SwalAlert.error(caught instanceof Error ? caught.message : 'Điền bổ sung Commit thất bại')
+    } finally {
+      setBackfillingMetadata(false)
+    }
+  }
+
   // "Triển khai bản mới → DEV": resolves the latest build via the
   // comparison state machine (never re-resolved here), imports it as a
   // Release Snapshot first if it's UNTRACKED_BUILD (no snapshot yet — the
@@ -871,6 +906,8 @@ export default function Dashboard({ username }: Props) {
         loading={loading}
         onRefresh={() => void refresh()}
         onCheckAffectedServices={() => setAffectedServicesOpen(true)}
+        onBackfillMetadata={() => void backfillMetadata()}
+        backfillingMetadata={backfillingMetadata}
       />
 
       {error ? (
