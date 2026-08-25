@@ -5,7 +5,7 @@ import { loadControlConfig } from '../../../lib/config'
 import { getConfiguredBuildBatchConcurrency, getConfiguredBuildBranch } from '../../../lib/github/client'
 import { normalizeServiceStatus } from '../../../lib/serviceStatus'
 import type { RawServiceStatus } from '../../../lib/serviceStatus'
-import type { AgentStatus, DashboardResponse, EnvironmentDashboard } from '../../../lib/types'
+import type { AgentStatus, DashboardResponse, EnvironmentDashboard, HostMetrics } from '../../../lib/types'
 
 export const dynamic = 'force-dynamic'
 
@@ -30,6 +30,22 @@ export async function GET() {
               items: services.items,
             })
           }
+          // Host health is best-effort and never affects `online`: an agent
+          // old enough to predate this endpoint, or a single slow/failed
+          // sample, should still show its services normally — just without
+          // the health row (the UI falls back to "Không lấy được thông tin
+          // server" for that case).
+          let hostMetrics: HostMetrics | undefined
+          try {
+            hostMetrics = await callAgent<HostMetrics>(environment, '/api/host/metrics', { timeoutMs: 8_000 })
+          } catch (hostMetricsError) {
+            if (process.env.NODE_ENV !== 'production') {
+              console.debug('[dashboard] host metrics unavailable', {
+                environment: environment.code,
+                error: hostMetricsError instanceof Error ? hostMetricsError.message : hostMetricsError,
+              })
+            }
+          }
           return {
             code: environment.code,
             name: environment.name,
@@ -37,6 +53,7 @@ export async function GET() {
             online: true,
             agent,
             services: services.items.map(normalizeServiceStatus),
+            hostMetrics,
           }
         } catch (error) {
           return {

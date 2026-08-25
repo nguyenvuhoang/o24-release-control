@@ -29,6 +29,16 @@ type Config struct {
 	ListenAddr  string          `json:"listenAddr"`
 	Compose     ComposeConfig   `json:"compose"`
 	Services    []ServiceConfig `json:"services"`
+	// Hostname overrides GET /api/host/metrics' "hostname" field. Optional:
+	// the container's own hostname (os.Hostname()) is the container ID, not
+	// anything host-identifying, so this defaults to Environment when unset
+	// rather than reporting something misleading.
+	Hostname string `json:"hostname,omitempty"`
+	// HostDiskPath is the filesystem path GET /api/host/metrics statfs's for
+	// disk usage. Must be a real host bind-mount (e.g. Compose.ProjectDirectory)
+	// — the agent's own container rootfs is never representative of host disk
+	// usage. Optional: defaults to Compose.ProjectDirectory when unset.
+	HostDiskPath string `json:"hostDiskPath,omitempty"`
 }
 
 type ComposeConfig struct {
@@ -72,6 +82,13 @@ type App struct {
 	opMu       sync.Mutex
 	operations map[string]*Operation
 	opOrder    []string
+
+	// hostCPU* cache the last /proc/stat sample so GET /api/host/metrics can
+	// compute CPU usage% as a delta between requests without ever sleeping
+	// inside a request. See cpuUsagePercent in hostmetrics.go.
+	hostCPUMu         sync.Mutex
+	hostCPULastSample cpuStatSample
+	hostCPUHasSample  bool
 }
 
 type APIError struct {
@@ -322,7 +339,7 @@ var rollbackStepLabels = deployLabels{
 var digestPattern = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 var requestIDPattern = regexp.MustCompile(`^[a-zA-Z0-9._:-]{1,120}$`)
 
-const version = "1.3.1"
+const version = "1.4.0"
 
 func main() {
 	configPath := getenv("AGENT_CONFIG_PATH", "/config/agent-config.json")
@@ -358,6 +375,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", app.handleHealth)
 	mux.Handle("GET /api/status", app.auth(http.HandlerFunc(app.handleStatus)))
+	mux.Handle("GET /api/host/metrics", app.auth(http.HandlerFunc(app.handleHostMetrics)))
 	mux.Handle("GET /api/services", app.auth(http.HandlerFunc(app.handleServices)))
 	mux.Handle("GET /api/services/{service}/logs", app.auth(http.HandlerFunc(app.handleLogs)))
 	mux.Handle("POST /api/services/{service}/restart", app.auth(http.HandlerFunc(app.handleRestart)))

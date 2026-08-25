@@ -47,6 +47,30 @@ GET /api/services
 
 Trả trạng thái container, health, image ID, digest và OCI revision label.
 
+## Host metrics
+
+```http
+GET /api/host/metrics
+```
+
+Snapshot tài nguyên của server đang chạy agent (CPU, RAM, swap, disk, số container, uptime, OS/kernel) — dùng để hiển thị "Server Health" trên Control Center trước khi build/deploy/promote. Luôn trả 200 với dữ liệu lấy được tốt nhất có thể; một chỉ số lấy lỗi (ví dụ `docker system df` timeout) chỉ bị bỏ qua (`omitempty`), không làm hỏng cả response. CPU/RAM/load/uptime/kernel là số liệu THỰC của host (Linux không namespace hoá `/proc/loadavg`, `/proc/stat`, `/proc/meminfo`, và kernel version dùng chung với host). `hostname`/`os` phản ánh chính container của agent — đặt `hostname` trong `agent-config.json` nếu muốn tên khác. Disk đo bằng `statfs` trên `hostDiskPath` (mặc định `compose.projectDirectory`) — phải là một path bind-mount thật từ host, không phải rootfs của container agent.
+
+```json
+{
+  "hostname": "dev-app",
+  "cpu": { "usagePercent": 24.8, "cores": 8, "load1": 1.42, "load5": 1.18, "load15": 0.96 },
+  "memory": { "usedBytes": 8589934592, "totalBytes": 17179869184, "usagePercent": 50 },
+  "swap": { "usedBytes": 0, "totalBytes": 2147483648 },
+  "disk": { "usedBytes": 128000000000, "totalBytes": 256000000000, "usagePercent": 50 },
+  "dockerDiskUsageBytes": 5368709120,
+  "containers": { "running": 12, "stopped": 2, "restarting": 0 },
+  "uptimeSeconds": 864000,
+  "os": "Alpine Linux v3.20",
+  "kernel": "6.8.0-45-generic",
+  "sampledAt": "2026-08-23T10:00:00Z"
+}
+```
+
 ## Logs
 
 ```http

@@ -45,6 +45,56 @@ export type ServiceStatus = {
   error?: string
 }
 
+// GET /api/host/metrics on the Deploy Agent — see apps/deploy-agent/hostmetrics.go
+// for exactly what each field reflects and its caveats (hostname/OS describe
+// the agent's own container, not the physical host, unless the agent config
+// sets `hostname` explicitly; every other field is a real host-wide value).
+export type HostCpuMetrics = {
+  /** Absent on the agent's very first sample after a restart (needs a previous /proc/stat snapshot to diff against). */
+  usagePercent?: number
+  cores: number
+  load1: number
+  load5: number
+  load15: number
+}
+
+export type HostMemoryMetrics = {
+  usedBytes: number
+  totalBytes: number
+  usagePercent: number
+}
+
+export type HostSwapMetrics = {
+  usedBytes: number
+  totalBytes: number
+}
+
+export type HostDiskMetrics = {
+  usedBytes: number
+  totalBytes: number
+  usagePercent: number
+}
+
+export type HostContainerCounts = {
+  running: number
+  stopped: number
+  restarting: number
+}
+
+export type HostMetrics = {
+  hostname: string
+  cpu: HostCpuMetrics
+  memory: HostMemoryMetrics
+  swap?: HostSwapMetrics
+  disk: HostDiskMetrics
+  dockerDiskUsageBytes?: number
+  containers: HostContainerCounts
+  uptimeSeconds: number
+  os?: string
+  kernel?: string
+  sampledAt: string
+}
+
 export type EnvironmentDashboard = {
   code: string
   name: string
@@ -53,6 +103,8 @@ export type EnvironmentDashboard = {
   error?: string
   agent?: AgentStatus
   services: ServiceStatus[]
+  /** Undefined when the agent is online but the host metrics call itself failed/timed out — a fetch failure here never flips `online`. */
+  hostMetrics?: HostMetrics
 }
 
 export type DashboardResponse = {

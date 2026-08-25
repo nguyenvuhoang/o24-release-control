@@ -29,6 +29,7 @@ import { BuildDialog } from './release-control/BuildDialog'
 import { DashboardHeader } from './release-control/DashboardHeader'
 import { EnvironmentPanel } from './release-control/EnvironmentPanel'
 import { EnvironmentTabs } from './release-control/EnvironmentTabs'
+import { resourceWarningMessage } from './release-control/HostHealth'
 import { LatestReleasePanel } from './release-control/LatestReleasePanel'
 import { LogsModal } from './release-control/LogsModal'
 import { OperationLogDrawer } from './release-control/OperationLogDrawer'
@@ -423,6 +424,16 @@ export default function Dashboard({ username }: Props) {
     }
   }
 
+  // Prepends an amber "server is low on resources" block to a confirm
+  // dialog's message when `warning` is set — never blocks the action, just
+  // makes the risk visible right before the user commits to it. Reused by
+  // both deploy() and promote() since they share the same confirm shape.
+  function withResourceWarning(baseMessage: string, warning: string | null): { message: string; danger: boolean } {
+    if (!warning) return { message: baseMessage, danger: false }
+    const warningBlock = `<div class="mb-3 rounded border border-amber-500/30 bg-amber-500/10 p-2.5 text-left text-xs text-amber-300"><p class="font-medium">⚠ ${escapeHtml(warning)}</p></div>`
+    return { message: warningBlock + baseMessage, danger: true }
+  }
+
   async function deploy(environment: EnvironmentDashboard, service: ServiceStatus, prefillDigest?: string) {
     const serviceLabel = service.displayName || service.code
     const digest = await SwalAlert.prompt({
@@ -442,11 +453,17 @@ export default function Dashboard({ username }: Props) {
     if (!digest) return
     const normalized = digest.trim().toLowerCase()
 
+    const resourceWarning = resourceWarningMessage(environment.code, environment.hostMetrics)
+    const { message, danger } = withResourceWarning(
+      `Bạn có chắc muốn triển khai ${escapeHtml(serviceLabel)} trên môi trường ${escapeHtml(environment.code)}?`,
+      resourceWarning,
+    )
     const confirmed = await SwalAlert.confirm({
       title: 'Xác nhận triển khai',
-      message: `Bạn có chắc muốn triển khai ${escapeHtml(serviceLabel)} trên môi trường ${escapeHtml(environment.code)}?`,
-      confirmText: 'Triển khai',
+      message,
+      confirmText: resourceWarning ? 'Vẫn tiếp tục' : 'Triển khai',
       cancelText: 'Hủy',
+      danger,
     })
     if (!confirmed) return
 
@@ -469,17 +486,23 @@ export default function Dashboard({ username }: Props) {
     }
     const serviceLabel = service.displayName || service.code
     const expectedDigest = service.repoDigest
-    const confirmed = await SwalAlert.confirm({
-      title: 'Xác nhận chuyển tiếp',
-      message: [
+    const resourceWarning = resourceWarningMessage(target.code, target.hostMetrics)
+    const { message, danger } = withResourceWarning(
+      [
         `${escapeHtml(serviceLabel)} sẽ được chuyển tiếp từ ${escapeHtml(environment.code)} sang ${escapeHtml(target.code)}.`,
         `<div class="mt-3 space-y-1 text-left text-xs">`,
         `<div><span class="text-slate-500">Sẽ lấy digest ĐANG CHẠY ở ${escapeHtml(environment.code)} (không phải Latest Build):</span></div>`,
         `<div class="font-mono break-all">${escapeHtml(expectedDigest)}</div>`,
         `</div>`,
       ].join(''),
-      confirmText: 'Chuyển tiếp',
+      resourceWarning,
+    )
+    const confirmed = await SwalAlert.confirm({
+      title: 'Xác nhận chuyển tiếp',
+      message,
+      confirmText: resourceWarning ? 'Vẫn tiếp tục' : 'Chuyển tiếp',
       cancelText: 'Hủy',
+      danger,
     })
     if (!confirmed) return
 

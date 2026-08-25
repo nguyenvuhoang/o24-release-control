@@ -1,6 +1,7 @@
 {
   "environment": "UAT",
   "listenAddr": ":9100",
+  "hostname": "uat-app",
   "compose": {
     "projectDirectory": "/app",
     "files": [

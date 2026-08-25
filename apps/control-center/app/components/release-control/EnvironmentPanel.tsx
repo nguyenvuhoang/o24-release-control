@@ -2,6 +2,7 @@ import type { BuildServiceCode } from '../../../lib/github/serviceMap'
 import { githubServiceForAgentCode } from '../../../lib/github/serviceMap'
 import type { EnvironmentDashboard, ReleaseComparison, ServiceStatus } from '../../../lib/types'
 import { displayEnvironmentName } from './environmentDisplay'
+import { HostHealth } from './HostHealth'
 import { ServiceCard } from './ServiceCard'
 import { StatusBadge, environmentLabel, environmentTone } from './StatusBadge'
 import type { BuildTrackedState } from './useBuildTracker'
@@ -79,6 +80,12 @@ export function EnvironmentPanel({
         <div className="border-b border-slate-800 px-4 py-1.5 text-xs text-slate-500 sm:hidden">
           Agent {environment.agent.agentVersion} · Compose {environment.agent.composeVersion ?? '--'} ·{' '}
           {environment.services.length} dịch vụ
+        </div>
+      ) : null}
+
+      {environment.online ? (
+        <div className="border-b border-slate-800 px-4 py-2">
+          <HostHealth metrics={environment.hostMetrics} />
         </div>
       ) : null}
 
