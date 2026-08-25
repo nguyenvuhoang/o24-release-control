@@ -1,17 +1,19 @@
 import { fetchDockerHubTagDigest } from './dockerHub'
 import { getBuildIntent } from './buildPointerStore'
+import { getCommitMessage } from './github/client'
 import { imageRepositoryFor, type BuildServiceCode } from './github/serviceMap'
 import { getReleaseRepository, ReleaseConflictError, type CreateReleaseResult, type CreateReleaseInput } from './releaseRepository'
 import type { BuildIntent, BuildRunSnapshot, DockerHubTagInfo } from './types'
 
 type CreateSnapshotOptions = {
-  // The three lookups below default to the real DockerHub/BuildIntent/
+  // The four lookups below default to the real DockerHub/BuildIntent/GitHub/
   // ReleaseRepository calls — overridable purely so this function's
-  // branching is unit-testable without live Docker Hub/KV/file I/O, not
-  // because any real caller needs to swap them (same convention as
+  // branching is unit-testable without live Docker Hub/KV/GitHub/file I/O,
+  // not because any real caller needs to swap them (same convention as
   // latestReleaseResolver.ts's ResolveOptions).
   fetchDockerHubTagDigest?: (repository: string, tag: string) => Promise<DockerHubTagInfo | null>
   getBuildIntent?: (runId: number) => Promise<BuildIntent | undefined>
+  getCommitMessage?: (sha: string) => Promise<string | null>
   createRelease?: (input: CreateReleaseInput) => Promise<CreateReleaseResult>
 }
 
@@ -56,6 +58,7 @@ export async function createReleaseSnapshotForCompletedBuild(
 
   const lookupDockerHubDigest = options.fetchDockerHubTagDigest ?? fetchDockerHubTagDigest
   const lookupBuildIntent = options.getBuildIntent ?? getBuildIntent
+  const lookupCommitMessage = options.getCommitMessage ?? getCommitMessage
   const createRelease = options.createRelease ?? ((input) => getReleaseRepository().create(input))
 
   const dockerRepository = imageRepositoryFor(service)
@@ -85,6 +88,20 @@ export async function createReleaseSnapshotForCompletedBuild(
     return { outcome: 'digest_not_found' }
   }
 
+  // Best-effort, never blocks the snapshot: a run always has a commitSha by
+  // this point (validated by BuildRunSnapshot's source), but GitHub's commit
+  // endpoint can still 404/rate-limit/permission-fail independently of the
+  // run lookup that already succeeded.
+  const commitMessage = await lookupCommitMessage(run.commitSha).catch((error) => {
+    console.error('[releaseSnapshotFromBuild] commit message lookup failed', {
+      service,
+      runId: run.runId,
+      commitSha: run.commitSha,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    })
+    return null
+  })
+
   try {
     // Idempotency is inherited entirely from releaseRepository.create()'s
     // existing buildReleaseId(service, runId, runAttempt) + SET-NX (KV) /
@@ -97,6 +114,7 @@ export async function createReleaseSnapshotForCompletedBuild(
       source: 'github-actions',
       branch: run.branch,
       commitSha: run.commitSha,
+      commitMessage,
       githubRunId: run.runId,
       githubRunAttempt: run.runAttempt ?? 1,
       dockerRepository,

@@ -6,7 +6,7 @@ process.env.GITHUB_OWNER = 'test-owner'
 process.env.GITHUB_REPO = 'test-repo'
 process.env.GITHUB_WORKFLOW = 'build-o24.yml'
 
-const { GithubPermissionError, triggerWorkflowBuild } = await import('./client')
+const { GithubPermissionError, getCommitMessage, triggerWorkflowBuild } = await import('./client')
 
 function mockFetchOnce(status: number, body: unknown, headers: Record<string, string> = {}) {
   const originalFetch = globalThis.fetch
@@ -53,6 +53,38 @@ test('triggerWorkflowBuild resolves normally on the documented 200 dispatch resp
   try {
     const result = await triggerWorkflowBuild({ service: 'CMS', branch: 'developer', tag: 'latest' })
     assert.equal(result.runId, 12345)
+  } finally {
+    restore()
+  }
+})
+
+// ---- getCommitMessage ----
+
+test('getCommitMessage returns only the first line (subject) of the full commit message', async () => {
+  const restore = mockFetchOnce(200, { sha: 'a'.repeat(40), commit: { message: 'feat: implement SimpleSearchResidents feature\n\nLonger body text here.' } })
+  try {
+    const message = await getCommitMessage('a'.repeat(40))
+    assert.equal(message, 'feat: implement SimpleSearchResidents feature')
+  } finally {
+    restore()
+  }
+})
+
+test('getCommitMessage returns null when GitHub cannot find the commit (404) — never throws', async () => {
+  const restore = mockFetchOnce(404, { message: 'Not Found' })
+  try {
+    const message = await getCommitMessage('a'.repeat(40))
+    assert.equal(message, null)
+  } finally {
+    restore()
+  }
+})
+
+test('getCommitMessage returns null on a permission error too — commit message is always best-effort', async () => {
+  const restore = mockFetchOnce(403, { message: 'Resource not accessible by personal access token' })
+  try {
+    const message = await getCommitMessage('a'.repeat(40))
+    assert.equal(message, null)
   } finally {
     restore()
   }

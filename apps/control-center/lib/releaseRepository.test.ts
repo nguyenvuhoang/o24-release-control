@@ -9,10 +9,19 @@ import {
   FileReleaseRepository,
   InMemoryReleaseRepository,
   InvalidReleaseInputError,
+  isValidGitSha,
   planReleaseDeploy,
   ReleaseConflictError,
   type CreateReleaseInput,
 } from './releaseRepository'
+
+test('isValidGitSha accepts only a full 40-character hex Git SHA', () => {
+  assert.equal(isValidGitSha('a'.repeat(40)), true)
+  assert.equal(isValidGitSha('A'.repeat(40)), true)
+  assert.equal(isValidGitSha('a'.repeat(39)), false)
+  assert.equal(isValidGitSha('not-a-sha'), false)
+  assert.equal(isValidGitSha(''), false)
+})
 
 function makeInput(overrides: Partial<CreateReleaseInput> = {}): CreateReleaseInput {
   return {
@@ -193,6 +202,17 @@ test('a docker-registry release has no build to point to — branch/commitSha/ru
   assert.equal(record.githubRunId, null)
   assert.equal(record.githubRunAttempt, null)
   assert.equal(record.id, buildRegistryReleaseId('CMS', record.repoDigest))
+})
+
+test('a docker-registry release CAN carry commitSha/commitMessage when the OCI revision label resolved one — branch still stays null', async () => {
+  const repo = new InMemoryReleaseRepository()
+  const { record } = await repo.create(
+    makeRegistryInput({ commitSha: 'e'.repeat(40), commitMessage: 'feat: implement SimpleSearchResidents feature' }),
+  )
+  assert.equal(record.source, 'docker-registry')
+  assert.equal(record.branch, null)
+  assert.equal(record.commitSha, 'e'.repeat(40))
+  assert.equal(record.commitMessage, 'feat: implement SimpleSearchResidents feature')
 })
 
 test('re-syncing the same Docker Hub digest dedupes instead of creating a second release', async () => {

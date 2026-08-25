@@ -1,9 +1,10 @@
 import { NextResponse } from 'next/server'
 import { requireApiSession } from '../../../../lib/api'
 import { appendAudit } from '../../../../lib/audit'
-import { fetchDockerHubTagDigest } from '../../../../lib/dockerHub'
+import { fetchDockerHubTagDigest, fetchImageRevisionLabel } from '../../../../lib/dockerHub'
+import { getCommitMessage } from '../../../../lib/github/client'
 import { BUILD_SERVICES, imageRepositoryFor, isBuildServiceCode } from '../../../../lib/github/serviceMap'
-import { digestHexOf, getReleaseRepository, InvalidReleaseInputError, ReleaseConflictError } from '../../../../lib/releaseRepository'
+import { digestHexOf, getReleaseRepository, InvalidReleaseInputError, isValidGitSha, ReleaseConflictError } from '../../../../lib/releaseRepository'
 import type { RegistrySyncResponse } from '../../../../lib/types'
 
 function syncError(error: string, status: number, details?: string) {
@@ -39,9 +40,18 @@ export async function POST(request: Request) {
       return syncError('not_found', 404, `No "latest" tag found on Docker Hub for ${dockerRepository}`)
     }
 
+    // Best-effort: an image built without an org.opencontainers.image.revision
+    // label (or one this app can't reach on the registry) leaves commitSha
+    // null — never guessed from the "latest" branch or anything else.
+    const revisionLabel = await fetchImageRevisionLabel(dockerRepository, dockerHub.repoDigest).catch(() => null)
+    const commitSha = revisionLabel && isValidGitSha(revisionLabel) ? revisionLabel.toLowerCase() : null
+    const commitMessage = commitSha ? await getCommitMessage(commitSha).catch(() => null) : null
+
     const { record, deduped } = await getReleaseRepository().create({
       service,
       source: 'docker-registry',
+      commitSha,
+      commitMessage,
       dockerRepository,
       repoDigest: dockerHub.repoDigest,
       tag: dockerHub.tag,

@@ -75,6 +75,7 @@ test('a matched github-actions snapshot dispatched by release-control is classif
     source: 'github-actions',
     branch: 'developer',
     commitSha: 'c'.repeat(40),
+    commitMessage: 'feat: implement SimpleSearchResidents feature',
     githubRunId: 4242,
     githubRunAttempt: 1,
   })
@@ -90,6 +91,7 @@ test('a matched github-actions snapshot dispatched by release-control is classif
   assert.equal(result.source, 'release-control')
   assert.equal(result.branch, 'developer')
   assert.equal(result.commitSha, 'c'.repeat(40))
+  assert.equal(result.commitMessage, 'feat: implement SimpleSearchResidents feature')
   assert.equal(result.workflowRunId, 4242)
 })
 

@@ -89,15 +89,29 @@ test('toRunningRelease maps container status and attaches the matched snapshot',
   }
   const snapshot: ReleaseSnapshot = {
     id: 'release:CMS:digest:' + 'a'.repeat(64), service: 'CMS', source: 'docker-registry',
-    branch: null, commitSha: null, dockerRepository: REPO, repoDigest: `${REPO}@${DIGEST_A}`, tag: 'latest',
+    branch: null, commitSha: 'a'.repeat(40), commitMessage: 'feat: implement SimpleSearchResidents feature',
+    dockerRepository: REPO, repoDigest: `${REPO}@${DIGEST_A}`, tag: 'latest',
     githubRunId: null, githubRunAttempt: null, createdAt: '2026-08-22T09:00:00.000Z', createdBy: 'admin',
   }
   const result = toRunningRelease({ environment: 'DEV', service: 'CMS', environmentOnline: true, serviceStatus, matchedSnapshot: snapshot, checkedAt: 'now' })
   assert.equal(result.containerStatus, 'running')
   assert.equal(result.repoDigest, DIGEST_A)
   assert.equal(result.snapshotId, snapshot.id)
+  assert.equal(result.commitSha, snapshot.commitSha)
+  assert.equal(result.commitMessage, snapshot.commitMessage)
   // Never the local imageId, even though the ServiceStatus carries one.
   assert.notEqual(result.repoDigest, serviceStatus.imageId)
+})
+
+test('toRunningRelease leaves commitSha/commitMessage undefined when no snapshot matched the digest', () => {
+  const serviceStatus: ServiceStatus = {
+    code: 'o24-cms', displayName: 'CMS', composeService: 'cms', containerName: 'o24-cms',
+    status: 'running', health: 'healthy', imageRef: `${REPO}@${DIGEST_A}`, imageId: 'sha256:localimageid',
+    repoDigest: DIGEST_A,
+  }
+  const result = toRunningRelease({ environment: 'DEV', service: 'CMS', environmentOnline: true, serviceStatus, checkedAt: 'now' })
+  assert.equal(result.commitSha, undefined)
+  assert.equal(result.commitMessage, undefined)
 })
 
 test('toRunningRelease carries localImageId/imageReference separately from repoDigest and never cross-maps them', () => {

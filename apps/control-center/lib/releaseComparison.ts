@@ -86,6 +86,8 @@ export function toRunningRelease(input: {
     imageReference: serviceStatus.imageRef || undefined,
     configDrift,
     snapshotId: matchedSnapshot?.id,
+    commitSha: matchedSnapshot?.commitSha ?? undefined,
+    commitMessage: matchedSnapshot?.commitMessage ?? undefined,
     containerStatus: containerStatusOf(serviceStatus.status),
     checkedAt,
   }

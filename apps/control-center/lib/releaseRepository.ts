@@ -124,6 +124,11 @@ export function buildRegistryReleaseId(service: BuildServiceCode, repoDigest: st
 
 const GIT_SHA_PATTERN = /^[0-9a-f]{40}$/i
 
+/** Whether a value is a full 40-character hex Git SHA — the same rule prepareRelease enforces on commitSha. */
+export function isValidGitSha(value: string): boolean {
+  return GIT_SHA_PATTERN.test(value)
+}
+
 // Docker distribution reference component grammar (simplified): lowercase
 // alphanumerics separated by single dots/underscores/hyphens or a double
 // underscore, path segments separated by "/". Deliberately excludes bare

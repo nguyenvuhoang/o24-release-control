@@ -31,6 +31,10 @@ function stubNoBuildIntent(): (runId: number) => Promise<BuildIntent | undefined
   return async () => undefined
 }
 
+function stubNoCommitMessage(): (sha: string) => Promise<string | null> {
+  return async () => null
+}
+
 function makeHarness(digestHex: string) {
   const repo = new InMemoryReleaseRepository()
   return {
@@ -38,6 +42,7 @@ function makeHarness(digestHex: string) {
     options: {
       fetchDockerHubTagDigest: stubDockerHub(digestHex),
       getBuildIntent: stubNoBuildIntent(),
+      getCommitMessage: stubNoCommitMessage(),
       createRelease: (input: Parameters<InMemoryReleaseRepository['create']>[0]) => repo.create(input),
     },
   }
@@ -121,6 +126,22 @@ test('batch build gives each service its own snapshot for the same conceptual bu
   assert.equal(wfo.result.record.service, 'WFO')
 })
 
+test('a resolved commit message is stored on the created ReleaseSnapshot', async () => {
+  const { options } = makeHarness('a'.repeat(64))
+  const withCommitMessage = { ...options, getCommitMessage: async (sha: string) => (sha === 'a'.repeat(40) ? 'feat: implement SimpleSearchResidents feature' : null) }
+  const outcome = await createReleaseSnapshotForCompletedBuild(makeRun({ runId: 2010 }), 'CMS', 'tester', withCommitMessage)
+  assert.ok(outcome.outcome === 'created')
+  assert.equal(outcome.result.record.commitMessage, 'feat: implement SimpleSearchResidents feature')
+})
+
+test('a commit message lookup failure never blocks snapshot creation — commitMessage just stays null', async () => {
+  const { options } = makeHarness('a'.repeat(64))
+  const failingLookup = { ...options, getCommitMessage: async () => { throw new Error('GitHub API 500: boom') } }
+  const outcome = await createReleaseSnapshotForCompletedBuild(makeRun({ runId: 2011 }), 'CMS', 'tester', failingLookup)
+  assert.ok(outcome.outcome === 'created')
+  assert.equal(outcome.result.record.commitMessage, null)
+})
+
 test('no Docker Hub digest found (yet) returns digest_not_found — never throws, never creates', async () => {
   const repo = new InMemoryReleaseRepository()
   const options = {
@@ -142,6 +163,7 @@ test('uses the tag recorded in the BuildIntent for this runId, not a hardcoded d
     },
     getBuildIntent: async (runId: number): Promise<BuildIntent | undefined> =>
       runId === 2007 ? { runId: 2007, service: 'CMS', branch: 'developer', tag: 'v1.2.3', requestedBy: 'tester', requestedAt: new Date().toISOString() } : undefined,
+    getCommitMessage: stubNoCommitMessage(),
     createRelease: (input: Parameters<InMemoryReleaseRepository['create']>[0]) => repo.create(input),
   }
   await createReleaseSnapshotForCompletedBuild(makeRun({ runId: 2007 }), 'CMS', 'tester', options)
@@ -157,6 +179,7 @@ test('falls back to "latest" when no BuildIntent exists for this runId (build no
       return { repoDigest: `${repository}@sha256:${'f'.repeat(64)}`, tag }
     },
     getBuildIntent: stubNoBuildIntent(),
+    getCommitMessage: stubNoCommitMessage(),
     createRelease: (input: Parameters<InMemoryReleaseRepository['create']>[0]) => repo.create(input),
   }
   await createReleaseSnapshotForCompletedBuild(makeRun({ runId: 2008 }), 'CMS', 'tester', options)
@@ -176,6 +199,7 @@ test('retry helper resolves once the digest appears on a later attempt, using an
       return { repoDigest: `${repository}@sha256:${'1'.repeat(64)}`, tag }
     },
     getBuildIntent: stubNoBuildIntent(),
+    getCommitMessage: stubNoCommitMessage(),
     createRelease: (input: Parameters<InMemoryReleaseRepository['create']>[0]) => repo.create(input),
     sleep: async (ms: number) => {
       sleeps.push(ms)

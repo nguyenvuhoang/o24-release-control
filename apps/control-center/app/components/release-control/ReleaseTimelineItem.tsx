@@ -40,7 +40,11 @@ export function ReleaseTimelineItem({ release, runningEnvironments, onOpen }: Re
         </span>
       </div>
 
-      {release.commitMessage ? <p className="m-0 truncate text-slate-500">{release.commitMessage}</p> : null}
+      {release.commitMessage ? (
+        <p className="m-0 truncate text-slate-500" title={release.commitMessage}>
+          {release.commitMessage}
+        </p>
+      ) : null}
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-slate-500">
         <span className="truncate font-mono">{release.dockerRepository}</span>

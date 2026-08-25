@@ -254,6 +254,32 @@ export async function findLatestGithubRunForService(service: string): Promise<Bu
   return match ? normalizeRun(match) : null
 }
 
+type GithubCommitResponse = {
+  sha: string
+  commit: { message: string }
+}
+
+/**
+ * Resolves a commit's subject line (first line of its message) by sha —
+ * used to populate ReleaseSnapshot.commitMessage after commitSha is already
+ * known (a workflow run's head_sha, or a docker-registry image's
+ * org.opencontainers.image.revision label). Returns null on ANY failure
+ * (commit not found, rate-limited, permission error, network) — callers
+ * must treat that as "message unavailable", never retry-block a release
+ * snapshot on it, and never fall back to guessing a message.
+ */
+export async function getCommitMessage(sha: string): Promise<string | null> {
+  const { owner, repo } = githubConfig()
+  try {
+    const data = await githubRequest<GithubCommitResponse>(`/repos/${owner}/${repo}/commits/${sha}`)
+    const message = data?.commit?.message?.split('\n')[0]?.trim()
+    return message || null
+  } catch (error) {
+    console.error('[github] failed to resolve commit message', { sha, error: error instanceof Error ? error.message : 'Unknown error' })
+    return null
+  }
+}
+
 export async function getWorkflowRunJobs(runId: number): Promise<BuildJobsResponse> {
   const { owner, repo } = githubConfig()
   const data = await githubRequest<{ jobs: GithubJob[] }>(`/repos/${owner}/${repo}/actions/runs/${runId}/jobs`)

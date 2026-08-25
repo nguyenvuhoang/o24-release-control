@@ -71,6 +71,7 @@ export function classifyLatestRelease(input: ClassifyInput): ResolvedRelease {
       workflowRunId: matchedSnapshot.githubRunId ?? undefined,
       branch: matchedSnapshot.branch ?? undefined,
       commitSha: matchedSnapshot.commitSha ?? undefined,
+      commitMessage: matchedSnapshot.commitMessage ?? undefined,
       createdAt: matchedSnapshot.createdAt,
       discoveredAt,
     }

@@ -244,8 +244,10 @@ export type ReleaseSource = 'github-actions' | 'docker-registry'
 // are keyed deterministically by service+run+attempt (see buildReleaseId in
 // releaseRepository.ts); docker-registry releases are keyed by the digest
 // itself (see buildRegistryReleaseId) since they have no run to key off —
-// branch/commitSha/githubRunId/githubRunAttempt are unknowable for those and
-// stay null.
+// branch/githubRunId/githubRunAttempt are unknowable for those and stay
+// null. commitSha CAN still be known for a docker-registry release when the
+// image carries an org.opencontainers.image.revision label (see
+// lib/dockerHub.ts's fetchImageRevisionLabel) — never guessed otherwise.
 export type ReleaseSnapshot = {
   id: string
   service: BuildServiceCode
@@ -253,10 +255,13 @@ export type ReleaseSnapshot = {
   branch: string | null
   commitSha: string | null
   /**
-   * The commit's message, when a source can supply one. Nothing currently
-   * populates this (see ReleaseSource doc) — reserved so a future
-   * github-actions release-creation path can fill it in without a schema
-   * change. Always shown as "not available" until then.
+   * The commit's subject line (first line of the commit message), resolved
+   * from GitHub by commitSha — see lib/github/client.ts's getCommitMessage.
+   * For github-actions releases this is resolved right after the run's
+   * head_sha is known; for docker-registry releases it's only attempted when
+   * fetchImageRevisionLabel found a commitSha in the image's OCI labels.
+   * Null when commitSha is null, or when GitHub couldn't resolve it (commit
+   * not found, rate-limited, etc.) — never a guess.
    */
   commitMessage?: string | null
   dockerRepository: string
@@ -308,6 +313,10 @@ export type RunningRelease = {
    */
   configDrift?: boolean
   snapshotId?: string
+  /** From the matched ReleaseSnapshot (see toRunningRelease) — undefined when repoDigest doesn't resolve to a known snapshot. */
+  commitSha?: string
+  /** From the matched ReleaseSnapshot — undefined when commitSha itself is undefined, or GitHub couldn't resolve a message for it. */
+  commitMessage?: string
   containerStatus: 'running' | 'stopped' | 'missing' | 'unknown'
   checkedAt: string
   /** Set when the environment/agent could not be checked at all — distinct from "missing" (checked, service just isn't deployed there). */
@@ -399,6 +408,7 @@ export type ResolvedRelease = {
   workflowRunUrl?: string
   branch?: string
   commitSha?: string
+  commitMessage?: string
   createdAt?: string
   discoveredAt: string
 }

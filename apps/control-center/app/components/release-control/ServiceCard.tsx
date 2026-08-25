@@ -129,6 +129,20 @@ export function ServiceCard({
   const promoteIsPrimary = hasComparisonData && !canDeployLatest && uatDiffersFromDev && Boolean(nextEnvironment)
   const primaryBusy = canDeployLatest && deployingLatest
 
+  // The Release Snapshot matched to THIS card's own environment (not
+  // necessarily DEV) — comparison carries dev/uat/prod regardless of which
+  // card renders the comparison flow block above, so every card (DEV/UAT/
+  // PROD) can show its own commit info here even though only the DEV card
+  // shows the flow itself.
+  const runningRelease =
+    environment.code === 'DEV' ? comparison?.dev : environment.code === 'UAT' ? comparison?.uat : environment.code === 'PROD' ? comparison?.prod : undefined
+  // Falls back to the Deploy Agent's own live-reported revision when no
+  // Release Snapshot matched this digest yet (e.g. an untracked build) — the
+  // commit message has no such fallback, since only a matched snapshot can
+  // supply one.
+  const gitRevision = runningRelease?.commitSha ?? service.gitRevision
+  const commitMessage = runningRelease?.commitMessage
+
   return (
     <section className="flex w-full min-w-0 flex-col rounded-lg border border-slate-800 bg-slate-900/50 p-4 transition-colors duration-150 hover:border-slate-700">
       <div className="mb-2.5 flex items-start justify-between gap-3">
@@ -223,12 +237,22 @@ export function ServiceCard({
           </div>
           <div className="min-w-0">
             <dt className="mb-0.5 text-[10px] tracking-wide text-slate-600 uppercase">Git Revision</dt>
-            <dd className="m-0 truncate text-slate-400">{service.gitRevision ? service.gitRevision.slice(0, 12) : '--'}</dd>
+            <dd className="m-0 truncate text-slate-400" title={gitRevision || undefined}>
+              {gitRevision ? gitRevision.slice(0, 12) : '--'}
+            </dd>
           </div>
           <div className="min-w-0">
             <dt className="mb-0.5 text-[10px] tracking-wide text-slate-600 uppercase">Khởi động lúc</dt>
             <dd className="m-0 truncate text-slate-400">{formatDate(service.startedAt)}</dd>
           </div>
+          {commitMessage ? (
+            <div className="col-span-2 min-w-0">
+              <dt className="mb-0.5 text-[10px] tracking-wide text-slate-600 uppercase">Commit</dt>
+              <dd className="m-0 truncate text-slate-400" title={commitMessage}>
+                {commitMessage}
+              </dd>
+            </div>
+          ) : null}
           <div className="col-span-2 min-w-0">
             <dt className="mb-0.5 text-[10px] tracking-wide text-slate-600 uppercase">Image ID (local, debug)</dt>
             <dd className="m-0">
