@@ -1,7 +1,7 @@
 // Allow-list of services the build-o24.yml GitHub Actions workflow accepts as
 // its `service` input. Kept as the single source of truth for build-related
 // service validation — never duplicate this list elsewhere.
-export const BUILD_SERVICES = ['CMS', 'WFO', 'IPS', 'CTH', 'NCH', 'RPT', 'LOG'] as const
+export const BUILD_SERVICES = ['CMS', 'WFO', 'IPS', 'CTH', 'NCH', 'RPT', 'LOG', 'DWH'] as const
 
 export type BuildServiceCode = (typeof BUILD_SERVICES)[number]
 

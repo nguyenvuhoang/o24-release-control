@@ -39,6 +39,7 @@ on:
           - NCH
           - RPT
           - LOG
+          - DWH
 
       tag:
         description: "Docker image tag"
@@ -87,6 +88,10 @@ jobs:
             LOG)
               echo "dockerfile=O24OpenAPI/O24OpenAPI.Logger/O24OpenAPI.Logger.API/Dockerfile" >> "$GITHUB_OUTPUT"
               echo "image=vknighthub/ips_o24log" >> "$GITHUB_OUTPUT"
+              ;;
+            DWH)
+              echo "dockerfile=O24OpenAPI/O24OpenAPI.DWH/O24OpenAPI.DWH.API/Dockerfile" >> "$GITHUB_OUTPUT"
+              echo "image=vknighthub/ips_o24dwh" >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "Unknown service: \${{ inputs.service }}"
@@ -217,19 +222,21 @@ test('extractProjectReferences resolves relative paths against the csproj direct
 
 // ---- parseServiceDockerfileMap ----
 
-test('parseServiceDockerfileMap finds all 7 real build services with their Dockerfile + image', () => {
+test('parseServiceDockerfileMap finds all 8 real build services with their Dockerfile + image', () => {
   const map = parseServiceDockerfileMap(REAL_BUILD_WORKFLOW_YML)
   assert.equal(map.CMS?.dockerfile, 'O24OpenAPI/O24OpenAPI.CMS/O24OpenAPI.CMS.API/Dockerfile')
   assert.equal(map.CMS?.image, 'vknighthub/ips_o24cms')
   assert.equal(map.LOG?.dockerfile, 'O24OpenAPI/O24OpenAPI.Logger/O24OpenAPI.Logger.API/Dockerfile')
-  for (const service of ['CMS', 'WFO', 'IPS', 'CTH', 'NCH', 'RPT', 'LOG'] as const) {
+  assert.equal(map.DWH?.dockerfile, 'O24OpenAPI/O24OpenAPI.DWH/O24OpenAPI.DWH.API/Dockerfile')
+  assert.equal(map.DWH?.image, 'vknighthub/ips_o24dwh')
+  for (const service of ['CMS', 'WFO', 'IPS', 'CTH', 'NCH', 'RPT', 'LOG', 'DWH'] as const) {
     assert.ok(map[service], `expected ${service} in the parsed map`)
   }
 })
 
 test('parseServiceDockerfileMap ignores the "*)" default case and non-service tokens', () => {
   const map = parseServiceDockerfileMap(REAL_BUILD_WORKFLOW_YML)
-  assert.equal(Object.keys(map).length, 7)
+  assert.equal(Object.keys(map).length, 8)
 })
 
 // ---- parseDockerfileRootCsproj ----

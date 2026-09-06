@@ -28,6 +28,15 @@
       "imageRepository": "vknighthub/ips_o24cms",
       "imageEnvKey": "O24_CMS_IMAGE",
       "healthTimeoutSeconds": 90
+    },
+    {
+      "code": "o24-dwh",
+      "displayName": "O24 Data Warehouse",
+      "composeService": "o24-dwh",
+      "containerName": "o24-dwh",
+      "imageRepository": "vknighthub/ips_o24dwh",
+      "imageEnvKey": "O24_DWH_IMAGE",
+      "healthTimeoutSeconds": 90
     }
   ]
 }

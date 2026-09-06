@@ -3,9 +3,10 @@ import { kvCommand, resolveKvConfig } from '../kv'
 import { GITHUB_API_BASE, GithubPermissionError, githubConfig } from './client'
 import { BUILD_SERVICES, isBuildServiceCode, type BuildServiceCode } from './serviceMap'
 
-// Live-derives the w4s monorepo's dependency graph for the 7 buildable
-// services — deliberately NOT a hardcoded map in this repo's source. Every
-// fact here is read straight from w4s at the ref being compared:
+// Live-derives the w4s monorepo's dependency graph for the buildable
+// services (BUILD_SERVICES) — deliberately NOT a hardcoded map in this
+// repo's source. Every fact here is read straight from w4s at the ref being
+// compared:
 //   - .github/workflows/build-o24.yml tells us which service maps to which
 //     Dockerfile (the same file build-o24.yml itself uses to build).
 //   - Each service's Dockerfile tells us its root .csproj (via the
@@ -14,12 +15,11 @@ import { BUILD_SERVICES, isBuildServiceCode, type BuildServiceCode } from './ser
 //     copies before `COPY . .` — i.e. actually feed the Docker image.
 //   - O24OpenAPI.sln gives the full, authoritative list of known projects in
 //     the solution, so a change in a module that exists but isn't referenced
-//     by any of the 7 services (ACT, AI, BUZ, DWH, Design, EXT, PMT, Sample,
-//     W4S) can be confidently classified as "no impact" instead of
-//     "unknown".
+//     by any buildable service (ACT, AI, BUZ, Design, EXT, PMT, Sample, W4S)
+//     can be confidently classified as "no impact" instead of "unknown".
 //   - Each project's own ProjectReference graph (recursively) tells us the
 //     real shared-dependency closure — this is what makes APIContracts/
-//     GrpcContracts affect all 7 services, and OData affect only WFO,
+//     GrpcContracts affect every service, and OData affect only WFO,
 //     without guessing at either.
 // If w4s's structure changes (new service, renamed project, refactored
 // Dockerfile), this keeps working without a code change here — only a
@@ -54,7 +54,7 @@ export type DependencyGraph = {
   services: Partial<Record<BuildServiceCode, ServiceDependencyInfo>>
   /** BUILD_SERVICES entries the workflow file didn't define — should be empty; surfaced so callers can warn instead of silently ignoring. */
   missingServices: BuildServiceCode[]
-  /** Project directories known to exist in the solution (via O24OpenAPI.sln) but not referenced by any of the 7 services' closures. */
+  /** Project directories known to exist in the solution (via O24OpenAPI.sln) but not referenced by any buildable service's closure. */
   knownUnrelatedDirs: string[]
   /**
    * The top-level folder shared by every project in O24OpenAPI.sln
