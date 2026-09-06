@@ -58,7 +58,7 @@ export function EnvironmentPanel({
 }: EnvironmentPanelProps) {
   return (
     <article
-      className={`w-full overflow-hidden rounded-lg border bg-slate-900/40 ${
+      className={`w-full rounded-lg border bg-slate-900/40 ${
         environment.online ? 'border-slate-800' : 'border-rose-500/25'
       }`}
     >
