@@ -2,6 +2,10 @@
 
 import { usePathname, useRouter, useSearchParams } from 'next/navigation'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import type { BuildServiceCode } from '../../lib/github/serviceMap'
+import { githubServiceForAgentCode } from '../../lib/github/serviceMap'
+import { readJsonSafe } from '../../lib/http'
+import { escapeHtml, SwalAlert } from '../../lib/swalAlert'
 import type {
   AuditRecord,
   BackfillMetadataResponse,
@@ -18,12 +22,8 @@ import type {
   ReleaseSnapshot,
   ServiceStatus,
 } from '../../lib/types'
-import { githubServiceForAgentCode } from '../../lib/github/serviceMap'
-import type { BuildServiceCode } from '../../lib/github/serviceMap'
-import { readJsonSafe } from '../../lib/http'
-import { escapeHtml, SwalAlert } from '../../lib/swalAlert'
-import type { AuditFilter } from './release-control/AuditLogPanel'
 import { AffectedServicesPanel } from './release-control/AffectedServicesPanel'
+import type { AuditFilter } from './release-control/AuditLogPanel'
 import { AuditLogPanel } from './release-control/AuditLogPanel'
 import { BuildDetailDrawer } from './release-control/BuildDetailDrawer'
 import { BuildDialog } from './release-control/BuildDialog'
@@ -33,13 +33,13 @@ import { EnvironmentTabs } from './release-control/EnvironmentTabs'
 import { resourceWarningMessage } from './release-control/HostHealth'
 import { LatestReleasePanel } from './release-control/LatestReleasePanel'
 import { LogsModal } from './release-control/LogsModal'
-import { OperationLogDrawer } from './release-control/OperationLogDrawer'
 import type { ActiveOperation } from './release-control/OperationLogDrawer'
+import { OperationLogDrawer } from './release-control/OperationLogDrawer'
 import { ReleaseTimelinePanel } from './release-control/ReleaseTimelinePanel'
 import { SummaryCards } from './release-control/SummaryCards'
-import { useReleaseComparison } from './release-control/useReleaseComparison'
 import type { BuildTrackedStatus } from './release-control/useBuildTracker'
 import { useBuildTracker } from './release-control/useBuildTracker'
+import { useReleaseComparison } from './release-control/useReleaseComparison'
 
 type Props = { username: string }
 
@@ -761,7 +761,7 @@ export default function Dashboard({ username }: Props) {
       }
       SwalAlert.toast(
         `Đã quét ${result.scanned} release: cập nhật ${result.updated}, chưa resolve được ${result.unresolved}` +
-          (result.scanned === 0 ? ' (không còn release nào thiếu commit)' : ''),
+        (result.scanned === 0 ? ' (không còn release nào thiếu commit)' : ''),
       )
       const fresh = await refresh(true)
       void refreshComparisons(fresh)
@@ -948,9 +948,8 @@ export default function Dashboard({ username }: Props) {
               type="button"
               onClick={() => setComparisonView('cards')}
               title="Xem so sánh Latest Build/DEV/UAT/PROD trực tiếp trên từng thẻ dịch vụ"
-              className={`rounded px-2.5 py-1.5 font-medium transition-colors duration-150 ${
-                comparisonView === 'cards' ? 'bg-slate-800 text-slate-100' : 'text-slate-400 hover:text-slate-200'
-              }`}
+              className={`rounded px-2.5 py-1.5 font-medium transition-colors duration-150 ${comparisonView === 'cards' ? 'bg-slate-800 text-slate-100' : 'text-slate-400 hover:text-slate-200'
+                }`}
             >
               Dạng thẻ
             </button>
@@ -958,9 +957,8 @@ export default function Dashboard({ username }: Props) {
               type="button"
               onClick={() => setComparisonView('table')}
               title="Xem so sánh Latest Build/DEV/UAT/PROD dạng bảng gọn cho cả 7 dịch vụ"
-              className={`rounded px-2.5 py-1.5 font-medium transition-colors duration-150 ${
-                comparisonView === 'table' ? 'bg-slate-800 text-slate-100' : 'text-slate-400 hover:text-slate-200'
-              }`}
+              className={`rounded px-2.5 py-1.5 font-medium transition-colors duration-150 ${comparisonView === 'table' ? 'bg-slate-800 text-slate-100' : 'text-slate-400 hover:text-slate-200'
+                }`}
             >
               Dạng bảng
             </button>
