@@ -26,7 +26,7 @@
       "apiKey": "${PROD_AGENT_KEY}",
       "apiSecret": "${PROD_AGENT_SECRET}",
       "order": 3,
-      "enabled": false
+      "enabled": true
     }
   ]
 }
