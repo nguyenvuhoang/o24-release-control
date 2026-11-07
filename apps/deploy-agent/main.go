@@ -29,6 +29,13 @@ type Config struct {
 	ListenAddr  string          `json:"listenAddr"`
 	Compose     ComposeConfig   `json:"compose"`
 	Services    []ServiceConfig `json:"services"`
+	// ImageCleanupEnabled prunes unused images after a deployment has passed
+	// both its health check and digest verification. Cleanup is best-effort:
+	// it never changes an otherwise successful deployment into a failure.
+	ImageCleanupEnabled bool `json:"imageCleanupEnabled"`
+	// ImageCleanupMinAgeHours protects recently downloaded images from cleanup.
+	// Values <= 0 use the conservative default of 24 hours.
+	ImageCleanupMinAgeHours int `json:"imageCleanupMinAgeHours"`
 	// Hostname overrides GET /api/host/metrics' "hostname" field. Optional:
 	// the container's own hostname (os.Hostname()) is the container ID, not
 	// anything host-identifying, so this defaults to Environment when unset
@@ -339,7 +346,7 @@ var rollbackStepLabels = deployLabels{
 var digestPattern = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 var requestIDPattern = regexp.MustCompile(`^[a-zA-Z0-9._:-]{1,120}$`)
 
-const version = "1.4.0"
+const version = "1.5.1"
 
 func main() {
 	configPath := getenv("AGENT_CONFIG_PATH", "/config/agent-config.json")
@@ -887,10 +894,46 @@ func (a *App) runDeploy(parent context.Context, op *Operation, svc ServiceConfig
 		op.log(fmt.Sprintf("digest_verified wanted=sha256:%s actual=%s", wanted, final.RepoDigest))
 	}
 
+	cleanupUnusedImages(parent, op, &output, a.cfg, runStreamedCommand)
+
 	record.Status = "succeeded"
 	a.finishDeployment(record, output.String())
 	op.log(labels.completed)
 	op.complete("success", "")
+}
+
+type streamedCommandRunner func(context.Context, *Operation, string, ...string) (string, error)
+
+// cleanupUnusedImages removes images that are not referenced by any
+// container and are older than the configured safety window. It deliberately
+// uses `docker image prune` rather than `docker system prune`: containers,
+// networks, build cache, and volumes are outside this cleanup's scope.
+//
+// The caller still holds App.mu, so cleanup cannot race another mutating
+// deploy/restart/rollback operation. Failure is logged but intentionally does
+// not fail the deployment that has already passed its verification gates.
+func cleanupUnusedImages(parent context.Context, op *Operation, output *strings.Builder, cfg Config, run streamedCommandRunner) {
+	if !cfg.ImageCleanupEnabled {
+		return
+	}
+
+	hours := cfg.ImageCleanupMinAgeHours
+	if hours <= 0 {
+		hours = 24
+	}
+	args := []string{"image", "prune", "-a", "-f", "--filter", fmt.Sprintf("until=%dh", hours)}
+
+	cleanupCtx, cancel := context.WithTimeout(parent, 2*time.Minute)
+	defer cancel()
+
+	op.log(fmt.Sprintf("Cleaning unused Docker images older than %d hours", hours))
+	cleanupOutput, err := run(cleanupCtx, op, "docker", args...)
+	output.WriteString("$ docker " + strings.Join(args, " ") + "\n" + cleanupOutput + "\n")
+	if err != nil {
+		op.log(fmt.Sprintf("Warning: Docker image cleanup failed: %v", err))
+		return
+	}
+	op.log("Docker image cleanup completed")
 }
 
 // requestedDigestOf extracts the bare "sha256:<hex>" digest from an image

@@ -176,6 +176,8 @@ Sửa `agent-config.json`:
 {
   "environment": "UAT",
   "listenAddr": ":9100",
+  "imageCleanupEnabled": true,
+  "imageCleanupMinAgeHours": 24,
   "compose": {
     "projectDirectory": "/app",
     "files": ["/app/docker-compose.yml"],
@@ -195,6 +197,13 @@ Sửa `agent-config.json`:
   ]
 }
 ```
+
+Khi `imageCleanupEnabled` bật, agent chỉ chạy dọn image sau khi container mới
+đã healthy và digest thực tế khớp digest yêu cầu. Lệnh tương đương là
+`docker image prune -a -f --filter until=24h`; image còn được container tham
+chiếu sẽ không bị xóa, và lỗi cleanup chỉ được ghi cảnh báo chứ không làm
+deployment thất bại. Có thể tăng `imageCleanupMinAgeHours` nếu muốn giữ image
+cũ lâu hơn để rollback nhanh.
 
 Tạo key và secret:
 

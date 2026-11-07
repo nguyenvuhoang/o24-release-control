@@ -2,6 +2,8 @@
   "environment": "UAT",
   "listenAddr": ":9100",
   "hostname": "uat-app",
+  "imageCleanupEnabled": true,
+  "imageCleanupMinAgeHours": 24,
   "compose": {
     "projectDirectory": "/app",
     "files": [

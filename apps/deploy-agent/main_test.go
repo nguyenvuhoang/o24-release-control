@@ -30,6 +30,87 @@ func TestUpdateEnvAtomic(t *testing.T) {
 	}
 }
 
+func TestCleanupUnusedImages(t *testing.T) {
+	t.Run("disabled does not invoke docker", func(t *testing.T) {
+		called := false
+		runner := func(context.Context, *Operation, string, ...string) (string, error) {
+			called = true
+			return "", nil
+		}
+
+		op := newOperation("op-cleanup-disabled", "DEV", "o24-cms", "deploy", "")
+		var output strings.Builder
+		cleanupUnusedImages(context.Background(), op, &output, Config{}, runner)
+
+		if called {
+			t.Fatal("docker runner must not be called when image cleanup is disabled")
+		}
+	})
+
+	tests := []struct {
+		name  string
+		hours int
+		want  string
+	}{
+		{name: "defaults to 24 hours", hours: 0, want: "until=24h"},
+		{name: "uses configured minimum age", hours: 72, want: "until=72h"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotName string
+			var gotArgs []string
+			runner := func(_ context.Context, _ *Operation, name string, args ...string) (string, error) {
+				gotName = name
+				gotArgs = append([]string(nil), args...)
+				return "Deleted Images:\nsha256:old", nil
+			}
+
+			op := newOperation("op-cleanup", "DEV", "o24-cms", "deploy", "")
+			var output strings.Builder
+			cleanupUnusedImages(context.Background(), op, &output, Config{
+				ImageCleanupEnabled:     true,
+				ImageCleanupMinAgeHours: tt.hours,
+			}, runner)
+
+			if gotName != "docker" {
+				t.Fatalf("expected docker command, got %q", gotName)
+			}
+			wantArgs := []string{"image", "prune", "-a", "-f", "--filter", tt.want}
+			if strings.Join(gotArgs, " ") != strings.Join(wantArgs, " ") {
+				t.Fatalf("expected args %q, got %q", wantArgs, gotArgs)
+			}
+			if !strings.Contains(output.String(), "Deleted Images:") {
+				t.Fatalf("cleanup output was not appended: %q", output.String())
+			}
+		})
+	}
+
+	t.Run("failure is logged and remains best effort", func(t *testing.T) {
+		runner := func(context.Context, *Operation, string, ...string) (string, error) {
+			return "daemon unavailable", errors.New("exit status 1")
+		}
+		op := newOperation("op-cleanup-failed", "DEV", "o24-cms", "deploy", "")
+		var output strings.Builder
+
+		cleanupUnusedImages(context.Background(), op, &output, Config{ImageCleanupEnabled: true}, runner)
+
+		snapshot, _ := op.snapshot()
+		if snapshot.Status != "running" {
+			t.Fatalf("cleanup failure must not fail the deployment operation, got %q", snapshot.Status)
+		}
+		foundWarning := false
+		for _, line := range snapshot.Logs {
+			if strings.Contains(line.Message, "Warning: Docker image cleanup failed") {
+				foundWarning = true
+				break
+			}
+		}
+		if !foundWarning {
+			t.Fatalf("expected cleanup warning in operation logs: %#v", snapshot.Logs)
+		}
+	})
+}
+
 func TestRequestedImage(t *testing.T) {
 	svc := ServiceConfig{ImageRepository: "vknighthub/ips_o24wfo"}
 	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
