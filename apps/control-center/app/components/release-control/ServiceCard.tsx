@@ -301,7 +301,12 @@ export function ServiceCard({
           >
             ⋯
           </summary>
-          <div className="absolute right-0 z-10 mt-1.5 w-56 rounded-lg border border-slate-800 bg-slate-900 p-1.5 shadow-2xl shadow-black/50">
+          {/* Opens UPWARD (bottom-full + mb-1.5): the ⋯ trigger always sits
+              in the card footer, so opening downward would push the menu past
+              the card edge and it used to be clipped by EnvironmentPanel's
+              container. z-50 keeps it above adjacent/row cards and the
+              "Lịch sử thao tác" panel below. */}
+          <div className="absolute right-0 bottom-full z-50 mb-1.5 w-56 rounded-lg border border-slate-800 bg-slate-900 p-1.5 shadow-2xl shadow-black/50">
             {canBuild ? (
               <button
                 type="button"

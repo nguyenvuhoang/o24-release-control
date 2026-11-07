@@ -86,7 +86,7 @@ function classifyOneFile(
 
   // Known w4s module (verified via O24OpenAPI.sln) that no tracked service references.
   if (graph.knownUnrelatedDirs.some((dir) => isUnderDir(filePath, dir))) {
-    return { rule: 'known-unrelated', services: [], reason: `${filePath} thuộc module w4s không được service nào trong 7 service tham chiếu` }
+    return { rule: 'known-unrelated', services: [], reason: `${filePath} thuộc module w4s không được service nào trong danh sách build tham chiếu` }
   }
 
   return { rule: 'unknown', services: [], reason: `Không xác định được phạm vi ảnh hưởng của ${filePath}` }

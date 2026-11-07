@@ -9,11 +9,13 @@ import { resolveAffectedServices, type ResolverCompareInput } from './resolver'
 
 const SHARED_PROPS = ['O24OpenAPI/Directory.Packages.props', 'O24OpenAPI/Directory.Build.props']
 
+const MODULE_FOLDER: Partial<Record<ServiceDependencyInfo['service'], string>> = { LOG: 'Logger' }
+
 function simpleService(code: ServiceDependencyInfo['service']): ServiceDependencyInfo {
-  const ownDir = `O24OpenAPI/O24OpenAPI.${code === 'LOG' ? 'Logger' : code}`
+  const ownDir = `O24OpenAPI/O24OpenAPI.${MODULE_FOLDER[code] ?? code}`
   return {
     service: code,
-    dockerfile: `O24OpenAPI/O24OpenAPI.${code === 'LOG' ? 'Logger' : code}/X.API/Dockerfile`,
+    dockerfile: `O24OpenAPI/O24OpenAPI.${MODULE_FOLDER[code] ?? code}/X.API/Dockerfile`,
     image: `vknighthub/ips_o24${code.toLowerCase()}`,
     rootCsproj: `${ownDir}/X.API/X.API.csproj`,
     ownDir,
@@ -39,15 +41,16 @@ function fixtureGraph(): DependencyGraph {
       NCH: simpleService('NCH'),
       RPT: simpleService('RPT'),
       LOG: simpleService('LOG'),
+      DWH: simpleService('DWH'),
     },
     missingServices: [],
-    // Real, verified: modules that exist in O24OpenAPI.sln but are referenced by none of the 7 buildable services.
-    knownUnrelatedDirs: ['O24OpenAPI/O24OpenAPI.ACT', 'O24OpenAPI/O24OpenAPI.AI', 'O24OpenAPI/O24OpenAPI.BUZ', 'O24OpenAPI/O24OpenAPI.DWH', 'O24OpenAPI/O24OpenAPI.Design', 'O24OpenAPI/O24OpenAPI.EXT', 'O24OpenAPI/O24OpenAPI.PMT', 'O24OpenAPI/O24OpenAPI.Sample', 'O24OpenAPI/O24OpenAPI.W4S'],
+    // Real, verified: modules that exist in O24OpenAPI.sln but are referenced by none of the buildable services.
+    knownUnrelatedDirs: ['O24OpenAPI/O24OpenAPI.ACT', 'O24OpenAPI/O24OpenAPI.AI', 'O24OpenAPI/O24OpenAPI.BUZ', 'O24OpenAPI/O24OpenAPI.Design', 'O24OpenAPI/O24OpenAPI.EXT', 'O24OpenAPI/O24OpenAPI.PMT', 'O24OpenAPI/O24OpenAPI.Sample', 'O24OpenAPI/O24OpenAPI.W4S'],
     solutionRoot: 'O24OpenAPI',
   }
 }
 
-const ALL_SERVICES = ['CMS', 'WFO', 'IPS', 'CTH', 'NCH', 'RPT', 'LOG']
+const ALL_SERVICES = ['CMS', 'WFO', 'IPS', 'CTH', 'NCH', 'RPT', 'LOG', 'DWH']
 
 function compareWith(files: ResolverCompareInput['files']): ResolverCompareInput {
   return { base: 'developer~1', head: 'developer', baseSha: 'base-sha', headSha: 'head-sha', status: 'ahead', files, truncated: false }
@@ -82,7 +85,7 @@ test('changes under two different services\' own dirs -> both affected, nothing 
 })
 
 // 4. Đổi APIContracts -> tất cả
-test('APIContracts change affects all 7 services', () => {
+test('APIContracts change affects all buildable services', () => {
   const result = resolveAffectedServices(compareWith([{ filename: 'O24OpenAPI/O24OpenAPI.APIContracts/Dto/Foo.cs', status: 'modified' }]), fixtureGraph())
   assert.deepEqual(result.affectedServices.sort(), [...ALL_SERVICES].sort())
   assert.equal(result.fellBackToAll, false) // this is a REAL shared-dependency match, not a safety fallback
@@ -90,21 +93,21 @@ test('APIContracts change affects all 7 services', () => {
 })
 
 // 5. Đổi GrpcContracts (bao gồm Protos) -> tất cả
-test('GrpcContracts change (including a nested Protos file) affects all 7 services', () => {
+test('GrpcContracts change (including a nested Protos file) affects all buildable services', () => {
   const result = resolveAffectedServices(compareWith([{ filename: 'O24OpenAPI/O24OpenAPI.GrpcContracts/Protos/BUZ/buz.proto', status: 'modified' }]), fixtureGraph())
   assert.deepEqual(result.affectedServices.sort(), [...ALL_SERVICES].sort())
   assert.equal(result.fellBackToAll, false)
 })
 
 // 6. Đổi Directory.Packages.props -> tất cả
-test('Directory.Packages.props (O24OpenAPI/ level, copied by every service) affects all 7 services', () => {
+test('Directory.Packages.props (O24OpenAPI/ level, copied by every service) affects all buildable services', () => {
   const result = resolveAffectedServices(compareWith([{ filename: 'O24OpenAPI/Directory.Packages.props', status: 'modified' }]), fixtureGraph())
   assert.deepEqual(result.affectedServices.sort(), [...ALL_SERVICES].sort())
   assert.equal(result.fellBackToAll, false)
 })
 
 // 7. Đổi Directory.Build.props: cấp O24OpenAPI/ -> tất cả; cấp root -> không ảnh hưởng
-test('Directory.Build.props at O24OpenAPI/ level affects all 7 services', () => {
+test('Directory.Build.props at O24OpenAPI/ level affects all buildable services', () => {
   const result = resolveAffectedServices(compareWith([{ filename: 'O24OpenAPI/Directory.Build.props', status: 'modified' }]), fixtureGraph())
   assert.deepEqual(result.affectedServices.sort(), [...ALL_SERVICES].sort())
   assert.equal(result.fellBackToAll, false)
