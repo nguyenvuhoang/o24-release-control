@@ -1,4 +1,5 @@
 import Image from 'next/image'
+import { ACTIVE_PROJECT_PROFILE } from '../../../lib/projectProfile'
 
 type DashboardHeaderProps = {
   applicationName?: string
@@ -33,7 +34,7 @@ export function DashboardHeader({
         <div>
           <p className="mb-1 text-xs font-semibold tracking-[0.1em] text-slate-500">QUẢN LÝ TRIỂN KHAI</p>
           <h1 className="text-2xl font-semibold tracking-tight text-slate-100 lg:text-3xl">
-            {applicationName ?? 'Quản lý triển khai IPS'}
+            {applicationName ?? ACTIVE_PROJECT_PROFILE.applicationName}
           </h1>
           <p className="mt-1 text-sm text-slate-500">
             Theo dõi và chuyển phiên bản triển khai qua DEV → UAT → PROD.

@@ -1,0 +1,40 @@
+services:
+  o24-wfo:
+    image: ${O24_WFO_IMAGE}
+    container_name: o24-wfo
+    restart: unless-stopped
+
+  o24-log:
+    image: ${O24_LOG_IMAGE}
+    container_name: o24-log
+    restart: unless-stopped
+
+  o24-cms:
+    image: ${O24_CMS_IMAGE}
+    container_name: o24-cms
+    restart: unless-stopped
+
+  o24-cth:
+    image: ${O24_CTH_IMAGE}
+    container_name: o24-cth
+    restart: unless-stopped
+
+  o24-w4s:
+    image: ${O24_W4S_IMAGE}
+    container_name: o24-w4s
+    restart: unless-stopped
+
+  o24-nch:
+    image: ${O24_NCH_IMAGE}
+    container_name: o24-nch
+    restart: unless-stopped
+
+  o24-pmt:
+    image: ${O24_PMT_IMAGE}
+    container_name: o24-pmt
+    restart: unless-stopped
+
+  o24-ai:
+    image: ${O24_AI_IMAGE}
+    container_name: o24-ai
+    restart: unless-stopped

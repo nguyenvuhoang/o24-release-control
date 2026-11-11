@@ -1,10 +1,10 @@
 {
-  "applicationName": "IPS Release Control",
+  "applicationName": "O24 Release Control",
   "environments": [
     {
       "code": "DEV",
       "name": "Development",
-      "baseUrl": "https://deploy-dev.vknight.io.vn",
+      "baseUrl": "${DEV_AGENT_URL}",
       "apiKey": "${DEV_AGENT_KEY}",
       "apiSecret": "${DEV_AGENT_SECRET}",
       "cfAccessClientId": "${DEV_CF_ACCESS_CLIENT_ID}",
@@ -15,7 +15,7 @@
     {
       "code": "UAT",
       "name": "User Acceptance Test",
-      "baseUrl": "https://deploy-uat.vknight.io.vn",
+      "baseUrl": "${UAT_AGENT_URL}",
       "apiKey": "${UAT_AGENT_KEY}",
       "apiSecret": "${UAT_AGENT_SECRET}",
       "cfAccessClientId": "${UAT_CF_ACCESS_CLIENT_ID}",
@@ -26,7 +26,7 @@
     {
       "code": "PROD",
       "name": "Production",
-      "baseUrl": "https://deploy-prod.vknight.io.vn",
+      "baseUrl": "${PROD_AGENT_URL}",
       "apiKey": "${PROD_AGENT_KEY}",
       "apiSecret": "${PROD_AGENT_SECRET}",
       "cfAccessClientId": "${PROD_CF_ACCESS_CLIENT_ID}",

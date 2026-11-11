@@ -1,0 +1,7 @@
+tunnel: REPLACE_WITH_W4S_TUNNEL_ID
+credentials-file: /etc/cloudflared/REPLACE_WITH_W4S_TUNNEL_ID.json
+
+ingress:
+  - hostname: REPLACE_WITH_W4S_AGENT_HOSTNAME
+    service: http://127.0.0.1:9100
+  - service: http_status:404

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { DependencyGraph, ServiceDependencyInfo } from '../github/w4sGraph'
+import { BUILD_SERVICES, imageRepositoryFor } from '../github/serviceMap'
 import { resolveAffectedServices, type ResolverCompareInput } from './resolver'
 
 // ---- Fixture graph — mirrors the REAL closures verified against
@@ -16,7 +17,7 @@ function simpleService(code: ServiceDependencyInfo['service']): ServiceDependenc
   return {
     service: code,
     dockerfile: `O24OpenAPI/O24OpenAPI.${MODULE_FOLDER[code] ?? code}/X.API/Dockerfile`,
-    image: `vknighthub/ips_o24${code.toLowerCase()}`,
+    image: imageRepositoryFor(code),
     rootCsproj: `${ownDir}/X.API/X.API.csproj`,
     ownDir,
     projects: [`${ownDir}/X.API/X.API.csproj`, `${ownDir}/X.Domain/X.Domain.csproj`, `${ownDir}/X.Infrastructure/X.Infrastructure.csproj`, 'O24OpenAPI/O24OpenAPI.APIContracts/O24OpenAPI.APIContracts.csproj', 'O24OpenAPI/O24OpenAPI.GrpcContracts/O24OpenAPI.GrpcContracts.csproj'],
@@ -31,26 +32,21 @@ function fixtureGraph(): DependencyGraph {
     ...simpleService('WFO'),
     dirs: [wfoOwnDir, 'O24OpenAPI/O24OpenAPI.APIContracts', 'O24OpenAPI/O24OpenAPI.GrpcContracts', 'O24OpenAPI/O24OpenAPI.OData/src/O24OpenAPI.OData'],
   }
+  const services = Object.fromEntries(BUILD_SERVICES.map((service) => [service, service === 'WFO' ? wfo : simpleService(service)]))
+  const knownModules = ['ACT', 'AI', 'BUZ', 'Design', 'EXT', 'PMT', 'Sample', 'W4S']
+    .filter((module) => !BUILD_SERVICES.includes(module.toUpperCase() as ServiceDependencyInfo['service']))
+    .map((module) => `O24OpenAPI/O24OpenAPI.${module}`)
   return {
     ref: 'developer',
-    services: {
-      CMS: simpleService('CMS'),
-      WFO: wfo,
-      IPS: simpleService('IPS'),
-      CTH: simpleService('CTH'),
-      NCH: simpleService('NCH'),
-      RPT: simpleService('RPT'),
-      LOG: simpleService('LOG'),
-      DWH: simpleService('DWH'),
-    },
+    services,
     missingServices: [],
-    // Real, verified: modules that exist in O24OpenAPI.sln but are referenced by none of the buildable services.
-    knownUnrelatedDirs: ['O24OpenAPI/O24OpenAPI.ACT', 'O24OpenAPI/O24OpenAPI.AI', 'O24OpenAPI/O24OpenAPI.BUZ', 'O24OpenAPI/O24OpenAPI.Design', 'O24OpenAPI/O24OpenAPI.EXT', 'O24OpenAPI/O24OpenAPI.PMT', 'O24OpenAPI/O24OpenAPI.Sample', 'O24OpenAPI/O24OpenAPI.W4S'],
+    knownUnrelatedDirs: knownModules,
     solutionRoot: 'O24OpenAPI',
   }
 }
 
-const ALL_SERVICES = ['CMS', 'WFO', 'IPS', 'CTH', 'NCH', 'RPT', 'LOG', 'DWH']
+const ALL_SERVICES = [...BUILD_SERVICES]
+const GRAPH_SERVICES = [...BUILD_SERVICES]
 
 function compareWith(files: ResolverCompareInput['files']): ResolverCompareInput {
   return { base: 'developer~1', head: 'developer', baseSha: 'base-sha', headSha: 'head-sha', status: 'ahead', files, truncated: false }
@@ -87,7 +83,7 @@ test('changes under two different services\' own dirs -> both affected, nothing 
 // 4. Đổi APIContracts -> tất cả
 test('APIContracts change affects all buildable services', () => {
   const result = resolveAffectedServices(compareWith([{ filename: 'O24OpenAPI/O24OpenAPI.APIContracts/Dto/Foo.cs', status: 'modified' }]), fixtureGraph())
-  assert.deepEqual(result.affectedServices.sort(), [...ALL_SERVICES].sort())
+  assert.deepEqual(result.affectedServices.sort(), [...GRAPH_SERVICES].sort())
   assert.equal(result.fellBackToAll, false) // this is a REAL shared-dependency match, not a safety fallback
   assert.ok(result.reasons.CMS?.some((r) => r.includes('APIContracts')))
 })
@@ -95,21 +91,21 @@ test('APIContracts change affects all buildable services', () => {
 // 5. Đổi GrpcContracts (bao gồm Protos) -> tất cả
 test('GrpcContracts change (including a nested Protos file) affects all buildable services', () => {
   const result = resolveAffectedServices(compareWith([{ filename: 'O24OpenAPI/O24OpenAPI.GrpcContracts/Protos/BUZ/buz.proto', status: 'modified' }]), fixtureGraph())
-  assert.deepEqual(result.affectedServices.sort(), [...ALL_SERVICES].sort())
+  assert.deepEqual(result.affectedServices.sort(), [...GRAPH_SERVICES].sort())
   assert.equal(result.fellBackToAll, false)
 })
 
 // 6. Đổi Directory.Packages.props -> tất cả
 test('Directory.Packages.props (O24OpenAPI/ level, copied by every service) affects all buildable services', () => {
   const result = resolveAffectedServices(compareWith([{ filename: 'O24OpenAPI/Directory.Packages.props', status: 'modified' }]), fixtureGraph())
-  assert.deepEqual(result.affectedServices.sort(), [...ALL_SERVICES].sort())
+  assert.deepEqual(result.affectedServices.sort(), [...GRAPH_SERVICES].sort())
   assert.equal(result.fellBackToAll, false)
 })
 
 // 7. Đổi Directory.Build.props: cấp O24OpenAPI/ -> tất cả; cấp root -> không ảnh hưởng
 test('Directory.Build.props at O24OpenAPI/ level affects all buildable services', () => {
   const result = resolveAffectedServices(compareWith([{ filename: 'O24OpenAPI/Directory.Build.props', status: 'modified' }]), fixtureGraph())
-  assert.deepEqual(result.affectedServices.sort(), [...ALL_SERVICES].sort())
+  assert.deepEqual(result.affectedServices.sort(), [...GRAPH_SERVICES].sort())
   assert.equal(result.fellBackToAll, false)
 })
 
@@ -168,16 +164,16 @@ test('a truncated compare (>= 300 files) falls back to building everything even 
 // 10. Renamed/deleted file
 test('a renamed file is classified by BOTH its new and previous path', () => {
   const result = resolveAffectedServices(
-    compareWith([{ filename: 'O24OpenAPI/O24OpenAPI.RPT/X.API/NewName.cs', status: 'renamed', previousFilename: 'O24OpenAPI/O24OpenAPI.NCH/X.API/OldName.cs' }]),
+    compareWith([{ filename: 'O24OpenAPI/O24OpenAPI.CTH/X.API/NewName.cs', status: 'renamed', previousFilename: 'O24OpenAPI/O24OpenAPI.NCH/X.API/OldName.cs' }]),
     fixtureGraph(),
   )
-  assert.deepEqual(result.affectedServices.sort(), ['NCH', 'RPT'])
+  assert.deepEqual(result.affectedServices.sort(), ['CTH', 'NCH'])
   assert.equal(result.fellBackToAll, false)
 })
 
 test('a deleted file is still classified by its (now-gone) path', () => {
-  const result = resolveAffectedServices(compareWith([{ filename: 'O24OpenAPI/O24OpenAPI.IPS/X.Domain/Removed.cs', status: 'removed' }]), fixtureGraph())
-  assert.deepEqual(result.affectedServices, ['IPS'])
+  const result = resolveAffectedServices(compareWith([{ filename: 'O24OpenAPI/O24OpenAPI.CTH/X.Domain/Removed.cs', status: 'removed' }]), fixtureGraph())
+  assert.deepEqual(result.affectedServices, ['CTH'])
   assert.equal(result.fellBackToAll, false)
 })
 
@@ -204,3 +200,14 @@ test('WFO-only shared dependency (OData) affects only WFO, not the other 6 servi
   assert.deepEqual(result.affectedServices, ['WFO'])
   assert.equal(result.fellBackToAll, false)
 })
+
+for (const service of ['W4S', 'AI', 'PMT'] as const) {
+  test(`W4S profile classifies a direct ${service} change`, { skip: process.env.RELEASE_PROJECT?.toLowerCase() !== 'w4s' }, () => {
+    const result = resolveAffectedServices(
+      compareWith([{ filename: `O24OpenAPI/O24OpenAPI.${service}/X.API/Program.cs`, status: 'modified' }]),
+      fixtureGraph(),
+    )
+    assert.deepEqual(result.affectedServices, [service])
+    assert.equal(result.fellBackToAll, false)
+  })
+}

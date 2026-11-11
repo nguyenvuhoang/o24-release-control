@@ -1,7 +1,9 @@
 import path from 'node:path'
 import { kvCommand, resolveKvConfig } from '../kv'
 import { GITHUB_API_BASE, GithubPermissionError, githubConfig } from './client'
-import { BUILD_SERVICES, isBuildServiceCode, type BuildServiceCode } from './serviceMap'
+import { BUILD_SERVICES, type BuildServiceCode } from './serviceMap'
+import { ACTIVE_PROJECT_PROFILE, type ProjectCode } from '../projectProfile'
+import { isServiceCodeForProfile } from './serviceMap'
 
 // Live-derives the w4s monorepo's dependency graph for the buildable
 // services (BUILD_SERVICES) — deliberately NOT a hardcoded map in this
@@ -97,12 +99,19 @@ export function extractProjectReferences(csprojContent: string, csprojDir: strin
  * automatically, no control-center change required.
  */
 export function parseServiceDockerfileMap(ymlContent: string): Partial<Record<BuildServiceCode, { dockerfile: string; image: string }>> {
+  return parseServiceDockerfileMapForProfile(ACTIVE_PROJECT_PROFILE.code, ymlContent)
+}
+
+export function parseServiceDockerfileMapForProfile(
+  project: ProjectCode,
+  ymlContent: string,
+): Partial<Record<BuildServiceCode, { dockerfile: string; image: string }>> {
   const result: Partial<Record<BuildServiceCode, { dockerfile: string; image: string }>> = {}
   const caseBlockPattern = /\n[ \t]*([A-Za-z0-9_]+)\)\s*\n([\s\S]*?);;/g
   let match: RegExpExecArray | null
   while ((match = caseBlockPattern.exec(ymlContent))) {
     const label = match[1].trim()
-    if (!isBuildServiceCode(label)) continue
+    if (!isServiceCodeForProfile(project, label)) continue
     const body = match[2]
     const dockerfileMatch = /dockerfile=([^\s"]+)/.exec(body)
     const imageMatch = /image=([^\s"]+)/.exec(body)

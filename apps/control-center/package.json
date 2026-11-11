@@ -8,6 +8,7 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-transform-types --import ./scripts/test-ts-hooks.mjs --test lib/**/*.test.ts app/components/**/*.test.ts app/api/**/*.test.ts",
+    "validate:w4s-kit": "node ../../scripts/validate-w4s-kit.mjs",
     "seed:users": "node --experimental-transform-types --import ./scripts/test-ts-hooks.mjs scripts/seed-users.mjs"
   },
   "dependencies": {

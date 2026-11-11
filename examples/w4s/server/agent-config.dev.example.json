@@ -1,0 +1,89 @@
+{
+  "environment": "DEV",
+  "listenAddr": ":9100",
+  "hostname": "w4s-dev-app",
+  "imageCleanupEnabled": true,
+  "imageCleanupMinAgeHours": 24,
+  "compose": {
+    "projectDirectory": "/app",
+    "files": [
+      "/app/docker-compose.yml"
+    ],
+    "baseEnvFile": "/app/.env",
+    "deployEnvFile": "/app/.env.deploy"
+  },
+  "services": [
+    {
+      "code": "o24-wfo",
+      "displayName": "O24 Workflow",
+      "composeService": "o24-wfo",
+      "containerName": "o24-wfo",
+      "imageRepository": "vknighthub/w4s_o24wfo",
+      "imageEnvKey": "O24_WFO_IMAGE",
+      "healthTimeoutSeconds": 90
+    },
+    {
+      "code": "o24-log",
+      "displayName": "O24 Logging",
+      "composeService": "o24-log",
+      "containerName": "o24-log",
+      "imageRepository": "vknighthub/w4s_o24log",
+      "imageEnvKey": "O24_LOG_IMAGE",
+      "healthTimeoutSeconds": 90
+    },
+    {
+      "code": "o24-cms",
+      "displayName": "O24 CMS",
+      "composeService": "o24-cms",
+      "containerName": "o24-cms",
+      "imageRepository": "vknighthub/w4s_o24cms",
+      "imageEnvKey": "O24_CMS_IMAGE",
+      "healthTimeoutSeconds": 90
+    },
+    {
+      "code": "o24-cth",
+      "displayName": "O24 CTH",
+      "composeService": "o24-cth",
+      "containerName": "o24-cth",
+      "imageRepository": "vknighthub/w4s_o24cth",
+      "imageEnvKey": "O24_CTH_IMAGE",
+      "healthTimeoutSeconds": 90
+    },
+    {
+      "code": "o24-w4s",
+      "displayName": "O24 W4S",
+      "composeService": "o24-w4s",
+      "containerName": "o24-w4s",
+      "imageRepository": "vknighthub/w4s_o24w4s",
+      "imageEnvKey": "O24_W4S_IMAGE",
+      "healthTimeoutSeconds": 90
+    },
+    {
+      "code": "o24-nch",
+      "displayName": "O24 NCH",
+      "composeService": "o24-nch",
+      "containerName": "o24-nch",
+      "imageRepository": "vknighthub/w4s_o24nch",
+      "imageEnvKey": "O24_NCH_IMAGE",
+      "healthTimeoutSeconds": 90
+    },
+    {
+      "code": "o24-pmt",
+      "displayName": "O24 Payment",
+      "composeService": "o24-pmt",
+      "containerName": "o24-pmt",
+      "imageRepository": "vknighthub/w4s_o24pmt",
+      "imageEnvKey": "O24_PMT_IMAGE",
+      "healthTimeoutSeconds": 90
+    },
+    {
+      "code": "o24-ai",
+      "displayName": "O24 AI",
+      "composeService": "o24-ai",
+      "containerName": "o24-ai",
+      "imageRepository": "vknighthub/w4s_o24ai",
+      "imageEnvKey": "O24_AI_IMAGE",
+      "healthTimeoutSeconds": 90
+    }
+  ]
+}

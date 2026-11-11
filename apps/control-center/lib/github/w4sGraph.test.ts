@@ -13,6 +13,7 @@ const {
   parseDockerfileRootCsproj,
   parseDockerfileSharedPropsFiles,
   parseServiceDockerfileMap,
+  parseServiceDockerfileMapForProfile,
   parseSlnProjects,
   resetDependencyGraphCacheForTests,
   stripXmlComments,
@@ -98,6 +99,47 @@ jobs:
               exit 1
               ;;
           esac
+`
+
+const W4S_BUILD_WORKFLOW_YML = `
+case "\${{ inputs.service }}" in
+  WFO)
+    echo "dockerfile=O24OpenAPI/O24OpenAPI.WFO/O24OpenAPI.WFO.API/Dockerfile" >> "$GITHUB_OUTPUT"
+    echo "image=vknighthub/w4s_o24wfo" >> "$GITHUB_OUTPUT"
+    ;;
+  LOG)
+    echo "dockerfile=O24OpenAPI/O24OpenAPI.Logger/O24OpenAPI.Logger.API/Dockerfile" >> "$GITHUB_OUTPUT"
+    echo "image=vknighthub/w4s_o24log" >> "$GITHUB_OUTPUT"
+    ;;
+  CMS)
+    echo "dockerfile=O24OpenAPI/O24OpenAPI.CMS/O24OpenAPI.CMS.API/Dockerfile" >> "$GITHUB_OUTPUT"
+    echo "image=vknighthub/w4s_o24cms" >> "$GITHUB_OUTPUT"
+    ;;
+  CTH)
+    echo "dockerfile=O24OpenAPI/O24OpenAPI.CTH/O24OpenAPI.CTH.API/Dockerfile" >> "$GITHUB_OUTPUT"
+    echo "image=vknighthub/w4s_o24cth" >> "$GITHUB_OUTPUT"
+    ;;
+  W4S)
+    echo "dockerfile=O24OpenAPI/O24OpenAPI.W4S/O24OpenAPI.W4S.API/Dockerfile" >> "$GITHUB_OUTPUT"
+    echo "image=vknighthub/w4s_o24w4s" >> "$GITHUB_OUTPUT"
+    ;;
+  NCH)
+    echo "dockerfile=O24OpenAPI/O24OpenAPI.NCH/O24OpenAPI.NCH.API/Dockerfile" >> "$GITHUB_OUTPUT"
+    echo "image=vknighthub/w4s_o24nch" >> "$GITHUB_OUTPUT"
+    ;;
+  PMT)
+    echo "dockerfile=O24OpenAPI/O24OpenAPI.PMT/O24OpenAPI.PMT.API/Dockerfile" >> "$GITHUB_OUTPUT"
+    echo "image=vknighthub/w4s_o24pmt" >> "$GITHUB_OUTPUT"
+    ;;
+  AI)
+    echo "dockerfile=O24OpenAPI/O24OpenAPI.AI/O24OpenAPI.AI.API/Dockerfile" >> "$GITHUB_OUTPUT"
+    echo "image=vknighthub/w4s_o24ai" >> "$GITHUB_OUTPUT"
+    ;;
+  IPS)
+    echo "dockerfile=O24OpenAPI/O24OpenAPI.IPS/O24OpenAPI.IPS.API/Dockerfile" >> "$GITHUB_OUTPUT"
+    echo "image=vknighthub/ips_o24ips" >> "$GITHUB_OUTPUT"
+    ;;
+esac
 `
 
 const REAL_CMS_DOCKERFILE = `FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
@@ -223,7 +265,7 @@ test('extractProjectReferences resolves relative paths against the csproj direct
 // ---- parseServiceDockerfileMap ----
 
 test('parseServiceDockerfileMap finds all 8 real build services with their Dockerfile + image', () => {
-  const map = parseServiceDockerfileMap(REAL_BUILD_WORKFLOW_YML)
+  const map = parseServiceDockerfileMapForProfile('ips', REAL_BUILD_WORKFLOW_YML)
   assert.equal(map.CMS?.dockerfile, 'O24OpenAPI/O24OpenAPI.CMS/O24OpenAPI.CMS.API/Dockerfile')
   assert.equal(map.CMS?.image, 'vknighthub/ips_o24cms')
   assert.equal(map.LOG?.dockerfile, 'O24OpenAPI/O24OpenAPI.Logger/O24OpenAPI.Logger.API/Dockerfile')
@@ -235,8 +277,17 @@ test('parseServiceDockerfileMap finds all 8 real build services with their Docke
 })
 
 test('parseServiceDockerfileMap ignores the "*)" default case and non-service tokens', () => {
-  const map = parseServiceDockerfileMap(REAL_BUILD_WORKFLOW_YML)
+  const map = parseServiceDockerfileMapForProfile('ips', REAL_BUILD_WORKFLOW_YML)
   assert.equal(Object.keys(map).length, 8)
+})
+
+test('parseServiceDockerfileMapForProfile accepts the complete W4S catalog and ignores IPS-only entries', () => {
+  const map = parseServiceDockerfileMapForProfile('w4s', W4S_BUILD_WORKFLOW_YML)
+  assert.deepEqual(Object.keys(map), ['WFO', 'LOG', 'CMS', 'CTH', 'W4S', 'NCH', 'PMT', 'AI'])
+  assert.equal(map.W4S?.image, 'vknighthub/w4s_o24w4s')
+  assert.equal(map.AI?.image, 'vknighthub/w4s_o24ai')
+  assert.equal(map.PMT?.image, 'vknighthub/w4s_o24pmt')
+  assert.equal(map.IPS, undefined)
 })
 
 // ---- parseDockerfileRootCsproj ----
