@@ -1,6 +1,7 @@
 import type { Metadata } from 'next'
 import { Quicksand } from 'next/font/google'
 import './globals.css'
+import { ACTIVE_PROJECT_PROFILE } from '../lib/projectProfile'
 
 const quicksand = Quicksand({
   subsets: ['latin', 'vietnamese'],
@@ -9,7 +10,7 @@ const quicksand = Quicksand({
 })
 
 export const metadata: Metadata = {
-  title: 'Quản lý triển khai IPS',
+  title: ACTIVE_PROJECT_PROFILE.applicationName,
   description: 'Quản lý triển khai tập trung cho DEV, UAT và PROD',
 }
 

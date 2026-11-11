@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import type { ControlConfig, EnvironmentConfig } from './types'
+import { getProjectProfile, resolveProjectCode, type ProjectCode } from './projectProfile'
 
 const envPattern = /\$\{([A-Z0-9_]+)\}/g
 
@@ -20,7 +21,11 @@ function resolveEnvironmentVariables(value: unknown): unknown {
 }
 
 export async function loadControlConfig(): Promise<ControlConfig> {
-  const configPath = path.join(process.cwd(), 'config', 'environments.json')
+  const configPath = resolveControlConfigPath(
+    process.cwd(),
+    process.env.CONTROL_CONFIG_PATH,
+    resolveProjectCode(process.env.RELEASE_PROJECT),
+  )
   const raw = await fs.readFile(configPath, 'utf8')
   const parsed = resolveEnvironmentVariables(JSON.parse(raw)) as ControlConfig
 
@@ -42,6 +47,17 @@ export async function loadControlConfig(): Promise<ControlConfig> {
     .sort((a, b) => a.order - b.order)
 
   return parsed
+}
+
+export function resolveControlConfigPath(
+  cwd: string,
+  explicitPath?: string,
+  projectCode: ProjectCode = 'ips',
+): string {
+  if (explicitPath?.trim()) {
+    return path.resolve(cwd, explicitPath.trim())
+  }
+  return path.join(cwd, 'config', getProjectProfile(projectCode).configFile)
 }
 
 function validateEnvironment(environment: EnvironmentConfig): void {

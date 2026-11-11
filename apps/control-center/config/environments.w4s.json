@@ -1,0 +1,32 @@
+{
+  "applicationName": "W4S Release Control",
+  "environments": [
+    {
+      "code": "DEV",
+      "name": "Development",
+      "baseUrl": "${W4S_DEV_AGENT_URL}",
+      "apiKey": "${DEV_AGENT_KEY}",
+      "apiSecret": "${DEV_AGENT_SECRET}",
+      "order": 1,
+      "enabled": true
+    },
+    {
+      "code": "UAT",
+      "name": "Kiểm thử UAT",
+      "baseUrl": "${W4S_UAT_AGENT_URL}",
+      "apiKey": "${UAT_AGENT_KEY}",
+      "apiSecret": "${UAT_AGENT_SECRET}",
+      "order": 2,
+      "enabled": true
+    },
+    {
+      "code": "PROD",
+      "name": "LIVE",
+      "baseUrl": "${W4S_PROD_AGENT_URL}",
+      "apiKey": "${PROD_AGENT_KEY}",
+      "apiSecret": "${PROD_AGENT_SECRET}",
+      "order": 3,
+      "enabled": true
+    }
+  ]
+}

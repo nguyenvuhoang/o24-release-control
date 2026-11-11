@@ -8,6 +8,21 @@ DEV → UAT → PROD
 
 Mỗi môi trường chạy một **Deploy Agent** nhỏ. Giao diện **Next.js Control Center** gọi các agent qua HTTPS/domain, nên người vận hành không cần SSH trực tiếp vào server trong thao tác triển khai hằng ngày.
 
+## Project profiles
+
+Cùng một codebase hỗ trợ hai Control Center tách biệt bằng `RELEASE_PROJECT`:
+
+| Profile | Service catalog | Docker image namespace |
+|---|---|---|
+| `ips` (mặc định) | CMS, WFO, IPS, CTH, NCH, RPT, LOG, DWH, PMT | `vknighthub/ips_o24*` |
+| `w4s` | WFO, LOG, CMS, CTH, W4S, NCH, PMT, AI | `vknighthub/w4s_o24*` |
+
+Nếu không khai báo `RELEASE_PROJECT`, ứng dụng tiếp tục chạy profile `ips` để tương thích deployment hiện tại. Giá trị khác `ips` hoặc `w4s` làm ứng dụng dừng với lỗi cấu hình.
+
+- Hướng dẫn W4S hoàn chỉnh: [`docs/W4S_DEPLOYMENT.md`](docs/W4S_DEPLOYMENT.md)
+- Bộ cấu hình agent W4S: [`examples/w4s/server`](examples/w4s/server)
+- Kiểm tra bộ cấu hình: `pnpm --dir apps/control-center validate:w4s-kit`
+
 ## Thành phần
 
 ```text

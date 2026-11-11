@@ -1,27 +1,35 @@
-// Allow-list of services the build-o24.yml GitHub Actions workflow accepts as
-// its `service` input. Kept as the single source of truth for build-related
-// service validation — never duplicate this list elsewhere.
-export const BUILD_SERVICES = [
-  "CMS",
-  "WFO",
-  "IPS",
-  "CTH",
-  "NCH",
-  "RPT",
-  "LOG",
-  "DWH",
-  "PMT",
-] as const;
+import {
+  ACTIVE_PROJECT_PROFILE,
+  getProjectProfile,
+  type ProjectCode,
+  type ServiceCode,
+} from '../projectProfile'
 
-export type BuildServiceCode = (typeof BUILD_SERVICES)[number];
+export type BuildServiceCode = ServiceCode
 
-export function isBuildServiceCode(value: string): value is BuildServiceCode {
-  return (BUILD_SERVICES as readonly string[]).includes(value);
+export const BUILD_SERVICES: readonly BuildServiceCode[] = ACTIVE_PROJECT_PROFILE.services
+
+export function serviceCodesForProfile(project: ProjectCode): readonly BuildServiceCode[] {
+  return getProjectProfile(project).services
 }
 
-// The Docker Hub repository the workflow pushes each service's image to.
+export function isServiceCodeForProfile(project: ProjectCode, value: string): value is BuildServiceCode {
+  return serviceCodesForProfile(project).includes(value as BuildServiceCode)
+}
+
+export function isBuildServiceCode(value: string): value is BuildServiceCode {
+  return BUILD_SERVICES.includes(value as BuildServiceCode)
+}
+
 export function imageRepositoryFor(service: BuildServiceCode): string {
-  return `vknighthub/ips_o24${service.toLowerCase()}`;
+  return imageRepositoryForProfile(ACTIVE_PROJECT_PROFILE.code, service)
+}
+
+export function imageRepositoryForProfile(project: ProjectCode, service: BuildServiceCode): string {
+  if (!isServiceCodeForProfile(project, service)) {
+    throw new Error(`Service ${service} is not available for project ${project}`)
+  }
+  return `${getProjectProfile(project).imagePrefix}${service.toLowerCase()}`
 }
 
 // Deploy Agent service codes already follow the "o24-<name>" convention (see
@@ -31,10 +39,17 @@ export function imageRepositoryFor(service: BuildServiceCode): string {
 export function githubServiceForAgentCode(
   agentServiceCode: string,
 ): BuildServiceCode | null {
+  return githubServiceForAgentCodeForProfile(ACTIVE_PROJECT_PROFILE.code, agentServiceCode)
+}
+
+export function githubServiceForAgentCodeForProfile(
+  project: ProjectCode,
+  agentServiceCode: string,
+): BuildServiceCode | null {
   const match = /^o24-([a-z0-9]+)$/i.exec(agentServiceCode);
   if (!match) return null;
   const candidate = match[1].toUpperCase();
-  return isBuildServiceCode(candidate) ? candidate : null;
+  return isServiceCodeForProfile(project, candidate) ? candidate : null
 }
 
 /**
@@ -51,5 +66,14 @@ export function resolveAgentServiceCode<T extends { code: string }>(
   items: T[],
   service: BuildServiceCode,
 ): T | undefined {
-  return items.find((item) => githubServiceForAgentCode(item.code) === service);
+  return resolveAgentServiceCodeForProfile(ACTIVE_PROJECT_PROFILE.code, items, service)
+}
+
+export function resolveAgentServiceCodeForProfile<T extends { code: string }>(
+  project: ProjectCode,
+  items: T[],
+  service: BuildServiceCode,
+): T | undefined {
+  if (!isServiceCodeForProfile(project, service)) return undefined
+  return items.find((item) => githubServiceForAgentCodeForProfile(project, item.code) === service)
 }
