@@ -454,3 +454,7 @@ Chi tiết endpoint và cơ chế chữ ký nằm tại [docs/API.md](docs/API.m
 # Ghi chú triển khai
 
 Các lưu ý đường dẫn Compose, healthcheck và xử lý sự cố nằm tại [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
+# Redis / KV storage
+
+Control Center lưu audit log, release snapshot, build pointer và user record qua một adapter Redis dùng chung (`apps/control-center/lib/kv.ts`). Mặc định vẫn là Vercel KV / Upstash REST; cấu hình và lộ trình chuyển sang self-hosted HTTP Redis Gateway nằm tại [docs/REDIS_GATEWAY.md](docs/REDIS_GATEWAY.md).
