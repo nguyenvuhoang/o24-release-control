@@ -1,6 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { mapWithConcurrency } from '../../../lib/concurrency'
 import { BUILD_SERVICES, githubServiceForAgentCode, type BuildServiceCode } from '../../../lib/github/serviceMap'
 import { readJsonSafe } from '../../../lib/http'
 import { resolveReleaseComparison, toRunningRelease } from '../../../lib/releaseComparison'
@@ -13,6 +14,14 @@ import type { EnvironmentDashboard, ReleaseComparison, ReleaseEnvironmentStateRe
 // build/import/deploy/promote/restart/rollback) call `refresh()` directly
 // instead of waiting for this timer.
 const REFRESH_INTERVAL_MS = 45_000
+
+// How many of the 7 services' own POST /api/releases/environment-state
+// requests this hook fires at once — previously an uncapped
+// BUILD_SERVICES.map(...) + Promise.all, i.e. all 7 simultaneously, on top
+// of /api/registry/status's own fan-out, both landing on the self-hosted
+// Redis Gateway at the same moment on every Dashboard load. See
+// docs/REDIS_GATEWAY.md's root-cause note.
+const ENVIRONMENT_STATE_FETCH_CONCURRENCY = 3
 
 type ComparisonMap = Partial<Record<BuildServiceCode, ReleaseComparison>>
 
@@ -61,8 +70,10 @@ export function useReleaseComparison(environments: EnvironmentDashboard[], regis
       const registry = overrides?.registryStatus ?? registryStatusRef.current
       const checkedAt = new Date().toISOString()
 
-      const entries = await Promise.all(
-        BUILD_SERVICES.map(async (service): Promise<[BuildServiceCode, ReleaseComparison]> => {
+      const entries = await mapWithConcurrency(
+        BUILD_SERVICES,
+        ENVIRONMENT_STATE_FETCH_CONCURRENCY,
+        async (service): Promise<[BuildServiceCode, ReleaseComparison]> => {
           const perEnvironment = envs.map((environment) => ({
             code: environment.code,
             repoDigest: environment.services.find((item) => githubServiceForAgentCode(item.code) === service)?.repoDigest,
@@ -111,7 +122,7 @@ export function useReleaseComparison(environments: EnvironmentDashboard[], regis
             prod: runningByCode.get('PROD'),
           })
           return [service, comparison]
-        }),
+        },
       )
 
       setComparisons(Object.fromEntries(entries) as ComparisonMap)

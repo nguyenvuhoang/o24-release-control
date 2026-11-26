@@ -150,3 +150,45 @@ export async function getLatestBuildIntent(service: string): Promise<BuildIntent
       return latest
     }, undefined)
 }
+
+/**
+ * Batched getLatestBuildIntent: ONE Gateway/Upstash MGET across every
+ * service's "latest" pointer, instead of one GET request PER service —
+ * /api/registry/status resolves this for all BUILD_SERVICES on every
+ * Dashboard load, which previously meant one request per service fired
+ * concurrently alongside everything else hitting the Redis Gateway (see
+ * docs/REDIS_GATEWAY.md's root-cause note). Returns a map of only the
+ * services that have a recorded intent — same "undefined means none" result
+ * as getLatestBuildIntent, just keyed by service.
+ */
+export async function getLatestBuildIntents(services: readonly string[]): Promise<Map<string, BuildIntent>> {
+  const result = new Map<string, BuildIntent>()
+  if (services.length === 0) return result
+
+  const kvConfig = resolveKvConfig()
+  if (kvConfig) {
+    const raw = (await kvCommand(kvConfig, ['MGET', ...services.map((service) => KV_LATEST_INTENT_PREFIX + service)])) as
+      | (string | null)[]
+      | null
+    services.forEach((service, index) => {
+      const value = raw?.[index]
+      if (typeof value === 'string') result.set(service, JSON.parse(value) as BuildIntent)
+    })
+    return result
+  }
+  if (isRunningOnVercel()) {
+    for (const service of services) {
+      const intent = memoryLatestIntents.get(service)
+      if (intent) result.set(service, intent)
+    }
+    return result
+  }
+  const all = await readIntentFile(getIntentFilePath())
+  for (const service of services) {
+    const latest = Object.values(all)
+      .filter((intent) => intent.service === service)
+      .reduce<BuildIntent | undefined>((best, current) => (!best || current.requestedAt > best.requestedAt ? current : best), undefined)
+    if (latest) result.set(service, latest)
+  }
+  return result
+}

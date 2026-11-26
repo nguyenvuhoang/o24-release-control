@@ -18,6 +18,19 @@ export interface ReleaseRepository {
   getByRun(runId: number, runAttempt: number): Promise<ReleaseSnapshot | undefined>
   /** repoDigest may be the full "repo@sha256:<hex>" reference or the bare "sha256:<hex>" — only the hex is used to match. */
   getByDigest(service: BuildServiceCode, repoDigest: string): Promise<ReleaseSnapshot | undefined>
+  /**
+   * Batched getByDigest: resolves every pair in ONE round trip to the index
+   * plus ONE more to the matched records (KV backend), instead of two
+   * Gateway/Upstash requests PER pair — see docs/REDIS_GATEWAY.md's
+   * root-cause note on uncapped per-service fan-out overwhelming the Redis
+   * Gateway during Dashboard load (/api/registry/status and
+   * /api/releases/environment-state both resolve one digest per service/
+   * environment and previously did so with an independent getByDigest call
+   * each). Results are positional, same order and length as `pairs`; a pair
+   * with an unparseable digest or no match resolves to undefined, exactly
+   * like calling getByDigest on it individually.
+   */
+  getByDigests(pairs: Array<{ service: BuildServiceCode; repoDigest: string }>): Promise<(ReleaseSnapshot | undefined)[]>
   list(query?: ListReleasesQuery): Promise<ReleaseListResult>
   /**
    * Metadata enrichment, NOT a general update: fills ONLY commitSha/
@@ -342,6 +355,19 @@ export class FileReleaseRepository implements ReleaseRepository {
     return all.find((release) => release.service === service && digestHexOf(release.repoDigest) === digestHex)
   }
 
+  // No network round trip to batch here (readAll() is one local file read
+  // either way) — just reads the file once and resolves every pair against
+  // the same in-memory array, same lookup rule as getByDigest.
+  async getByDigests(pairs: Array<{ service: BuildServiceCode; repoDigest: string }>): Promise<(ReleaseSnapshot | undefined)[]> {
+    if (pairs.length === 0) return []
+    const all = await this.readAll()
+    return pairs.map((pair) => {
+      const digestHex = digestHexOf(pair.repoDigest)
+      if (!digestHex) return undefined
+      return all.find((release) => release.service === pair.service && digestHexOf(release.repoDigest) === digestHex)
+    })
+  }
+
   async list(query: ListReleasesQuery = {}): Promise<ReleaseListResult> {
     return paginateReleases(await this.readAll(), query)
   }
@@ -469,6 +495,46 @@ export class KvReleaseRepository implements ReleaseRepository {
     return this.getById(id)
   }
 
+  // Batched form of getByDigest: ONE MGET across every pair's digest-index
+  // key, then ONE MGET across the resulting (deduped) record ids — 2 Gateway
+  // requests total no matter how many pairs are asked for, instead of 2 PER
+  // pair. Callers with N pairs (e.g. one service's DEV/UAT/PROD digests, or
+  // every service's current Docker Hub digest) go from 2N requests to 2.
+  async getByDigests(pairs: Array<{ service: BuildServiceCode; repoDigest: string }>): Promise<(ReleaseSnapshot | undefined)[]> {
+    if (pairs.length === 0) return []
+
+    const digestHexes = pairs.map((pair) => digestHexOf(pair.repoDigest))
+    const indexKeys = pairs.map((pair, i) => {
+      const digestHex = digestHexes[i]
+      return digestHex ? kvDigestKey(pair.service, digestHex) : null
+    })
+    const keysToFetch = indexKeys.filter((key): key is string => key !== null)
+    if (keysToFetch.length === 0) return pairs.map(() => undefined)
+
+    const idResults = (await kvCommand(this.config, ['MGET', ...keysToFetch])) as (string | null)[] | null
+    // Re-align the fetched ids (one per key actually sent) back to every
+    // pair's position, including the ones skipped for lacking a valid digest.
+    let fetchCursor = 0
+    const idByPairIndex: (string | null)[] = indexKeys.map((key) => {
+      if (key === null) return null
+      const id = idResults?.[fetchCursor] ?? null
+      fetchCursor += 1
+      return typeof id === 'string' ? id : null
+    })
+
+    const uniqueIds = [...new Set(idByPairIndex.filter((id): id is string => id !== null))]
+    if (uniqueIds.length === 0) return pairs.map(() => undefined)
+
+    const recordResults = (await kvCommand(this.config, ['MGET', ...uniqueIds.map((id) => KV_RECORD_PREFIX + id)])) as (string | null)[] | null
+    const recordById = new Map<string, ReleaseSnapshot>()
+    uniqueIds.forEach((id, i) => {
+      const raw = recordResults?.[i]
+      if (typeof raw === 'string') recordById.set(id, JSON.parse(raw) as ReleaseSnapshot)
+    })
+
+    return idByPairIndex.map((id) => (id ? recordById.get(id) : undefined))
+  }
+
   async list(query: ListReleasesQuery = {}): Promise<ReleaseListResult> {
     const limit = Math.min(Math.max(query.limit ?? 50, 1), 200)
     const offset = query.cursor ? Math.max(Number(query.cursor) || 0, 0) : 0
@@ -544,6 +610,12 @@ export class InMemoryReleaseRepository implements ReleaseRepository {
     if (!digestHex) return undefined
     const id = this.byDigest.get(digestIndexKeyString(service, digestHex))
     return id ? this.records.get(id) : undefined
+  }
+
+  // In-memory maps are synchronous — no round trip to actually batch, just
+  // the same per-pair lookup rule as getByDigest, applied to every pair.
+  async getByDigests(pairs: Array<{ service: BuildServiceCode; repoDigest: string }>): Promise<(ReleaseSnapshot | undefined)[]> {
+    return Promise.all(pairs.map((pair) => this.getByDigest(pair.service, pair.repoDigest)))
   }
 
   async list(query: ListReleasesQuery = {}): Promise<ReleaseListResult> {

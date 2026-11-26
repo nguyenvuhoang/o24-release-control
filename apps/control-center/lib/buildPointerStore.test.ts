@@ -19,6 +19,7 @@ const {
   recordBuildIntent,
   getBuildIntent,
   getLatestBuildIntent,
+  getLatestBuildIntents,
   recordDispatchedRun,
   getLastDispatchedRun,
 } = await import('./buildPointerStore')
@@ -81,6 +82,36 @@ test('getLatestBuildIntent returns the most recently requested intent for a serv
 
 test('getLatestBuildIntent returns undefined when no intent was ever recorded for the service', async () => {
   assert.equal(await getLatestBuildIntent('IPS'), undefined)
+})
+
+test('getLatestBuildIntents resolves several services in one batched call, matching getLatestBuildIntent per service', async () => {
+  await recordBuildIntent({
+    runId: 10,
+    service: 'CTH',
+    branch: 'developer',
+    tag: 'latest',
+    requestedBy: 'alice',
+    requestedAt: '2026-08-20T09:00:00.000Z',
+  })
+  await recordBuildIntent({
+    runId: 11,
+    service: 'NCH',
+    branch: 'developer',
+    tag: 'latest',
+    requestedBy: 'bob',
+    requestedAt: '2026-08-20T09:00:00.000Z',
+  })
+
+  const result = await getLatestBuildIntents(['CTH', 'NCH', 'LOG'])
+  assert.equal(result.size, 2)
+  assert.equal(result.get('CTH')?.requestedBy, 'alice')
+  assert.equal(result.get('NCH')?.requestedBy, 'bob')
+  assert.equal(result.has('LOG'), false)
+})
+
+test('getLatestBuildIntents returns an empty map for an empty service list, without reading anything', async () => {
+  const result = await getLatestBuildIntents([])
+  assert.equal(result.size, 0)
 })
 
 test('legacy build pointer (recordDispatchedRun / getLastDispatchedRun) still works unchanged', async () => {

@@ -10,10 +10,13 @@ import {
   InMemoryReleaseRepository,
   InvalidReleaseInputError,
   isValidGitSha,
+  KvReleaseRepository,
   planReleaseDeploy,
   ReleaseConflictError,
   type CreateReleaseInput,
 } from './releaseRepository'
+import type { KvConfig } from './kv'
+import type { ReleaseSnapshot } from './types'
 
 test('isValidGitSha accepts only a full 40-character hex Git SHA', () => {
   assert.equal(isValidGitSha('a'.repeat(40)), true)
@@ -262,6 +265,176 @@ test('getByDigest returns undefined for a digest no release has, or for the wron
 
   assert.equal(await repo.getByDigest('CMS', `sha256:${'2'.repeat(64)}`), undefined)
   assert.equal(await repo.getByDigest('WFO', `sha256:${digest}`), undefined)
+})
+
+// ---- getByDigests — batched form, same lookup rule applied to several pairs ----
+
+test('getByDigests (InMemory) resolves every pair positionally, same result as calling getByDigest one at a time', async () => {
+  const repo = new InMemoryReleaseRepository()
+  const digestA = 'a'.repeat(64)
+  const digestB = 'b'.repeat(64)
+  const { record: recordA } = await repo.create(makeInput({ service: 'CMS', repoDigest: `vknighthub/ips_o24cms@sha256:${digestA}` }))
+  const { record: recordB } = await repo.create(makeInput({ service: 'WFO', githubRunId: 2, repoDigest: `vknighthub/ips_o24wfo@sha256:${digestB}` }))
+
+  const results = await repo.getByDigests([
+    { service: 'CMS', repoDigest: `sha256:${digestA}` },
+    { service: 'CMS', repoDigest: `sha256:${'c'.repeat(64)}` }, // no match
+    { service: 'WFO', repoDigest: `vknighthub/ips_o24wfo@sha256:${digestB}` },
+  ])
+  assert.deepEqual(results, [recordA, undefined, recordB])
+})
+
+test('getByDigests (InMemory, File) returns an empty array for an empty input', async () => {
+  const inMemory = new InMemoryReleaseRepository()
+  assert.deepEqual(await inMemory.getByDigests([]), [])
+
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'o24-release-repo-test-'))
+  const fileRepo = new FileReleaseRepository(path.join(dir, 'releases.jsonl'))
+  assert.deepEqual(await fileRepo.getByDigests([]), [])
+})
+
+test('getByDigests (File) resolves every pair positionally from the same on-disk data', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'o24-release-repo-test-'))
+  const repo = new FileReleaseRepository(path.join(dir, 'releases.jsonl'))
+  const digest = '3'.repeat(64)
+  const { record } = await repo.create(makeInput({ service: 'CMS', repoDigest: `vknighthub/ips_o24cms@sha256:${digest}` }))
+
+  const results = await repo.getByDigests([
+    { service: 'CMS', repoDigest: `sha256:${digest}` },
+    { service: 'CMS', repoDigest: 'not-a-digest' },
+  ])
+  // Read back through JSON, same as the on-disk JSONL round trip the File
+  // backend actually does (an explicit `undefined` field, like
+  // discoveredAt here, does not survive JSON.stringify).
+  assert.deepEqual(results, [JSON.parse(JSON.stringify(record)), undefined])
+})
+
+// ---- KvReleaseRepository.getByDigests — the production fix: N pairs must
+// become 2 Gateway/Upstash requests (one MGET for the digest index, one MGET
+// for the matched records), never 2*N — see docs/REDIS_GATEWAY.md's
+// root-cause note on uncapped per-pair fan-out overwhelming the Redis
+// Gateway during Dashboard load. ----
+
+const KV_CONFIG: KvConfig = { provider: 'upstash', url: 'https://example.com/redis', token: 'tok' }
+
+function mockFetchCapture(results: unknown[]) {
+  const originalFetch = globalThis.fetch
+  const bodies: unknown[] = []
+  let call = 0
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    bodies.push(init?.body ? JSON.parse(String(init.body)) : undefined)
+    const result = results[call]
+    call += 1
+    return new Response(JSON.stringify({ result }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }) as typeof fetch
+  return { restore: () => { globalThis.fetch = originalFetch }, bodies, callCount: () => call }
+}
+
+function makeSnapshot(overrides: Partial<ReleaseSnapshot> = {}): ReleaseSnapshot {
+  return {
+    id: 'release:CMS:digest:' + 'a'.repeat(64),
+    service: 'CMS',
+    source: 'docker-registry',
+    branch: null,
+    commitSha: null,
+    commitMessage: null,
+    dockerRepository: 'vknighthub/ips_o24cms',
+    repoDigest: `vknighthub/ips_o24cms@sha256:${'a'.repeat(64)}`,
+    tag: 'latest',
+    githubRunId: null,
+    githubRunAttempt: null,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    createdBy: 'admin',
+    ...overrides,
+  }
+}
+
+test('KvReleaseRepository.getByDigests resolves 3 pairs in exactly 2 requests, positionally, with no match for an unmatched digest', async () => {
+  const repo = new KvReleaseRepository(KV_CONFIG)
+  const digestA = 'a'.repeat(64)
+  const digestB = 'b'.repeat(64)
+  const digestMiss = 'c'.repeat(64)
+  const snapshotA = makeSnapshot({ id: 'release:CMS:digest:' + digestA, repoDigest: `vknighthub/ips_o24cms@sha256:${digestA}` })
+  const snapshotB = makeSnapshot({
+    id: 'release:WFO:digest:' + digestB,
+    service: 'WFO',
+    dockerRepository: 'vknighthub/ips_o24wfo',
+    repoDigest: `vknighthub/ips_o24wfo@sha256:${digestB}`,
+  })
+
+  const { restore, bodies, callCount } = mockFetchCapture([
+    [snapshotA.id, null, snapshotB.id],
+    [JSON.stringify(snapshotA), JSON.stringify(snapshotB)],
+  ])
+  try {
+    const result = await repo.getByDigests([
+      { service: 'CMS', repoDigest: `sha256:${digestA}` },
+      { service: 'CMS', repoDigest: `sha256:${digestMiss}` },
+      { service: 'WFO', repoDigest: `sha256:${digestB}` },
+    ])
+    assert.equal(callCount(), 2)
+    assert.deepEqual(result[0], snapshotA)
+    assert.equal(result[1], undefined)
+    assert.deepEqual(result[2], snapshotB)
+    assert.deepEqual(bodies[0], [
+      'MGET',
+      `o24:release:index:service:CMS:digest:${digestA}`,
+      `o24:release:index:service:CMS:digest:${digestMiss}`,
+      `o24:release:index:service:WFO:digest:${digestB}`,
+    ])
+    assert.deepEqual(bodies[1], ['MGET', `o24:release:record:${snapshotA.id}`, `o24:release:record:${snapshotB.id}`])
+  } finally {
+    restore()
+  }
+})
+
+test('KvReleaseRepository.getByDigests never calls fetch for an empty input', async () => {
+  const repo = new KvReleaseRepository(KV_CONFIG)
+  const { restore, callCount } = mockFetchCapture([])
+  try {
+    assert.deepEqual(await repo.getByDigests([]), [])
+    assert.equal(callCount(), 0)
+  } finally {
+    restore()
+  }
+})
+
+test('KvReleaseRepository.getByDigests skips the index MGET entirely when every pair has an unparseable digest', async () => {
+  const repo = new KvReleaseRepository(KV_CONFIG)
+  const { restore, callCount } = mockFetchCapture([])
+  try {
+    const result = await repo.getByDigests([
+      { service: 'CMS', repoDigest: 'not-a-digest' },
+      { service: 'WFO', repoDigest: 'also-not-a-digest' },
+    ])
+    assert.deepEqual(result, [undefined, undefined])
+    assert.equal(callCount(), 0)
+  } finally {
+    restore()
+  }
+})
+
+test('KvReleaseRepository.getByDigests dedupes a record MGET when two pairs resolve to the same release id', async () => {
+  const repo = new KvReleaseRepository(KV_CONFIG)
+  const digest = 'd'.repeat(64)
+  const snapshot = makeSnapshot({ id: 'release:CMS:digest:' + digest, repoDigest: `vknighthub/ips_o24cms@sha256:${digest}` })
+
+  const { restore, bodies, callCount } = mockFetchCapture([
+    [snapshot.id, snapshot.id], // both pairs resolve to the same id
+    [JSON.stringify(snapshot)],
+  ])
+  try {
+    const result = await repo.getByDigests([
+      { service: 'CMS', repoDigest: `sha256:${digest}` },
+      { service: 'CMS', repoDigest: `vknighthub/ips_o24cms@sha256:${digest}` },
+    ])
+    assert.equal(callCount(), 2)
+    assert.deepEqual(result, [snapshot, snapshot])
+    // Only ONE record key requested even though two pairs matched it.
+    assert.deepEqual(bodies[1], ['MGET', `o24:release:record:${snapshot.id}`])
+  } finally {
+    restore()
+  }
 })
 
 // ---- list() filters (branch/source/since/until) ----

@@ -34,13 +34,37 @@ export async function POST(request: Request) {
 
   try {
     const releaseRepository = getReleaseRepository()
-    const items: ReleaseEnvironmentState[] = await Promise.all(
-      body.environments.map(async (entry) => {
-        const repoDigest = entry.repoDigest?.trim() || undefined
-        const release = repoDigest ? (await releaseRepository.getByDigest(service, repoDigest)) ?? null : null
-        return { environment: entry.code, repoDigest, release }
-      }),
-    )
+
+    // Batched instead of one getByDigest call per environment: this used to
+    // be up to 2*N Gateway/Upstash requests (2 per environment — digest
+    // index + record) for a single POST, fired concurrently across all 7
+    // services' own POSTs from the client — see docs/REDIS_GATEWAY.md's
+    // root-cause note on Redis HTTP request concurrency during Dashboard
+    // load. Now it's 2 requests total, regardless of how many environments
+    // are asked about.
+    const normalizedEnvironments = body.environments.map((entry) => ({
+      code: entry.code,
+      repoDigest: entry.repoDigest?.trim() || undefined,
+    }))
+    const lookupPairs = normalizedEnvironments
+      .filter((entry): entry is { code: string; repoDigest: string } => Boolean(entry.repoDigest))
+      .map((entry) => ({ service, repoDigest: entry.repoDigest }))
+    const matched = await releaseRepository.getByDigests(lookupPairs).catch((error) => {
+      console.error('[releases/environment-state] batched release digest lookup failed', {
+        service,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+      return lookupPairs.map(() => undefined)
+    })
+
+    let cursor = 0
+    const items: ReleaseEnvironmentState[] = normalizedEnvironments.map((entry) => {
+      if (!entry.repoDigest) return { environment: entry.code, repoDigest: undefined, release: null }
+      const release = matched[cursor] ?? null
+      cursor += 1
+      return { environment: entry.code, repoDigest: entry.repoDigest, release }
+    })
+
     const response: ReleaseEnvironmentStateResponse = { items }
     return NextResponse.json(response)
   } catch (error) {
