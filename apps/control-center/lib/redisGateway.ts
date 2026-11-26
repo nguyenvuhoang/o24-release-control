@@ -12,7 +12,12 @@
 // request — no client-side emulation of atomicity (no claim keys, no
 // GET/SET races, no multi-request fan-out standing in for a data
 // structure). See docs/REDIS_GATEWAY.md for the exact request/response
-// contract this file assumes for every op.
+// contract this file assumes for every op, and its "2026-11-26 Vercel
+// transport incident" note for why gatewayCallOnce below validates the raw
+// transport response (redirect/content-type/JSON envelope) instead of just
+// trusting response.ok, and why the request's timeout now provably covers
+// body consumption, not just connecting.
+import { resolveGatewayTransport, sendGatewayRequest, type GatewayRawResponse } from './redisGatewayTransport'
 
 export type GatewayConfig = {
   url: string
@@ -39,6 +44,8 @@ const DEFAULT_TIMEOUT_MS = (() => {
   const raw = Number(process.env.REDIS_GATEWAY_TIMEOUT_MS ?? process.env.KV_REQUEST_TIMEOUT_MS)
   return Number.isFinite(raw) && raw > 0 ? raw : 5_000
 })()
+/** Exported so the admin transport diagnostic endpoint measures against the SAME configured budget production calls actually use, never a different one. */
+export const GATEWAY_REQUEST_TIMEOUT_MS = DEFAULT_TIMEOUT_MS
 const MAX_RETRIES = 2 // up to 3 total attempts
 const BASE_RETRY_DELAY_MS = 150
 const MAX_RETRY_DELAY_MS = 1_500
@@ -121,40 +128,91 @@ function gatewayEndpoint(config: GatewayConfig): string {
   return `${config.url.replace(/\/+$/, '')}/v1/redis`
 }
 
+function gatewayHeaders(config: GatewayConfig): Record<string, string> {
+  return {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${config.token}`,
+    ...(config.cfAccessClientId ? { 'CF-Access-Client-Id': config.cfAccessClientId } : {}),
+    ...(config.cfAccessClientSecret ? { 'CF-Access-Client-Secret': config.cfAccessClientSecret } : {}),
+  }
+}
+
+// Pulls a POSIX/libuv error code (ECONNRESET, ETIMEDOUT, ENOTFOUND, ...) off
+// a thrown network error without ever touching its message/headers/body —
+// genuinely useful for diagnosing a transport issue, and never sensitive
+// (unlike a header value or response body, which might echo back
+// credentials or Redis data and must never be logged).
+function networkErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  const withCode = error as { code?: unknown; cause?: { code?: unknown } }
+  const code = withCode.code ?? withCode.cause?.code
+  return typeof code === 'string' ? code : undefined
+}
+
 async function gatewayCallOnce(config: GatewayConfig, op: GatewayOp, params: Record<string, unknown>): Promise<unknown> {
-  const controller = new AbortController()
-  const timeoutHandle = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
-  let response: Response
+  const requestBody = JSON.stringify({ op, ...params })
+
+  let raw: GatewayRawResponse
   try {
-    response = await fetch(gatewayEndpoint(config), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${config.token}`,
-        ...(config.cfAccessClientId ? { 'CF-Access-Client-Id': config.cfAccessClientId } : {}),
-        ...(config.cfAccessClientSecret ? { 'CF-Access-Client-Secret': config.cfAccessClientSecret } : {}),
-      },
-      body: JSON.stringify({ op, ...params }),
-      cache: 'no-store',
-      signal: controller.signal,
-    })
+    raw = await sendGatewayRequest(gatewayEndpoint(config), { method: 'POST', body: requestBody, headers: gatewayHeaders(config) }, DEFAULT_TIMEOUT_MS, resolveGatewayTransport())
   } catch (networkError) {
-    const isTimeout = networkError instanceof Error && networkError.name === 'AbortError'
+    const isTimeout = networkError instanceof Error && (networkError.name === 'AbortError' || /timed out/i.test(networkError.message))
+    const code = networkErrorCode(networkError)
     const message = networkError instanceof Error ? networkError.message : 'Unknown network error'
     throw new GatewayCommandError(
-      isTimeout ? `Redis Gateway request timed out after ${DEFAULT_TIMEOUT_MS}ms` : `Redis Gateway request failed: ${message}`,
+      isTimeout
+        ? `Redis Gateway request timed out after ${DEFAULT_TIMEOUT_MS}ms${code ? ` (${code})` : ''}`
+        : `Redis Gateway request failed: ${message}${code ? ` (${code})` : ''}`,
       null,
       op,
     )
-  } finally {
-    clearTimeout(timeoutHandle)
   }
 
-  const body = (await response.json().catch(() => null)) as { result?: unknown; error?: string } | null
-  if (!response.ok) {
-    throw new GatewayCommandError(`Redis Gateway op "${op}" failed (${response.status}): ${body?.error ?? response.statusText}`, response.status, op)
+  // A redirect (e.g. to a Cloudflare Access / WAF challenge or login page)
+  // must never be followed silently — it means we didn't actually reach the
+  // Gateway, which "the Gateway returned a 4xx/5xx" doesn't capture.
+  if (raw.redirected) {
+    throw new GatewayCommandError(
+      `Redis Gateway op "${op}" received a redirect instead of a direct response — check REDIS_GATEWAY_URL/Cloudflare Access configuration, not the Gateway's own logic`,
+      raw.status || null,
+      op,
+    )
   }
-  return body?.result
+
+  // An HTML body (instead of the documented JSON envelope) is the other
+  // classic sign of hitting a proxy/WAF/challenge page in front of the
+  // Gateway rather than the Gateway itself — surfaced as its own condition
+  // rather than failing confusingly on JSON.parse.
+  if (raw.contentType && /text\/html/i.test(raw.contentType)) {
+    throw new GatewayCommandError(
+      `Redis Gateway op "${op}" returned HTML (status ${raw.status}, content-type ${raw.contentType}) instead of JSON — likely a proxy/WAF/Access page in front of the Gateway`,
+      raw.status,
+      op,
+    )
+  }
+
+  let parsed: { result?: unknown; error?: string } | null = null
+  if (raw.bodyText) {
+    try {
+      parsed = JSON.parse(raw.bodyText) as { result?: unknown; error?: string }
+    } catch {
+      throw new GatewayCommandError(`Redis Gateway op "${op}" returned a response that is not valid JSON (status ${raw.status})`, raw.status, op)
+    }
+  }
+
+  if (raw.status < 200 || raw.status >= 300) {
+    throw new GatewayCommandError(`Redis Gateway op "${op}" failed (${raw.status}): ${parsed?.error ?? 'no error detail in response'}`, raw.status, op)
+  }
+
+  // A 2xx body that parsed as JSON but isn't the documented {result}/{error}
+  // envelope (e.g. an upstream proxy's own "ok" JSON page) must not be
+  // silently treated as `result: undefined` — that's indistinguishable from
+  // a real null/undefined result and would hide a real misconfiguration.
+  if (parsed !== null && !('result' in parsed) && !('error' in parsed)) {
+    throw new GatewayCommandError(`Redis Gateway op "${op}" returned an unexpected response shape (missing "result"/"error")`, raw.status, op)
+  }
+
+  return parsed?.result
 }
 
 /** Bounded retry (3 attempts total) with backoff + jitter for transient failures — mirrors kv.ts's kvCommand. */

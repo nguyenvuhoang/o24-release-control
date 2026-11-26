@@ -92,28 +92,34 @@ function isTransient(error: unknown): boolean {
 async function kvCommandOnce(config: { url: string; token: string }, command: (string | number)[]): Promise<unknown> {
   const controller = new AbortController()
   const timeoutHandle = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
-  let response: Response
+  // The abort signal — and therefore the timeout it enforces — must stay
+  // live through reading the response body, not just through connecting:
+  // clearing it right after fetch() resolves (as this used to do) leaves
+  // response.json() completely unbounded if the body stream stalls after
+  // headers arrive. Everything that can hang is inside this one try/finally
+  // now; see docs/REDIS_GATEWAY.md's transport-incident note (the same bug,
+  // fixed the same way, in redisGateway.ts's gatewayCallOnce).
   try {
-    response = await fetch(config.url, {
+    const response = await fetch(config.url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${config.token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(command),
       cache: 'no-store',
       signal: controller.signal,
     })
-  } catch (networkError) {
-    const isTimeout = networkError instanceof Error && networkError.name === 'AbortError'
-    const message = networkError instanceof Error ? networkError.message : 'Unknown network error'
+    const body = (await response.json().catch(() => null)) as { result?: unknown; error?: string } | null
+    if (!response.ok) {
+      throw new KvCommandError(`KV command failed (${response.status}): ${body?.error ?? response.statusText}`, response.status)
+    }
+    return body?.result
+  } catch (error) {
+    if (error instanceof KvCommandError) throw error
+    const isTimeout = error instanceof Error && error.name === 'AbortError'
+    const message = error instanceof Error ? error.message : 'Unknown network error'
     throw new KvCommandError(isTimeout ? `KV request timed out after ${DEFAULT_TIMEOUT_MS}ms` : `KV request failed: ${message}`, null)
   } finally {
     clearTimeout(timeoutHandle)
   }
-
-  const body = (await response.json().catch(() => null)) as { result?: unknown; error?: string } | null
-  if (!response.ok) {
-    throw new KvCommandError(`KV command failed (${response.status}): ${body?.error ?? response.statusText}`, response.status)
-  }
-  return body?.result
 }
 
 /**

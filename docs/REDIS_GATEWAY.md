@@ -1,3 +1,124 @@
+## 2026-11-26 Vercel transport incident
+
+**Symptom:** after Gateway v0.3.0 went live, every Dashboard load logged
+`[registry] ... lookup failed: Redis Gateway request timed out after
+15000ms` for every service, plus `[releases/environment-state] ... failed`
+and `[builds/[runId]] appendBuildAudit failed` — i.e. **every** op, reads
+and writes alike, from the Vercel runtime specifically. Batching/
+concurrency work (see the earlier commit reducing the per-load request
+count from ~70 to ~24) did **not** fix it: the request *count* was never
+the problem — every individual request was failing the same way.
+
+**What we confirmed before touching anything:**
+- A PowerShell client hitting the Gateway through Cloudflare Access
+  succeeds, from a different network than Vercel's.
+- The Gateway's own v0.3.0 smoke tests passed (from yet another network).
+- The failure is unconditional per-op, not load-dependent — the opposite of
+  an overloaded-server symptom, consistent instead with a transport-level
+  dead end that happens to resolve right at the 15000ms boundary rather
+  than failing fast (a connection attempt that never gets a response at
+  all behaves exactly like this: it doesn't error quickly, it just sits
+  until our own AbortController fires).
+- `REDIS_GATEWAY_URL` resolves to **both** an IPv4 and an IPv6 Cloudflare
+  address from this environment:
+  ```
+  $ nslookup redis-gateway.vknight.io.vn
+  2606:4700:3037::ac43:826e   (AAAA)
+  2606:4700:3035::6815:864    (AAAA)
+  172.67.130.110              (A)
+  104.21.8.100                (A)
+  ```
+  Node's `fetch` (undici) does not race IPv4/IPv6 (no Happy-Eyeballs) — it
+  connects to whichever address `dns.lookup()` returns first, in the
+  platform's default order (`verbatim`, i.e. unmodified getaddrinfo order,
+  often AAAA-first on a dual-stack resolver). If a serverless runtime's
+  outbound network doesn't actually support (or cleanly reject) IPv6 egress
+  to that destination, that single attempt hangs with no fallback — a very
+  well-documented class of bug on constrained/NAT'd serverless networks,
+  and one that explains every observed fact here: it affects every op
+  uniformly, it's unaffected by concurrency, and other clients on other
+  networks are unaffected.
+
+We also found and fixed a **real, independently-confirmed bug** while
+investigating, in both `kv.ts`'s `kvCommandOnce` and `redisGateway.ts`'s
+`gatewayCallOnce`: the abort timeout was cleared right after `fetch()`
+itself resolved (i.e. once response *headers* arrived), **before**
+`response.json()`/`.text()` was awaited — so a connection that connected
+and sent headers promptly, but then stalled mid-body, had **no timeout at
+all** protecting the body read. This is not what produced the specific
+`"timed out after 15000ms"` message being seen (that message only fires
+from the pre-headers `AbortError` path), but it's a real latent hang risk
+in its own right, now fixed and regression-tested
+(`redisGatewayTransport.test.ts`'s "timeout covers body read" test actually
+exercises a server that sends headers then stalls, proving the fix).
+
+**What shipped (all client-side, nothing in Gateway infra, no timeout
+change):**
+- **`instrumentation.ts`** (new): calls `dns.setDefaultResultOrder('ipv4first')`
+  once at server boot, in the Node.js runtime only. This is a process-wide
+  DNS *address-family ordering* change — not a TLS change — and applies
+  equally to every outbound Node connection in this app (Gateway, GitHub,
+  Docker Hub, Deploy Agent); none of those are known to need IPv6, so this
+  is a safe default. Overridable without a redeploy via `DNS_RESULT_ORDER`
+  (`ipv4first` default, or `verbatim` to restore Node's own default).
+- **`lib/redisGatewayTransport.ts`** (new): extracts the Gateway's HTTP
+  transport behind a small interface, with two implementations:
+  - `fetch` (default): the same fetch-based call as before, but the abort
+    timeout now demonstrably covers the full lifecycle including body
+    consumption (the bug above), and it validates the raw response before
+    trusting it (see `gatewayCallOnce` below).
+  - `https-agent` (opt-in via `REDIS_GATEWAY_TRANSPORT=https-agent`): a
+    dedicated `node:https.Agent` with `keepAlive` and an explicit `family: 4`
+    (IPv4) preference, plus real socket-level phase timing (DNS lookup / TCP
+    connect / TLS handshake / time-to-first-byte) — useful both as a
+    fallback transport if `fetch`'s behavior is ever itself the problem, and
+    as the more detailed half of the diagnostic endpoint below. Standard TLS
+    certificate verification is never weakened (`rejectUnauthorized`'s
+    default of `true` is never overridden). Off by default — never changes
+    behavior unless explicitly selected.
+- **`gatewayCallOnce`** (`redisGateway.ts`) now validates the raw response
+  before trusting it, instead of just checking `response.ok`:
+  - a 3xx is rejected explicitly (never silently followed, never mistaken
+    for the Gateway's own response) — signals a Cloudflare Access/WAF/
+    login page in front of the Gateway, not a Gateway-side failure;
+  - an HTML body is rejected explicitly (classic WAF/challenge-page
+    signature) instead of failing confusingly deep inside `JSON.parse`;
+  - a 2xx body that isn't valid JSON, or that's JSON but missing both
+    `result`/`error`, is rejected explicitly instead of silently becoming
+    `result: undefined` (which would be indistinguishable from a real null
+    result);
+  - a network error's POSIX code (`ECONNRESET`, `ETIMEDOUT`, `ENOTFOUND`, …)
+    is now included in the thrown message when available — real diagnostic
+    value, never sensitive, never a credential/header/body value.
+- **`GET /api/admin/redis-diagnostics`** (new, admin-gated, read-only):
+  compares `fetch` vs. `node:https` transports, each doing `GET /health`
+  (best-effort — not part of the documented Gateway contract, so a 404
+  there is itself a successful transport result) and `POST /v1/redis` with
+  `get`/`mget` against two synthetic, never-written keys
+  (`o24:diag:ping[2]`) — never real release/audit/user data. Reports DNS
+  resolution (duration, every resolved address + family — the IPv4/IPv6
+  evidence above, captured fresh from wherever this is actually running),
+  HTTP status, content-type, `CF-Ray`, redirect detection, body length (not
+  content), phase timings, and sanitized network error codes. Never returns
+  response bodies, header values, the Gateway token, or CF-Access secrets.
+
+**This incident is not closed by this commit.** Nobody on this task has
+network access to `redis-gateway.vknight.io.vn` or to the live Vercel
+deployment from the environment these changes were written in (the same
+limitation noted below, under "Validation status", when this document was
+first written) — so the DNS evidence above and the body-read-timeout fix
+are both real, but the IPv4-preference hypothesis they motivate is NOT yet
+confirmed against production. Deploy this, then call
+`GET /api/admin/redis-diagnostics` from the actual Vercel deployment and
+compare: a true transport-layer fix shows up as every probe succeeding with
+a real `httpStatus` and timings in the tens-to-low-hundreds of
+milliseconds, not as a 15000ms-bounded `errorCode: 'TIMEOUT'`. If `fetch`
+probes still hang after the DNS fix but `https-agent` probes succeed, set
+`REDIS_GATEWAY_TRANSPORT=https-agent` in production and re-run the
+diagnostic to confirm before relying on it.
+
+---
+
 # Redis / KV storage: Upstash vs the self-hosted HTTP Gateway
 
 Control Center's audit log, release snapshots, build pointers, snapshot-job
@@ -36,6 +157,15 @@ CF_ACCESS_CLIENT_ID=
 CF_ACCESS_CLIENT_SECRET=
 # optional, falls back to KV_REQUEST_TIMEOUT_MS then 5000ms
 REDIS_GATEWAY_TIMEOUT_MS=
+
+# optional — "fetch" (default) or "https-agent" (see the 2026-11-26
+# transport-incident note above). Only switch this after confirming via
+# GET /api/admin/redis-diagnostics that https-agent actually helps.
+REDIS_GATEWAY_TRANSPORT=
+
+# optional — "ipv4first" (default, set in instrumentation.ts) or "verbatim"
+# to restore Node's own default DNS address-family ordering process-wide.
+DNS_RESULT_ORDER=
 ```
 
 `REDIS_PROVIDER=http` is an explicit choice: if `REDIS_GATEWAY_URL` or

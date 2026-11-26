@@ -38,6 +38,16 @@ function okResponse(result: unknown): Response {
   return new Response(JSON.stringify({ result }), { status: 200, headers: { 'content-type': 'application/json' } })
 }
 
+/** Captures the actual rejection from an async call, for assertions beyond "it threw" (message/status/type). */
+async function captureRejection(fn: () => Promise<unknown>): Promise<unknown> {
+  try {
+    await fn()
+  } catch (error) {
+    return error
+  }
+  throw new Error('expected fn() to reject, but it resolved')
+}
+
 // ---- gatewayCall: request shape, auth headers, retry policy ----
 
 test('gatewayCall posts {op,...params} to {url}/v1/redis with bearer auth and no-store', async () => {
@@ -126,6 +136,88 @@ test('a network failure during a write op propagates a GatewayCommandError, neve
     await assert.rejects(() => gatewaySet(CONFIG, 'k', 'v'), GatewayCommandError)
   } finally {
     globalThis.fetch = originalFetch
+  }
+})
+
+test('a network error carrying a POSIX error code (e.g. ECONNRESET) surfaces that code in the thrown message, never the request body/headers', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => {
+    const error = new Error('socket hang up') as Error & { code?: string }
+    error.code = 'ECONNRESET'
+    throw error
+  }) as typeof fetch
+  try {
+    const error = await captureRejection(() => gatewayCall(CONFIG, 'get', { key: 'foo' }))
+    assert.ok(error instanceof GatewayCommandError)
+    assert.match((error as Error).message, /ECONNRESET/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// ---- Transport-level validation (2026-11-26 incident hardening): a
+// redirect, an HTML body, or a malformed/unexpected JSON envelope must each
+// surface as a diagnosable GatewayCommandError — never get silently treated
+// as a successful `result: undefined`, and never crash uncontrollably on
+// JSON.parse. See docs/REDIS_GATEWAY.md. ----
+
+test('a 3xx redirect response is rejected with its real status, never silently followed or treated as success', async () => {
+  const { restore, callCount } = mockFetchSequence([() => new Response(null, { status: 302, headers: { Location: '/login' } })])
+  try {
+    const error = await captureRejection(() => gatewayCall(CONFIG, 'get', { key: 'foo' }))
+    assert.ok(error instanceof GatewayCommandError)
+    assert.match((error as Error).message, /redirect/i)
+    assert.equal((error as GatewayCommandError).status, 302)
+    // 302 is neither null nor >=500, so it is NOT retried — a redirect is a
+    // deterministic condition, not transient server noise.
+    assert.equal(callCount(), 1)
+  } finally {
+    restore()
+  }
+})
+
+test('an HTML response (e.g. a WAF/challenge page) is rejected with a distinguishing error, not a JSON.parse crash', async () => {
+  const { restore } = mockFetchSequence([
+    () => new Response('<html><body>Attention Required! | Cloudflare</body></html>', { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } }),
+  ])
+  try {
+    const error = await captureRejection(() => gatewayCall(CONFIG, 'get', { key: 'foo' }))
+    assert.ok(error instanceof GatewayCommandError)
+    assert.match((error as Error).message, /HTML/)
+  } finally {
+    restore()
+  }
+})
+
+test('a 2xx body that is not valid JSON is rejected with a clear error, not swallowed into result: undefined', async () => {
+  const { restore } = mockFetchSequence([() => new Response('not json at all', { status: 200, headers: { 'content-type': 'application/json' } })])
+  try {
+    const error = await captureRejection(() => gatewayCall(CONFIG, 'get', { key: 'foo' }))
+    assert.ok(error instanceof GatewayCommandError)
+    assert.match((error as Error).message, /not valid JSON/)
+  } finally {
+    restore()
+  }
+})
+
+test('a 2xx JSON body missing both "result" and "error" is rejected as an unexpected envelope, not silently returned as undefined', async () => {
+  const { restore } = mockFetchSequence([() => new Response(JSON.stringify({ status: 'ok' }), { status: 200, headers: { 'content-type': 'application/json' } })])
+  try {
+    const error = await captureRejection(() => gatewayCall(CONFIG, 'get', { key: 'foo' }))
+    assert.ok(error instanceof GatewayCommandError)
+    assert.match((error as Error).message, /unexpected response shape/)
+  } finally {
+    restore()
+  }
+})
+
+test('a 2xx body with an explicit null result is still a valid, successful envelope (e.g. GET on a missing key)', async () => {
+  const { restore } = mockFetchSequence([() => okResponse(null)])
+  try {
+    const result = await gatewayCall(CONFIG, 'get', { key: 'missing' })
+    assert.equal(result, null)
+  } finally {
+    restore()
   }
 })
 
