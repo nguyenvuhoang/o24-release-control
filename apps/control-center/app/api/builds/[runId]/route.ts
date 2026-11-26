@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server'
+import { NextResponse, after } from 'next/server'
 import { appendBuildAudit } from '../../../../lib/audit'
 import { requireApiSession, errorResponse } from '../../../../lib/api'
 import { getWorkflowRun } from '../../../../lib/github/client'
@@ -29,34 +29,48 @@ export async function GET(request: Request, { params }: { params: Promise<{ runI
   }
 
   // Everything below is best-effort enrichment — a durable-storage hiccup
-  // here must never mask an otherwise-successful GitHub status read.
-  try {
-    await appendBuildAudit(run, service, session.username)
-  } catch (auditError) {
-    console.error('[builds/runId] appendBuildAudit failed', {
-      service,
-      runId: numericRunId,
-      error: auditError instanceof Error ? auditError.message : 'Unknown error',
-    })
-  }
-  if (service && isBuildServiceCode(service)) {
+  // (or, per docs/REDIS_GATEWAY.md, an outright 15s Gateway transport hang)
+  // here must never mask an otherwise-successful GitHub status read, AND
+  // must never delay delivering it either: this used to be awaited before
+  // the response was sent, so a slow/hung Redis Gateway added its own
+  // latency directly onto every live-build poll — on an in-progress run
+  // this is a cheap no-op (see appendBuildAudit/createReleaseSnapshotFor
+  // CompletedBuild's `run.status !== 'completed'` early-outs) so it never
+  // showed up outside the one poll that first observes completion, but
+  // THAT is exactly the poll useBuildTracker needs to actually see in
+  // order to leave "in_progress"/BUILDING — a function kill or client
+  // timeout on it reads as live tracking having silently frozen even
+  // though GitHub Actions itself finished. after() runs this once the
+  // response below has already reached the browser.
+  after(async () => {
     try {
-      // Poll route = fallback/reconciliation path (the webhook is
-      // primary) — a single attempt is enough here since this route gets
-      // hit repeatedly anyway; attemptSnapshotAndPersistPending also
-      // hands off to the durable job queue on 'digest_not_found', same as
-      // the webhook.
-      await attemptSnapshotAndPersistPending(run, service, session.username)
-    } catch (snapshotError) {
-      // Best-effort, same non-blocking contract as appendBuildAudit above —
-      // a snapshot-creation hiccup must never fail an otherwise-successful
-      // status poll.
-      console.error('[builds/runId] attemptSnapshotAndPersistPending failed', {
+      await appendBuildAudit(run, service, session.username)
+    } catch (auditError) {
+      console.error('[builds/runId] appendBuildAudit failed', {
         service,
         runId: numericRunId,
-        error: snapshotError instanceof Error ? snapshotError.message : 'Unknown error',
+        error: auditError instanceof Error ? auditError.message : 'Unknown error',
       })
     }
-  }
+    if (service && isBuildServiceCode(service)) {
+      try {
+        // Poll route = fallback/reconciliation path (the webhook is
+        // primary) — a single attempt is enough here since this route gets
+        // hit repeatedly anyway; attemptSnapshotAndPersistPending also
+        // hands off to the durable job queue on 'digest_not_found', same as
+        // the webhook.
+        await attemptSnapshotAndPersistPending(run, service, session.username)
+      } catch (snapshotError) {
+        // Best-effort, same non-blocking contract as appendBuildAudit above —
+        // a snapshot-creation hiccup must never fail an otherwise-successful
+        // status poll.
+        console.error('[builds/runId] attemptSnapshotAndPersistPending failed', {
+          service,
+          runId: numericRunId,
+          error: snapshotError instanceof Error ? snapshotError.message : 'Unknown error',
+        })
+      }
+    }
+  })
   return NextResponse.json(run)
 }

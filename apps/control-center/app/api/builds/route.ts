@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server'
+import { NextResponse, after } from 'next/server'
 import { requireApiSession } from '../../../lib/api'
 import { recordBuildIntent, recordDispatchedRun } from '../../../lib/buildPointerStore'
 import { GithubPermissionError, GithubRateLimitError, getConfiguredBuildBranch, triggerWorkflowBuild } from '../../../lib/github/client'
@@ -48,36 +48,40 @@ export async function POST(request: Request) {
 
   try {
     const run = await triggerWorkflowBuild({ service, branch, tag })
-    try {
-      // Best-effort hint for /api/builds/latest's fallback path — never let
-      // a storage hiccup here fail an otherwise-successful dispatch.
-      await recordDispatchedRun(service, run.runId)
-    } catch (pointerError) {
-      console.error('[builds] recordDispatchedRun failed', {
-        service,
-        runId: run.runId,
-        error: pointerError instanceof Error ? pointerError.message : 'Unknown error',
-      })
-    }
-    try {
-      // Same best-effort contract: a GitHub build that already dispatched
-      // successfully must never fail the request just because recording who
-      // asked for it hit a storage hiccup.
-      await recordBuildIntent({
-        runId: run.runId,
-        service,
-        branch,
-        tag,
-        requestedBy: session.username,
-        requestedAt: new Date().toISOString(),
-      })
-    } catch (intentError) {
-      console.error('[builds] recordBuildIntent failed', {
-        service,
-        runId: run.runId,
-        error: intentError instanceof Error ? intentError.message : 'Unknown error',
-      })
-    }
+    // Best-effort pointer-recording, deferred past the response the same
+    // way and for the same reason as the two poll routes' enrichment calls
+    // (see app/api/builds/[runId]/route.ts) — a GitHub dispatch that
+    // already succeeded must never have its response held up (or, under a
+    // hung Redis Gateway, potentially never delivered at all) just because
+    // recording who asked for it hit a storage hiccup.
+    after(async () => {
+      try {
+        // Best-effort hint for /api/builds/latest's fallback path.
+        await recordDispatchedRun(service, run.runId)
+      } catch (pointerError) {
+        console.error('[builds] recordDispatchedRun failed', {
+          service,
+          runId: run.runId,
+          error: pointerError instanceof Error ? pointerError.message : 'Unknown error',
+        })
+      }
+      try {
+        await recordBuildIntent({
+          runId: run.runId,
+          service,
+          branch,
+          tag,
+          requestedBy: session.username,
+          requestedAt: new Date().toISOString(),
+        })
+      } catch (intentError) {
+        console.error('[builds] recordBuildIntent failed', {
+          service,
+          runId: run.runId,
+          error: intentError instanceof Error ? intentError.message : 'Unknown error',
+        })
+      }
+    })
     const response: BuildTriggerResponse = {
       success: true,
       service,

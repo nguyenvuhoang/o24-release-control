@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server'
+import { NextResponse, after } from 'next/server'
 import { appendBuildAudit } from '../../../../lib/audit'
 import { requireApiSession, errorResponse } from '../../../../lib/api'
 import { getLastDispatchedRun } from '../../../../lib/buildPointerStore'
@@ -65,30 +65,35 @@ export async function GET(request: Request) {
   // Telegram and nobody ever polled /api/builds/{runId} for it) — record
   // it now so the audit trail doesn't miss builds that didn't originate
   // in this app. Idempotent: harmless if the per-run poll route already
-  // recorded the same runId+attempt. Best-effort: a durable-storage hiccup
-  // here must never mask an otherwise-successful GitHub status read (see
-  // the module doc comment).
-  try {
-    await appendBuildAudit(run, service, session.username)
-  } catch (auditError) {
-    console.error('[builds/latest] appendBuildAudit failed', {
-      service,
-      runId: run.runId,
-      error: auditError instanceof Error ? auditError.message : 'Unknown error',
-    })
-  }
-  try {
-    // Fallback/reconciliation path (the webhook is primary) — see
-    // app/api/builds/[runId]/route.ts's identical comment.
-    await attemptSnapshotAndPersistPending(run, service, session.username)
-  } catch (snapshotError) {
-    // Best-effort, same non-blocking contract as appendBuildAudit above.
-    console.error('[builds/latest] attemptSnapshotAndPersistPending failed', {
-      service,
-      runId: run.runId,
-      error: snapshotError instanceof Error ? snapshotError.message : 'Unknown error',
-    })
-  }
+  // recorded the same runId+attempt. Best-effort AND non-blocking: a
+  // durable-storage hiccup (or a hung Redis Gateway transport, see
+  // docs/REDIS_GATEWAY.md) here must never mask, nor delay delivering, an
+  // otherwise-successful GitHub status read — see app/api/builds/[runId]/
+  // route.ts's identical after() comment for why this used to be awaited
+  // before responding, and what that cost live tracking.
+  after(async () => {
+    try {
+      await appendBuildAudit(run, service, session.username)
+    } catch (auditError) {
+      console.error('[builds/latest] appendBuildAudit failed', {
+        service,
+        runId: run.runId,
+        error: auditError instanceof Error ? auditError.message : 'Unknown error',
+      })
+    }
+    try {
+      // Fallback/reconciliation path (the webhook is primary) — see
+      // app/api/builds/[runId]/route.ts's identical comment.
+      await attemptSnapshotAndPersistPending(run, service, session.username)
+    } catch (snapshotError) {
+      // Best-effort, same non-blocking contract as appendBuildAudit above.
+      console.error('[builds/latest] attemptSnapshotAndPersistPending failed', {
+        service,
+        runId: run.runId,
+        error: snapshotError instanceof Error ? snapshotError.message : 'Unknown error',
+      })
+    }
+  })
 
   const response: LatestBuildResponse = { service, ...run }
   return NextResponse.json(response)
