@@ -49,7 +49,7 @@ function handleKvCommand(store: MockKvStore, command: unknown[]): unknown {
 
 function makeJobStore(): { jobStore: InstanceType<typeof KvSnapshotJobStore>; kv: MockKvStore } {
   const kv: MockKvStore = { strings: new Map(), zsets: new Map() }
-  const config = { url: 'https://fake-kv.example.com', token: 'fake-token' }
+  const config = { provider: 'upstash' as const, url: 'https://fake-kv.example.com', token: 'fake-token' }
   const originalFetch = globalThis.fetch
   globalThis.fetch = (async (_url: string | URL, init?: RequestInit) => {
     const command = JSON.parse(String(init?.body))

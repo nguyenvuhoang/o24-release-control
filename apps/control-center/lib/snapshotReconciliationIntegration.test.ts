@@ -78,7 +78,7 @@ function makeWorkflowRunPayload(runId: number) {
 
 test('full lifecycle: webhook exhausts immediate retries with digest still missing -> persists a durable job -> a LATER cron run resolves it into exactly one snapshot', async () => {
   const kv: MockKvStore = { strings: new Map(), zsets: new Map() }
-  const config = { url: 'https://fake-kv.example.com', token: 'fake-token' }
+  const config = { provider: 'upstash' as const, url: 'https://fake-kv.example.com', token: 'fake-token' }
   const jobStore = new KvSnapshotJobStore(config)
   const releaseRepo = new InMemoryReleaseRepository()
   const originalFetch = globalThis.fetch

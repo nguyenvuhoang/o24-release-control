@@ -1,16 +1,56 @@
-// Shared Redis-REST client (Vercel KV and Upstash Redis both speak the same
-// single-command REST protocol: POST {url} with a JSON command array, Bearer
-// token auth) — no extra npm dependency needed. Used by both the audit trail
-// (auditRepository.ts) and the build-pointer hint store (buildPointerStore.ts)
-// so there is exactly one place that knows how to talk to KV.
+// Shared Redis client. Every repository (audit, releases, build pointers,
+// snapshot jobs, users) builds a raw Redis command array — `['SET', key,
+// value, 'NX']`, `['ZADD', key, score, member]`, etc. — and calls
+// kvCommand(config, command) without caring which backend answers it. Which
+// backend that is is the ONE thing this file decides, via REDIS_PROVIDER:
+//  - unset / "upstash" (default): Vercel KV / Upstash Redis's REST protocol
+//    (POST {url} with the command array as the body, Bearer token auth).
+//  - "http": the self-hosted HTTP Redis Gateway (see ./redisGateway.ts),
+//    which speaks a different, more restricted protocol (POST {url}/v1/redis
+//    with {op, ...} — see docs/REDIS_GATEWAY.md) that redisGateway.ts
+//    translates each command array into.
+// Resolved fresh on every call rather than cached in a module-level
+// singleton, specifically so a Next.js dev hot-reload can never leave a
+// request running against a stale provider selection.
 
-export type KvConfig = { url: string; token: string }
+import {
+  gatewayExecuteRedisCommand,
+  resolveGatewayConfig,
+  type GatewayConfig,
+} from './redisGateway'
+
+export type KvConfig = { provider: 'upstash'; url: string; token: string } | { provider: 'http'; gateway: GatewayConfig }
+
+export class RedisConfigError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RedisConfigError'
+  }
+}
+
+function resolveProviderKind(): 'upstash' | 'http' {
+  return (process.env.REDIS_PROVIDER ?? '').trim().toLowerCase() === 'http' ? 'http' : 'upstash'
+}
 
 export function resolveKvConfig(): KvConfig | null {
+  if (resolveProviderKind() === 'http') {
+    const gateway = resolveGatewayConfig()
+    if (!gateway) {
+      // REDIS_PROVIDER=http is an explicit choice, not "KV isn't configured"
+      // — silently falling back to the in-memory/file tiers here would hide
+      // a real misconfiguration behind what looks like a healthy (but
+      // non-durable) response. Fail loud instead.
+      throw new RedisConfigError(
+        'REDIS_PROVIDER=http but REDIS_GATEWAY_URL/REDIS_GATEWAY_TOKEN are not both set — refusing to silently fall back to in-memory/file storage',
+      )
+    }
+    return { provider: 'http', gateway }
+  }
+
   const url = process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL
   const token = process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN
   if (!url || !token) return null
-  return { url, token }
+  return { provider: 'upstash', url, token }
 }
 
 // Bounded per-attempt timeout — a hung KV connection on a serverless
@@ -49,7 +89,7 @@ function isTransient(error: unknown): boolean {
   return true // network/timeout errors never reach KvCommandError construction
 }
 
-async function kvCommandOnce(config: KvConfig, command: (string | number)[]): Promise<unknown> {
+async function kvCommandOnce(config: { url: string; token: string }, command: (string | number)[]): Promise<unknown> {
   const controller = new AbortController()
   const timeoutHandle = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
   let response: Response
@@ -82,9 +122,15 @@ async function kvCommandOnce(config: KvConfig, command: (string | number)[]): Pr
  * the ONE place every KV-backed repository (audit, releases, build
  * pointers, snapshot jobs, users) goes through, so hardening it here fixes
  * the shared chokepoint behind the simultaneous audit/snapshot/registry/
- * login failures observed in production.
+ * login failures observed in production. Under REDIS_PROVIDER=http this
+ * delegates the whole command to redisGateway.ts instead — see that file's
+ * gatewayExecuteRedisCommand for the Gateway's own retry/timeout handling.
  */
 export async function kvCommand(config: KvConfig, command: (string | number)[]): Promise<unknown> {
+  if (config.provider === 'http') {
+    return gatewayExecuteRedisCommand(config.gateway, command)
+  }
+
   let attempt = 0
   for (;;) {
     try {
