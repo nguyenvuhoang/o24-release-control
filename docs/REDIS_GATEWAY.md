@@ -6,7 +6,15 @@ queue and user store all go through one chokepoint:
 repository builds a raw Redis command array (`['SET', key, value, 'NX']`,
 `['ZADD', key, score, member]`, ...) exactly as it always has — which
 backend actually answers that command is the one thing `REDIS_PROVIDER`
-decides.
+decides. `apps/control-center/lib/redisGateway.ts` is the adapter for the
+self-hosted Gateway half of that decision, and this document is its
+contract.
+
+**Status:** this document specifies Gateway **v0.3.0**, which does not
+exist yet — it is the target the vKnight team will build the standalone
+Gateway against. The adapter in this repo (`lib/redisGateway.ts`) already
+calls every op below exactly as specified here; it has not been run against
+a live v0.3.0 instance (see "Validation status" below).
 
 ## Environment variables
 
@@ -36,90 +44,371 @@ REDIS_GATEWAY_TIMEOUT_MS=
 tiers — a misconfigured Production deploy must fail loudly, not look healthy
 while quietly losing durability.
 
-## Gateway contract
+## Transport
 
-`POST {REDIS_GATEWAY_URL}/v1/redis`, body `{"op": "...", ...}`, response
-`{"result": ...}`. Auth: `Authorization: Bearer <REDIS_GATEWAY_TOKEN>` plus
-`CF-Access-Client-Id` / `CF-Access-Client-Secret` when set. Every request
-uses `cache: 'no-store'` and a bounded timeout (`lib/redisGateway.ts`).
+`POST {REDIS_GATEWAY_URL}/v1/redis`, one op per request, body
+`{"op": "<name>", ...params}`, success response `{"result": <value>}`.
 
-Gateway v0.2.0 documents exactly 14 ops: `get`, `set`, `del`, `exists`,
-`ttl`, `pttl`, `expire`, `getdel`, `incr`, `rateLimit`, `sadd`, `srem`,
-`smembers`, `scard`, `compareAndDelete`. There is no arbitrary-command or
-Lua-execution escape hatch, by design.
-
-## How raw Redis commands map onto that contract
-
-| Redis command used by a repository | Under `REDIS_PROVIDER=http` |
-| --- | --- |
-| `GET`, `DEL`, `EXISTS`, `TTL`, `PTTL`, `EXPIRE`, `GETDEL`, `INCR` | 1:1 to the matching op |
-| `SET key value` (no flags) | `set` |
-| `SET key value EX sec \| PX ms` (no `NX`) | `set` then `expire` — two calls, not atomic, but this path is only ever used for a best-effort cache write (`w4sGraph`'s dependency-graph cache) that already tolerates a failed/lost write |
-| `SET key value NX [EX \| PX]` | **Emulated**, not 1:1 — see "SET NX" below |
-| `MGET k1 k2 ...` | fanned out to one `get` per key (`Promise.all`) — MGET's only job here is a batch-read optimization, not an atomicity requirement |
-| `SADD`, `SREM`, `SMEMBERS`, `SCARD` | 1:1 |
-| `LPUSH`, `LTRIM`, `LRANGE` | **Not supported** — throws `GatewayUnsupportedCommandError` |
-| `ZADD`, `ZREM`, `ZREVRANGE`, `ZRANGEBYSCORE` | **Not supported** — throws `GatewayUnsupportedCommandError` |
-
-### `SET ... NX` (atomic append-if-absent)
-
-This is the single most important guarantee in the codebase — it's what
-makes audit append, release-snapshot create and user create-if-absent
-idempotent, and what backs `w4sGraph`'s cross-instance build lock. Gateway
-v0.2.0 has no `setnx`/conditional-set op, so it's built entirely from ops
-that genuinely are atomic, never from an unsafe GET-then-SET race:
-
-1. `sadd(key + ":__nx_claim", "1")` — atomic; the return value (1 = we
-   claimed it, 0 = someone else already did) is the ONLY thing that decides
-   who gets to create the record. Two concurrent callers can never both
-   believe they won.
-2. The claim's winner writes the real value (`set`, plus `expire` on both
-   keys if a TTL was requested) and the call returns `'OK'`.
-3. A loser polls `get(key)` briefly (five attempts, 50ms–800ms backoff,
-   ~1.55s worst case) for the winner's write to become visible, then
-   returns `null` — exactly the Upstash `SET NX` contract callers already
-   branch on (`if (setResult !== 'OK') { GET key }`). If the winner's write
-   never becomes visible within that window, it throws rather than return a
-   result that can't actually be confirmed.
-
-### What's genuinely not supported yet
-
-Audit's recent-items index (`LPUSH`/`LTRIM`/`LRANGE`), the release index and
-per-service index (`ZADD`/`ZREVRANGE`), and the snapshot-job retry queue
-(`ZADD`/`ZRANGEBYSCORE`) all need ordering or pagination that `sadd`/
-`smembers` alone can't give you without reconstructing a sorted index
-client-side on every read — not attempted here, to avoid trading one
-request-volume problem for a worse one. Calling these under
-`REDIS_PROVIDER=http` throws `GatewayUnsupportedCommandError` with the
-missing op named; callers propagate that as a controlled error (never a
-silent empty list, never a crash with no explanation).
-
-**To close this gap, the Gateway needs native ops along these lines** (exact
-naming/shape is the Gateway maintainer's call — this is the contract the
-adapter would consume):
-
-```jsonc
-// zadd — add/update a member's score in a sorted set
-{ "op": "zadd", "key": "...", "score": 1732564000000, "member": "release:CMS:123:1" }
--> { "result": 1 }
-
-// zrevrange — highest score first, inclusive start/stop index
-{ "op": "zrevrange", "key": "...", "start": 0, "stop": 49 }
--> { "result": ["release:CMS:200:1", "release:CMS:199:1", ...] }
-
-// zrangebyscore — ascending, inclusive score bounds, optional limit
-{ "op": "zrangebyscore", "key": "...", "min": "-inf", "max": 1732564000000, "limit": 20 }
--> { "result": ["job:CMS:100", ...] }
-
-// zrem — remove a member
-{ "op": "zrem", "key": "...", "member": "..." }
--> { "result": 1 }
+**Headers** (every request):
+```
+Content-Type: application/json
+Authorization: Bearer <REDIS_GATEWAY_TOKEN>
+CF-Access-Client-Id: <CF_ACCESS_CLIENT_ID>        (only if configured)
+CF-Access-Client-Secret: <CF_ACCESS_CLIENT_SECRET> (only if configured)
 ```
 
-Until those exist, `REDIS_PROVIDER=http` is safe to use for build pointers,
-build intents, user accounts and the `w4sGraph` cache/lock, but **not** a
-full replacement for audit listing, release listing or the snapshot-job
-reconciliation queue — see the migration section below.
+**Error response** (any non-2xx status): `{"error": "<human-readable message>"}`.
+The adapter treats the HTTP status, not the body, as authoritative:
+- `4xx` — malformed op/args, bad auth, bad token. Never retried by the
+  adapter (retrying a bad request can't change the outcome).
+- `5xx`, or the request never completing (network error / timeout) —
+  transient. Retried up to twice (3 attempts total, exponential backoff +
+  jitter, 150ms base / 1500ms cap) **except** for the five ops listed under
+  "Non-idempotent ops" below, which are never auto-retried no matter what.
+
+**No arbitrary commands, no Lua.** Every op below is a fixed, individually
+specified operation. The Gateway must reject (400) a request whose `op` is
+not one of these — it must never proxy an arbitrary Redis command string or
+accept a script body.
+
+**Timeouts.** The adapter aborts a request after `REDIS_GATEWAY_TIMEOUT_MS`
+(default 5000ms) and treats the abort as transient. The Gateway's own
+upstream Redis timeout should be comfortably shorter than that so a slow
+Redis produces a clean error response rather than the adapter's own abort
+racing it.
+
+## Non-idempotent ops
+
+`incr`, `getdel`, `rateLimit`, `compareAndDelete`, `lpush` — a blind retry of
+any of these can observe or cause a different outcome than the first
+attempt even when that first attempt actually succeeded server-side before
+the response was lost (double increment, a `getdel` that already consumed
+the value, a rate-limit window counted twice, a compare that no longer
+matches after already deleting, a list push that would append the same
+value twice). The adapter never retries these automatically. Every other op
+reaches the same end state no matter how many times it's applied — this
+includes conditional `set`, because every id/value pair this codebase sends
+is deterministic, so replaying a `SET NX` either re-confirms the same write
+or correctly discovers it already happened.
+
+---
+
+## Operation contracts
+
+Every op's `params` are merged into the request body alongside `"op"`, e.g.
+`{"op": "get", "key": "foo"}`.
+
+### `get`
+
+Read a string key.
+
+```jsonc
+// Request
+{ "op": "get", "key": "o24:audit:record:abc123" }
+// Response — the stored string, or null if the key doesn't exist
+{ "result": "…json string…" }
+{ "result": null }
+```
+Error: none specific to this op beyond the shared contract above.
+
+### `set`
+
+Write a string key, optionally conditional and/or with a TTL. **This is the
+single most important op in the contract** — it backs every idempotent
+create-if-absent in the codebase (audit append, release-snapshot create,
+user create) and the `w4sGraph` cross-instance build lock, and it MUST be
+atomic as a single server-side operation (check-and-write under one lock),
+never decomposed internally into a separate existence check plus a
+separate write.
+
+```jsonc
+// Request — every field except key/value is optional
+{
+  "op": "set",
+  "key": "o24:release:record:release:CMS:123:1",
+  "value": "…json string…",
+  "nx": true,        // optional: only set if the key does NOT already exist
+  "xx": true,        // optional: only set if the key DOES already exist (mutually exclusive with nx)
+  "ex": 120,          // optional: expire after this many seconds
+  "px": 60000         // optional: expire after this many milliseconds (mutually exclusive with ex)
+}
+// Response
+{ "result": "OK" }   // the write happened
+{ "result": null }   // nx/xx condition was not met — nothing was written, nothing was overwritten
+```
+Semantics (must match Redis `SET key value [NX|XX] [EX seconds|PX milliseconds]`):
+- No `nx`/`xx`: always writes and returns `"OK"`.
+- `nx: true`: writes only if the key is absent. Returns `"OK"` if it wrote, `null` if the key already existed (value is untouched).
+- `xx: true`: writes only if the key already exists. Returns `"OK"` if it wrote, `null` if the key was absent (nothing is created).
+- `ex`/`px`: sets/replaces the key's TTL as part of the same write when the write happens; irrelevant when the write didn't happen (`null` case) — no TTL is touched on an existing, untouched key.
+- `ex` and `px` are mutually exclusive, as are `nx` and `xx`; sending both of a pair is a 400.
+- Error: 400 if `key`/`value` is missing or either exclusive pair is both set.
+
+### `del`
+
+```jsonc
+{ "op": "del", "key": "o24:build:pointer:CMS" }
+// Response: number of keys actually removed (0 or 1 here — this adapter never sends multiple keys)
+{ "result": 1 }
+```
+
+### `exists`
+
+```jsonc
+{ "op": "exists", "key": "o24:user:record:admin" }
+// Response: 1 if the key exists, 0 otherwise
+{ "result": 1 }
+```
+
+### `ttl` / `pttl`
+
+Remaining time-to-live.
+
+```jsonc
+{ "op": "ttl", "key": "o24:depgraph:lock:nguyenvuhoang/w4s:abc" }
+// Response: seconds remaining; -1 if the key exists with no TTL; -2 if the key doesn't exist
+{ "result": 42 }
+```
+`pttl` is identical except the result is milliseconds.
+
+### `expire`
+
+Set (or replace) a key's TTL in seconds, without touching its value.
+
+```jsonc
+{ "op": "expire", "key": "o24:depgraph:cache:...", "seconds": 300 }
+// Response: 1 if the TTL was set, 0 if the key doesn't exist
+{ "result": 1 }
+```
+
+### `getdel`
+
+Atomically read a key and delete it in the same operation.
+
+```jsonc
+{ "op": "getdel", "key": "..." }
+// Response: the value that was there (now deleted), or null if the key didn't exist
+{ "result": "…" }
+```
+Non-idempotent: a retried `getdel` would see `null` even if the first,
+unacknowledged attempt actually succeeded — never auto-retried.
+
+### `incr`
+
+Atomically increment an integer-valued key (creating it at 0 first if absent).
+
+```jsonc
+{ "op": "incr", "key": "o24:counter:..." }
+// Response: the value AFTER incrementing
+{ "result": 6 }
+```
+Error: 400 if the existing value isn't a valid integer string. Non-idempotent.
+
+### `rateLimit`
+
+Atomic fixed-window rate check-and-increment. Not currently called by any
+repository in this codebase — specified here for completeness/future use
+(e.g. login-attempt throttling).
+
+```jsonc
+{ "op": "rateLimit", "key": "login:admin", "limit": 5, "windowSeconds": 60 }
+// Response
+{ "result": { "allowed": true, "remaining": 2 } }
+{ "result": { "allowed": false, "remaining": 0 } }
+```
+`allowed: false` means this call itself was counted against the window and
+rejected (i.e. calling it IS the attempt — it's not a side-effect-free
+peek). Non-idempotent.
+
+### `sadd` / `srem` / `smembers` / `scard`
+
+Unordered string set membership.
+
+```jsonc
+{ "op": "sadd", "key": "...", "member": "..." }
+// Response: 1 if newly added, 0 if it was already a member
+{ "result": 1 }
+
+{ "op": "srem", "key": "...", "member": "..." }
+// Response: 1 if removed, 0 if it wasn't a member
+{ "result": 1 }
+
+{ "op": "smembers", "key": "..." }
+// Response: all members, any order
+{ "result": ["a", "b", "c"] }
+
+{ "op": "scard", "key": "..." }
+// Response: member count (0 if the key doesn't exist)
+{ "result": 3 }
+```
+
+### `compareAndDelete`
+
+Atomic CAS delete: remove a key only if its current value matches exactly.
+Not currently called by any repository (the one lock in this codebase,
+`w4sGraph`'s build-graph lock, relies on TTL expiry rather than an explicit
+release) — specified here for completeness/future use by any future
+explicit lock-release path.
+
+```jsonc
+{ "op": "compareAndDelete", "key": "...", "value": "expected-current-value" }
+// Response: true if it matched and was deleted, false if the value didn't match (key untouched) or the key didn't exist
+{ "result": true }
+```
+Non-idempotent.
+
+### `mget`
+
+Batch read. **New in v0.3.0** — v0.2.0 had no batch-read op, so the adapter
+previously fanned this out into N separate `get` calls; this must now be one
+request.
+
+```jsonc
+{ "op": "mget", "keys": ["o24:release:record:a", "o24:release:record:b"] }
+// Response: one entry per input key, SAME ORDER, null for any key that doesn't exist
+{ "result": ["…json…", null] }
+```
+Error: 400 if `keys` is missing, not an array, or empty (the adapter never
+sends an empty array — it short-circuits to `[]` without a request).
+
+### `lpush`
+
+Prepend a value to a list (creating it if absent). **New in v0.3.0.**
+
+```jsonc
+{ "op": "lpush", "key": "o24:audit:index", "value": "record-id-123" }
+// Response: the list's length AFTER the push
+{ "result": 42 }
+```
+Non-idempotent (each call appends one more element, by design — used for a
+recent-items index where every append must count).
+
+### `ltrim`
+
+Keep only the elements within an inclusive index range, dropping the rest.
+**New in v0.3.0.**
+
+```jsonc
+{ "op": "ltrim", "key": "o24:audit:index", "start": 0, "stop": 999 }
+// Response: simple confirmation
+{ "result": "OK" }
+```
+`start`/`stop` are 0-based list indices (0 = head/most-recently-pushed end,
+since every push in this codebase is `lpush`), **inclusive on both ends**,
+matching Redis `LTRIM`. Negative indices (Redis-style, -1 = last element) are
+part of the contract even though this adapter never sends one today. If the
+key doesn't exist, this is a no-op (not an error). Idempotent — trimming to
+the same bounds twice has the same result.
+
+### `lrange`
+
+Read a range of list elements without removing them. **New in v0.3.0.**
+
+```jsonc
+{ "op": "lrange", "key": "o24:audit:index", "start": 0, "stop": 29 }
+// Response: elements from start to stop inclusive, in list order (head first)
+{ "result": ["id-30", "id-29", "...", "id-1"] }
+```
+Same inclusive 0-based (negative-capable) index semantics as `ltrim`. Empty
+array if the key doesn't exist or the range is out of bounds — never an
+error for an out-of-range request.
+
+### `zadd`
+
+Add or update a member's score in a sorted set (creating the set if absent).
+**New in v0.3.0.**
+
+```jsonc
+{ "op": "zadd", "key": "o24:release:index", "score": 1732564000000, "member": "release:CMS:123:1" }
+// Response: 1 if the member was newly added, 0 if it already existed (its score was just updated)
+{ "result": 1 }
+```
+`score` is a float (this codebase always sends an integer epoch-ms
+timestamp, via `Date.parse(...)`, but the Gateway must accept any IEEE-754
+double). Idempotent — adding the same member at the same score twice leaves
+the set unchanged.
+
+### `zrem`
+
+Remove a member from a sorted set.
+
+```jsonc
+{ "op": "zrem", "key": "o24:snapshot-job:pending", "member": "job-id" }
+// Response: 1 if removed, 0 if it wasn't a member
+{ "result": 1 }
+```
+
+### `zrevrange`
+
+Read members by rank, **highest score first**, inclusive 0-based index range.
+**New in v0.3.0.**
+
+```jsonc
+{ "op": "zrevrange", "key": "o24:release:index", "start": 0, "stop": 49 }
+// Response: up to 50 members, newest (highest score) first
+{ "result": ["release:CMS:200:1", "release:CMS:199:1", "..."] }
+```
+`start`/`stop` are ranks (0 = highest score), inclusive both ends,
+negative-index-capable (Redis `ZREVRANGE` semantics). Empty array if the key
+doesn't exist.
+
+### `zrangebyscore`
+
+Read members whose score falls within an inclusive range, **ascending by
+score** (lowest first), with an optional offset/count page. **New in
+v0.3.0.**
+
+```jsonc
+// Request — "offset"/"count" are both present or both absent
+{ "op": "zrangebyscore", "key": "o24:snapshot-job:pending", "min": "-inf", "max": "1732564000000", "offset": 0, "count": 20 }
+// Response: up to `count` members (or all matching, if offset/count are omitted), ascending score
+{ "result": ["job:CMS:100", "job:CMS:101"] }
+```
+- `min`/`max` are strings so `"-inf"` / `"+inf"` can be sent (as Redis
+  itself requires); a finite bound is sent as the decimal string of a
+  number (e.g. `"1732564000000"`). Both bounds are **inclusive** — this
+  adapter never sends the Redis `(` exclusive-bound prefix, but the Gateway
+  should still accept it for forward compatibility with a future caller
+  that does.
+- `offset`/`count` page the ascending-order result the same way Redis's
+  `LIMIT offset count` does: skip `offset` matches, then return up to
+  `count` more. Omitted entirely (not `0`) when the adapter wants every
+  match.
+- Empty array if nothing matches or the key doesn't exist.
+
+---
+
+## Multi-step repository operations — is an atomic combined op needed?
+
+Reviewing every repository call site for places that issue more than one
+Gateway request to do one logical thing:
+
+- **`auditRepository.ts`'s `append()`**: `SET ... NX` (one request, now
+  atomic — see `set` above) followed by, only on the winning write,
+  `LPUSH` then `LTRIM` as two separate requests to maintain the capped
+  recent-items index. This two-step push+trim is **not new** — it was
+  already two separate calls against Upstash before this migration, so it
+  is not a regression this migration introduces, and a crash between the
+  two leaves the index merely untrimmed (over-retained, never
+  under-retained or corrupted) until the next successful append trims it
+  back down. **Recommendation, not implemented in this PR:** an optional
+  combined `lpushtrim` op (`{"op":"lpushtrim","key":...,"value":...,"maxLen":1000}`
+  → pushes then trims to `maxLen` as one atomic server-side operation,
+  returning the post-trim length) would close this gap if the Gateway team
+  wants to take it on; the adapter does not depend on it and keeps using
+  plain `lpush`+`ltrim` until/unless it exists.
+- **`releaseRepository.ts`'s `writeIndexes()`**: one `ZADD` for the global
+  index, one `ZADD` for the per-service index, and a conditional `SET` for
+  the run-key and digest-key pointers — up to four independent requests,
+  all idempotent (re-running any subset after a partial failure is safe,
+  since every one of them is itself an idempotent op on a stable key). No
+  combined op needed here — the risk is "briefly missing from the index",
+  never a duplicate or corruption.
+- **`snapshotJobStore.ts`**: every mutation does a plain `SET` of the job
+  record and a `ZADD`/`ZREM` of the pending queue as two requests; same
+  idempotent-retry-safe shape as above.
+
+No other multi-request sequence in this codebase needs a combined op.
 
 ## Migration / cutover
 
@@ -127,19 +416,26 @@ reconciliation queue — see the migration section below.
   `UPSTASH_*` equivalents) for rollback. Nothing in this change deletes or
   touches the existing Upstash database.
 - Switching `REDIS_PROVIDER=http` in Production should wait until:
-  1. The Gateway gains the sorted-set ops above (or the audit/release/
-     snapshot-job indexes are redesigned to not need them), and
+  1. Gateway v0.3.0 (this contract) is actually deployed and reachable, and
   2. `REDIS_GATEWAY_URL`/`REDIS_GATEWAY_TOKEN`/`CF_ACCESS_CLIENT_ID`/
-     `CF_ACCESS_CLIENT_SECRET` are set in Vercel's env for every
-     environment that needs them, and
+     `CF_ACCESS_CLIENT_SECRET` are set in Vercel's env for every environment
+     that needs them, and
   3. Existing Upstash audit/release history has an accepted migration or
-     recovery plan (a one-off export/import script reading the current
-     Upstash `o24:audit:*` / `o24:release:*` keys and replaying them through
-     the same `SET`/`ZADD` calls against the Gateway, once it supports
-     `zadd`) — not built as part of this change, since it depends on the
-     Gateway supporting the sorted-set ops first and on being able to
-     actually read the current Upstash data (this environment could not
-     reach Upstash to check remaining quota/export feasibility).
-- Until then, use `REDIS_PROVIDER=http` only in Preview/staging to validate
-  the parts it does support (build pointers/intents, user accounts, the
-  w4sGraph dependency-graph cache and lock).
+     recovery plan (a one-off script reading the current Upstash
+     `o24:audit:*` / `o24:release:*` keys and replaying them through the
+     same `SET`/`ZADD`/`LPUSH` calls against the Gateway) — not built as
+     part of this change: this environment could not reach either Upstash
+     or `redis-gateway.vknight.io.vn` (DNS did not resolve) to assess
+     remaining Upstash quota or export feasibility, or to run a live
+     integration test against the new ops.
+
+## Validation status
+
+Every op above is covered by mocked-HTTP unit tests in
+`apps/control-center/lib/redisGateway.test.ts` (request shape, response
+parsing, retry policy, the native-SET single-request behavior, list/
+sorted-set translation). None of it has been exercised against a real
+Gateway — `redis-gateway.vknight.io.vn` does not resolve from this
+environment. Treat this contract as the spec to build v0.3.0 against, and
+re-run the adapter's test suite plus a live smoke test once that Gateway
+exists and is reachable.

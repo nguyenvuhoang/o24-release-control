@@ -3,6 +3,8 @@ import test from 'node:test'
 import {
   gatewayCall,
   gatewayExecuteRedisCommand,
+  gatewaySet,
+  GatewayCommandError,
   GatewayUnsupportedCommandError,
   type GatewayConfig,
 } from './redisGateway'
@@ -39,7 +41,6 @@ function okResponse(result: unknown): Response {
 // ---- gatewayCall: request shape, auth headers, retry policy ----
 
 test('gatewayCall posts {op,...params} to {url}/v1/redis with bearer auth and no-store', async () => {
-  const { restore, calls } = mockFetchSequence([() => okResponse('bar')])
   const originalFetch = globalThis.fetch
   let capturedUrl: string | undefined
   let capturedInit: RequestInit | undefined
@@ -59,7 +60,6 @@ test('gatewayCall posts {op,...params} to {url}/v1/redis with bearer auth and no
     assert.equal(JSON.parse(String(capturedInit?.body)).key, 'foo')
   } finally {
     globalThis.fetch = originalFetch
-    restore()
   }
 })
 
@@ -105,147 +105,257 @@ test('a 4xx is never retried', async () => {
   }
 })
 
-test('incr (non-idempotent) is NEVER retried even on a transient 500 — a blind retry could double-count', async () => {
-  const { restore, callCount } = mockFetchSequence([() => new Response('', { status: 500 }), () => okResponse(2)])
+for (const op of ['incr', 'getdel', 'rateLimit', 'compareAndDelete', 'lpush'] as const) {
+  test(`${op} (non-idempotent) is NEVER retried, even on a transient 500 — a blind retry could change the outcome`, async () => {
+    const { restore, callCount } = mockFetchSequence([() => new Response('', { status: 500 })])
+    try {
+      await assert.rejects(() => gatewayCall(CONFIG, op, { key: 'foo' }))
+      assert.equal(callCount(), 1, `${op} must fail fast on the first transient error, never consume the retry budget`)
+    } finally {
+      restore()
+    }
+  })
+}
+
+test('a network failure during a write op propagates a GatewayCommandError, never a silent success', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => {
+    throw new TypeError('fetch failed')
+  }) as typeof fetch
   try {
-    await assert.rejects(() => gatewayCall(CONFIG, 'incr', { key: 'foo' }))
-    assert.equal(callCount(), 1, 'incr must fail fast on the first transient error, never consume the retry budget')
+    await assert.rejects(() => gatewaySet(CONFIG, 'k', 'v'), GatewayCommandError)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+// ---- Native conditional SET: one request, no claim/emulation ----
+
+test('SET (no flags) is a single plain "set" request', async () => {
+  const { restore, calls, callCount } = mockFetchSequence([() => okResponse('OK')])
+  try {
+    const result = await gatewayExecuteRedisCommand(CONFIG, ['SET', 'k', 'v'])
+    assert.equal(result, 'OK')
+    assert.equal(callCount(), 1, 'a plain SET must be exactly one Gateway request')
+    assert.deepEqual(calls[0], { op: 'set', key: 'k', value: 'v' })
   } finally {
     restore()
   }
 })
 
-test('getdel (non-idempotent) is NEVER retried', async () => {
-  const { restore, callCount } = mockFetchSequence([() => new Response('', { status: 502 })])
+test('SET ... NX succeeding is a single atomic "set" request with nx:true — no claim key, no second request', async () => {
+  const { restore, calls, callCount } = mockFetchSequence([() => okResponse('OK')])
   try {
-    await assert.rejects(() => gatewayCall(CONFIG, 'getdel', { key: 'foo' }))
-    assert.equal(callCount(), 1)
+    const result = await gatewayExecuteRedisCommand(CONFIG, ['SET', 'record:1', '{"a":1}', 'NX'])
+    assert.equal(result, 'OK')
+    assert.equal(callCount(), 1, 'SET NX must be exactly one Gateway request — never sadd-then-set')
+    assert.deepEqual(calls[0], { op: 'set', key: 'record:1', value: '{"a":1}', nx: true })
   } finally {
     restore()
   }
 })
 
-// ---- gatewayExecuteRedisCommand: the raw-command translator kv.ts delegates to ----
+test('SET ... NX on an already-existing key: the Gateway reports the condition failed (null) in the SAME single request — no polling, no second read', async () => {
+  const { restore, callCount } = mockFetchSequence([() => okResponse(null)])
+  try {
+    const result = await gatewayExecuteRedisCommand(CONFIG, ['SET', 'record:1', '{"a":1}', 'NX'])
+    assert.equal(result, null)
+    assert.equal(callCount(), 1, 'a failed NX condition must not trigger any follow-up request from the adapter')
+  } finally {
+    restore()
+  }
+})
 
-test('GET/SET/DEL/INCR/EXISTS translate 1:1 to their gateway op', async () => {
-  const { restore, calls } = mockFetchSequence([
-    () => okResponse('hello'),
-    () => okResponse('OK'),
-    () => okResponse(1),
-    () => okResponse(5),
-    () => okResponse(1),
-  ])
+test('two "concurrent" SET NX calls against the same key: only the Gateway (not the adapter) arbitrates who wins — each call is independent and single-request', async () => {
+  // Simulates the Gateway's own atomic arbitration: first caller's single
+  // request wins (OK), second caller's single request loses (null) — the
+  // adapter never coordinates this itself (no local claim/lock state).
+  const { restore } = mockFetchSequence([() => okResponse('OK'), () => okResponse(null)])
+  try {
+    const [first, second] = await Promise.all([
+      gatewayExecuteRedisCommand(CONFIG, ['SET', 'record:dup', 'v', 'NX']),
+      gatewayExecuteRedisCommand(CONFIG, ['SET', 'record:dup', 'v', 'NX']),
+    ])
+    assert.deepEqual(new Set([first, second]), new Set(['OK', null]))
+  } finally {
+    restore()
+  }
+})
+
+test('SET ... NX EX seconds sends nx+ex in one request', async () => {
+  const { restore, calls } = mockFetchSequence([() => okResponse('OK')])
+  try {
+    await gatewayExecuteRedisCommand(CONFIG, ['SET', 'k', 'v', 'NX', 'EX', 120])
+    assert.deepEqual(calls[0], { op: 'set', key: 'k', value: 'v', nx: true, ex: 120 })
+  } finally {
+    restore()
+  }
+})
+
+test('SET ... NX PX milliseconds sends nx+px (milliseconds, not converted to seconds) in one request', async () => {
+  const { restore, calls } = mockFetchSequence([() => okResponse('OK')])
+  try {
+    await gatewayExecuteRedisCommand(CONFIG, ['SET', 'lock:sha1', '1', 'NX', 'PX', 60_000])
+    assert.deepEqual(calls[0], { op: 'set', key: 'lock:sha1', value: '1', nx: true, px: 60_000 })
+  } finally {
+    restore()
+  }
+})
+
+test('SET ... XX sends xx:true', async () => {
+  const { restore, calls } = mockFetchSequence([() => okResponse('OK')])
+  try {
+    await gatewayExecuteRedisCommand(CONFIG, ['SET', 'k', 'v', 'XX'])
+    assert.deepEqual(calls[0], { op: 'set', key: 'k', value: 'v', xx: true })
+  } finally {
+    restore()
+  }
+})
+
+test('gatewaySet treats both "OK" and boolean true as success, anything else as a failed condition', async () => {
+  const { restore } = mockFetchSequence([() => okResponse('OK'), () => okResponse(true), () => okResponse(null), () => okResponse(false)])
+  try {
+    assert.equal(await gatewaySet(CONFIG, 'k', 'v'), 'OK')
+    assert.equal(await gatewaySet(CONFIG, 'k', 'v'), 'OK')
+    assert.equal(await gatewaySet(CONFIG, 'k', 'v', { nx: true }), null)
+    assert.equal(await gatewaySet(CONFIG, 'k', 'v', { nx: true }), null)
+  } finally {
+    restore()
+  }
+})
+
+// ---- GET/DEL/EXISTS/INCR etc: 1:1 translation ----
+
+test('GET/DEL/INCR/EXISTS translate 1:1 to their gateway op', async () => {
+  const { restore, calls } = mockFetchSequence([() => okResponse('hello'), () => okResponse(1), () => okResponse(5), () => okResponse(1)])
   try {
     assert.equal(await gatewayExecuteRedisCommand(CONFIG, ['GET', 'k']), 'hello')
-    assert.equal(await gatewayExecuteRedisCommand(CONFIG, ['SET', 'k', 'v']), 'OK')
     assert.equal(await gatewayExecuteRedisCommand(CONFIG, ['DEL', 'k']), 1)
     assert.equal(await gatewayExecuteRedisCommand(CONFIG, ['INCR', 'k']), 5)
     assert.equal(await gatewayExecuteRedisCommand(CONFIG, ['EXISTS', 'k']), 1)
     assert.deepEqual(
       calls.map((body) => (body as { op: string }).op),
-      ['get', 'set', 'del', 'incr', 'exists'],
+      ['get', 'del', 'incr', 'exists'],
     )
   } finally {
     restore()
   }
 })
 
-test('MGET fans out to one get per key, preserving order and nulls', async () => {
-  const { restore, calls } = mockFetchSequence([() => okResponse('a'), () => okResponse(null), () => okResponse('c')])
+// ---- Native list ops ----
+
+test('MGET is a single native "mget" request, not N gets', async () => {
+  const { restore, calls, callCount } = mockFetchSequence([() => okResponse(['a', null, 'c'])])
   try {
     const result = await gatewayExecuteRedisCommand(CONFIG, ['MGET', 'k1', 'k2', 'k3'])
     assert.deepEqual(result, ['a', null, 'c'])
-    assert.equal(calls.length, 3)
+    assert.equal(callCount(), 1, 'MGET must be one Gateway request, not a per-key fan-out')
+    assert.deepEqual(calls[0], { op: 'mget', keys: ['k1', 'k2', 'k3'] })
   } finally {
     restore()
   }
 })
 
-test('SET ... NX: the winning claim writes the value and returns OK', async () => {
-  // sadd (claim, wins) -> set
-  const { restore, calls } = mockFetchSequence([() => okResponse(1), () => okResponse('OK')])
+test('MGET preserves order and nulls for missing keys', async () => {
+  const { restore } = mockFetchSequence([() => okResponse([null, 'b', null])])
   try {
-    const result = await gatewayExecuteRedisCommand(CONFIG, ['SET', 'record:1', '{"a":1}', 'NX'])
-    assert.equal(result, 'OK')
-    assert.equal((calls[0] as { op: string; key: string }).op, 'sadd')
-    assert.equal((calls[0] as { key: string }).key, 'record:1:__nx_claim')
-    assert.equal((calls[1] as { op: string }).op, 'set')
+    const result = await gatewayExecuteRedisCommand(CONFIG, ['MGET', 'k1', 'k2', 'k3'])
+    assert.deepEqual(result, [null, 'b', null])
   } finally {
     restore()
   }
 })
 
-test('SET ... NX: losing the claim polls GET until the winner value is visible, then returns null (never a false OK)', async () => {
-  // sadd (claim, loses -> 0) -> get(null) -> get(value)
-  const { restore, calls } = mockFetchSequence([() => okResponse(0), () => okResponse(null), () => okResponse('{"a":1}')])
+test('LPUSH translates to native "lpush" and returns the new length', async () => {
+  const { restore, calls } = mockFetchSequence([() => okResponse(3)])
   try {
-    const result = await gatewayExecuteRedisCommand(CONFIG, ['SET', 'record:1', '{"a":1}', 'NX'])
-    assert.equal(result, null)
-    assert.equal(calls.length, 3)
+    const result = await gatewayExecuteRedisCommand(CONFIG, ['LPUSH', 'idx', 'id-1'])
+    assert.equal(result, 3)
+    assert.deepEqual(calls[0], { op: 'lpush', key: 'idx', value: 'id-1' })
   } finally {
     restore()
   }
 })
 
-test('SET ... NX PX: a successful claim also expires both the claim and the value key', async () => {
-  const { restore, calls } = mockFetchSequence([() => okResponse(1), () => okResponse(1), () => okResponse('OK'), () => okResponse(1)])
+test('LTRIM translates to native "ltrim" with inclusive start/stop', async () => {
+  const { restore, calls } = mockFetchSequence([() => okResponse('OK')])
   try {
-    const result = await gatewayExecuteRedisCommand(CONFIG, ['SET', 'lock:sha1', '1', 'NX', 'PX', 60_000])
-    assert.equal(result, 'OK')
-    const ops = calls.map((body) => (body as { op: string }).op)
-    assert.deepEqual(ops, ['sadd', 'expire', 'set', 'expire'])
-    assert.equal((calls[1] as { seconds: number }).seconds, 60)
+    await gatewayExecuteRedisCommand(CONFIG, ['LTRIM', 'idx', 0, 999])
+    assert.deepEqual(calls[0], { op: 'ltrim', key: 'idx', start: 0, stop: 999 })
   } finally {
     restore()
   }
 })
 
-test('SET ... EX (no NX) is a plain set followed by expire — not treated as a uniqueness check', async () => {
-  const { restore, calls } = mockFetchSequence([() => okResponse('OK'), () => okResponse(1)])
+test('LRANGE translates to native "lrange" and returns the ordered list', async () => {
+  const { restore, calls } = mockFetchSequence([() => okResponse(['id-3', 'id-2', 'id-1'])])
   try {
-    const result = await gatewayExecuteRedisCommand(CONFIG, ['SET', 'cache:sha1', '{}', 'EX', 120])
-    assert.equal(result, 'OK')
-    assert.deepEqual(calls.map((body) => (body as { op: string }).op), ['set', 'expire'])
+    const result = await gatewayExecuteRedisCommand(CONFIG, ['LRANGE', 'idx', 0, 29])
+    assert.deepEqual(result, ['id-3', 'id-2', 'id-1'])
+    assert.deepEqual(calls[0], { op: 'lrange', key: 'idx', start: 0, stop: 29 })
   } finally {
     restore()
   }
 })
 
-test('SADD/SREM/SMEMBERS/SCARD translate 1:1', async () => {
-  const { restore } = mockFetchSequence([() => okResponse(1), () => okResponse(1), () => okResponse(['a', 'b']), () => okResponse(2)])
+// ---- Native sorted-set ops ----
+
+test('ZADD translates to native "zadd" with numeric score', async () => {
+  const { restore, calls } = mockFetchSequence([() => okResponse(1)])
   try {
-    assert.equal(await gatewayExecuteRedisCommand(CONFIG, ['SADD', 'set1', 'a']), 1)
-    assert.equal(await gatewayExecuteRedisCommand(CONFIG, ['SREM', 'set1', 'a']), 1)
-    assert.deepEqual(await gatewayExecuteRedisCommand(CONFIG, ['SMEMBERS', 'set1']), ['a', 'b'])
-    assert.equal(await gatewayExecuteRedisCommand(CONFIG, ['SCARD', 'set1']), 2)
+    const result = await gatewayExecuteRedisCommand(CONFIG, ['ZADD', 'zset', 1732564000000, 'release:1'])
+    assert.equal(result, 1)
+    assert.deepEqual(calls[0], { op: 'zadd', key: 'zset', score: 1732564000000, member: 'release:1' })
   } finally {
     restore()
   }
 })
 
-for (const command of [
-  ['LPUSH', 'k', 'v'],
-  ['LTRIM', 'k', 0, 10],
-  ['LRANGE', 'k', 0, 10],
-  ['ZADD', 'k', 1, 'm'],
-  ['ZREM', 'k', 'm'],
-  ['ZREVRANGE', 'k', 0, 10],
-  ['ZRANGEBYSCORE', 'k', 0, 10],
-]) {
-  test(`${command[0]} has no Gateway v0.2.0 op — throws GatewayUnsupportedCommandError instead of faking it`, async () => {
-    await assert.rejects(() => gatewayExecuteRedisCommand(CONFIG, command), GatewayUnsupportedCommandError)
-  })
-}
+test('ZREM translates to native "zrem"', async () => {
+  const { restore, calls } = mockFetchSequence([() => okResponse(1)])
+  try {
+    const result = await gatewayExecuteRedisCommand(CONFIG, ['ZREM', 'zset', 'release:1'])
+    assert.equal(result, 1)
+    assert.deepEqual(calls[0], { op: 'zrem', key: 'zset', member: 'release:1' })
+  } finally {
+    restore()
+  }
+})
+
+test('ZREVRANGE translates to native "zrevrange" (highest score first)', async () => {
+  const { restore, calls } = mockFetchSequence([() => okResponse(['release:3', 'release:2', 'release:1'])])
+  try {
+    const result = await gatewayExecuteRedisCommand(CONFIG, ['ZREVRANGE', 'zset', 0, 49])
+    assert.deepEqual(result, ['release:3', 'release:2', 'release:1'])
+    assert.deepEqual(calls[0], { op: 'zrevrange', key: 'zset', start: 0, stop: 49 })
+  } finally {
+    restore()
+  }
+})
+
+test('ZRANGEBYSCORE without LIMIT sends only key/min/max', async () => {
+  const { restore, calls } = mockFetchSequence([() => okResponse(['job:1'])])
+  try {
+    await gatewayExecuteRedisCommand(CONFIG, ['ZRANGEBYSCORE', 'zset', '-inf', 1732564000000])
+    assert.deepEqual(calls[0], { op: 'zrangebyscore', key: 'zset', min: '-inf', max: '1732564000000' })
+  } finally {
+    restore()
+  }
+})
+
+test('ZRANGEBYSCORE with LIMIT offset count parses the optional clause', async () => {
+  const { restore, calls } = mockFetchSequence([() => okResponse(['job:1', 'job:2'])])
+  try {
+    const result = await gatewayExecuteRedisCommand(CONFIG, ['ZRANGEBYSCORE', 'zset', '-inf', 1732564000000, 'LIMIT', 0, 20])
+    assert.deepEqual(result, ['job:1', 'job:2'])
+    assert.deepEqual(calls[0], { op: 'zrangebyscore', key: 'zset', min: '-inf', max: '1732564000000', offset: 0, count: 20 })
+  } finally {
+    restore()
+  }
+})
+
+// ---- Unknown command: still a controlled error ----
 
 test('an unknown command throws GatewayUnsupportedCommandError, not a generic error', async () => {
   await assert.rejects(() => gatewayExecuteRedisCommand(CONFIG, ['HSET', 'k', 'f', 'v']), GatewayUnsupportedCommandError)
-})
-
-test('SET ... NX: if the claim is lost and the winner value never becomes visible, it throws rather than silently reporting null', async () => {
-  const { restore } = mockFetchSequence([() => okResponse(0), ...Array(5).fill(() => okResponse(null))])
-  try {
-    await assert.rejects(() => gatewayExecuteRedisCommand(CONFIG, ['SET', 'record:1', '{}', 'NX']))
-  } finally {
-    restore()
-  }
 })

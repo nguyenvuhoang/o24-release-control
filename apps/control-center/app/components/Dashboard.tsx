@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { BuildServiceCode } from '../../lib/github/serviceMap'
 import { githubServiceForAgentCode } from '../../lib/github/serviceMap'
 import { readJsonSafe } from '../../lib/http'
+import { CoalescingFetcher, computeBackoffDelayMs } from '../../lib/pollScheduler'
 import { escapeHtml, SwalAlert } from '../../lib/swalAlert'
 import type {
   AuditRecord,
@@ -123,65 +124,140 @@ export default function Dashboard({ username }: Props) {
     refresh: refreshComparisons,
   } = useReleaseComparison(dashboard?.environments ?? [], registryStatus)
 
+  // Background poll cadence/backoff — see the visibility-gated scheduler
+  // below. Deliberately the same shape as useBuildTracker's
+  // FAST/RECOVERY constants: a fixed cadence while healthy, bounded
+  // exponential backoff (capped, never stops) while the backend is failing.
+  const BASE_POLL_INTERVAL_MS = 15_000
+  const MAX_POLL_INTERVAL_MS = 60_000
+
+  // Overlapping-request guard: a second refresh() call while one is already
+  // in flight (the poll timer firing right as a mutation's own `await
+  // refresh(true)` is still running, say) piggybacks on the SAME in-flight
+  // request via CoalescingFetcher instead of firing a duplicate
+  // /api/dashboard + /api/audit + /api/registry round trip — this is both
+  // the "prevent overlapping requests" and the "deduplicate concurrent
+  // identical reads" requirement. Every caller still gets the real resolved
+  // value (never a stale skip), which matters: several callers below
+  // `await refresh(true)` and feed the result straight into
+  // refreshComparisons(). See lib/pollScheduler.ts for the (unit-tested)
+  // coalescing/backoff logic itself.
+  const consecutiveFailuresRef = useRef(0)
+  const refreshFetcherRef = useRef<CoalescingFetcher<{ environments: EnvironmentDashboard[]; registryStatus?: RegistryServiceStatus[] } | undefined> | null>(null)
+
   // Returns the freshly-fetched environments/registryStatus (undefined if
   // either request failed) so a caller that just triggered a mutation can
   // feed them straight into refreshComparisons() — see the comment on
   // useReleaseComparison's refresh() for why reading registryStatus/dashboard
   // state right after this resolves would otherwise race React's re-render.
   const refresh = useCallback(async (silent = false) => {
-    if (!silent) setLoading(true)
-    try {
-      const [dashboardResponse, auditResponse, registryResponse] = await Promise.all([
-        fetch('/api/dashboard', { cache: 'no-store' }),
-        fetch('/api/audit?limit=30', { cache: 'no-store' }),
-        fetch('/api/registry/status', { cache: 'no-store' }),
-      ])
-      if (dashboardResponse.status === 401 || auditResponse.status === 401 || registryResponse.status === 401) {
-        window.location.href = '/login'
-        return undefined
-      }
-      const dashboardBody = await readJsonSafe<DashboardResponse & { details?: string; error?: string }>(dashboardResponse)
-      const auditBody = await readJsonSafe<{ items?: AuditRecord[]; details?: string; error?: string }>(auditResponse)
-      if (!dashboardResponse.ok) throw new Error(dashboardBody?.details ?? dashboardBody?.error ?? 'Không tải được dashboard')
-      if (!dashboardBody) throw new Error('Không tải được dashboard')
-      setDashboard(dashboardBody)
+    if (!refreshFetcherRef.current) {
+      refreshFetcherRef.current = new CoalescingFetcher(async () => {
+        try {
+          const [dashboardResponse, auditResponse, registryResponse] = await Promise.all([
+            fetch('/api/dashboard', { cache: 'no-store' }),
+            fetch('/api/audit?limit=30', { cache: 'no-store' }),
+            fetch('/api/registry/status', { cache: 'no-store' }),
+          ])
+          if (dashboardResponse.status === 401 || auditResponse.status === 401 || registryResponse.status === 401) {
+            window.location.href = '/login'
+            return undefined
+          }
+          const dashboardBody = await readJsonSafe<DashboardResponse & { details?: string; error?: string }>(dashboardResponse)
+          const auditBody = await readJsonSafe<{ items?: AuditRecord[]; details?: string; error?: string }>(auditResponse)
+          if (!dashboardResponse.ok) throw new Error(dashboardBody?.details ?? dashboardBody?.error ?? 'Không tải được dashboard')
+          if (!dashboardBody) throw new Error('Không tải được dashboard')
+          setDashboard(dashboardBody)
 
-      // Registry Sync comparison is best-effort, non-critical UI: a failure
-      // here (e.g. Docker Hub transiently unreachable) must never take the
-      // rest of the dashboard down with it.
-      let freshRegistryStatus: RegistryServiceStatus[] | undefined
-      if (registryResponse.ok) {
-        const registryBody = await readJsonSafe<RegistryStatusResponse>(registryResponse)
-        freshRegistryStatus = registryBody?.services ?? []
-        setRegistryStatus(freshRegistryStatus)
-      }
+          // Registry Sync comparison is best-effort, non-critical UI: a failure
+          // here (e.g. Docker Hub transiently unreachable) must never take the
+          // rest of the dashboard down with it.
+          let freshRegistryStatus: RegistryServiceStatus[] | undefined
+          if (registryResponse.ok) {
+            const registryBody = await readJsonSafe<RegistryStatusResponse>(registryResponse)
+            freshRegistryStatus = registryBody?.services ?? []
+            setRegistryStatus(freshRegistryStatus)
+          }
 
-      // Audit storage not being configured (Vercel without KV) must not take
-      // the whole dashboard down — only the audit panel needs to know, so it
-      // can show a distinct "not configured" message instead of an empty
-      // history. Any OTHER audit fetch failure is treated the same way
-      // (fail soft): the rest of the app stays usable either way.
-      if (auditResponse.ok) {
-        setAudit(auditBody?.items ?? [])
-        setAuditStorageNotConfigured(false)
-      } else {
-        setAudit([])
-        setAuditStorageNotConfigured(auditBody?.error === 'audit_storage_not_configured')
-      }
-      setError('')
-      return { environments: dashboardBody.environments, registryStatus: freshRegistryStatus }
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Không tải được dữ liệu')
-      return undefined
-    } finally {
-      setLoading(false)
+          // Audit storage not being configured (Vercel without KV) must not take
+          // the whole dashboard down — only the audit panel needs to know, so it
+          // can show a distinct "not configured" message instead of an empty
+          // history. Any OTHER audit fetch failure is treated the same way
+          // (fail soft): the rest of the app stays usable either way.
+          if (auditResponse.ok) {
+            setAudit(auditBody?.items ?? [])
+            setAuditStorageNotConfigured(false)
+          } else {
+            setAudit([])
+            setAuditStorageNotConfigured(auditBody?.error === 'audit_storage_not_configured')
+          }
+          setError('')
+          consecutiveFailuresRef.current = 0
+          return { environments: dashboardBody.environments, registryStatus: freshRegistryStatus }
+        } catch (caught) {
+          consecutiveFailuresRef.current += 1
+          setError(caught instanceof Error ? caught.message : 'Không tải được dữ liệu')
+          return undefined
+        } finally {
+          setLoading(false)
+        }
+      })
     }
+    if (!silent) setLoading(true)
+    return refreshFetcherRef.current.fetch()
   }, [])
 
+  // Background poll: paused entirely while the tab is hidden (no
+  // /api/dashboard + /api/audit + /api/registry traffic from backgrounded
+  // tabs, which is the dominant source of KV request volume — see
+  // docs/REDIS_GATEWAY.md's root-cause note), refreshed once immediately on
+  // becoming visible again, and re-scheduled with bounded backoff (see
+  // computeBackoffDelayMs) on consecutive failures instead of hammering a
+  // down backend every 15s. Active deployment/restart/rollback operations
+  // are tracked over their own SSE connection (see the operation drawer
+  // below) and are completely unaffected by this — they keep streaming
+  // regardless of tab visibility.
   useEffect(() => {
+    let timerHandle: number | undefined
+    let stopped = false
+
+    function clearTimer() {
+      if (timerHandle !== undefined) {
+        window.clearTimeout(timerHandle)
+        timerHandle = undefined
+      }
+    }
+
+    function scheduleTick() {
+      clearTimer()
+      if (stopped || document.visibilityState !== 'visible') return
+      const delay = computeBackoffDelayMs(BASE_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS, consecutiveFailuresRef.current)
+      timerHandle = window.setTimeout(() => void tick(), delay)
+    }
+
+    async function tick() {
+      timerHandle = undefined
+      if (stopped || document.visibilityState !== 'visible') return
+      await refresh(true)
+      scheduleTick()
+    }
+
+    function handleVisibility() {
+      if (document.visibilityState === 'visible') {
+        if (timerHandle === undefined) void tick()
+      } else {
+        clearTimer()
+      }
+    }
+
     void refresh()
-    const timer = window.setInterval(() => void refresh(true), 15_000)
-    return () => window.clearInterval(timer)
+    scheduleTick()
+    document.addEventListener('visibilitychange', handleVisibility)
+    return () => {
+      stopped = true
+      document.removeEventListener('visibilitychange', handleVisibility)
+      clearTimer()
+    }
   }, [refresh])
 
   // Loads each buildable service's latest GitHub Actions build state

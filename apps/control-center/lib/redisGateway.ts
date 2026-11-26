@@ -4,14 +4,15 @@
 // Redis command here via gatewayExecuteRedisCommand() so repositories never
 // need to know which provider is behind them.
 //
-// Gateway v0.2.0's documented contract is exactly these 14 ops: get, set,
-// del, exists, ttl, pttl, expire, getdel, incr, rateLimit, sadd, srem,
-// smembers, scard, compareAndDelete. There is no documented "set if not
-// exists" or ordered/list op, so those raw Redis commands are either
-// emulated from the documented ops (never via an unsafe GET/SET race — see
-// setIfAbsent below) or rejected with GatewayUnsupportedCommandError. See
-// docs/REDIS_GATEWAY.md for the exact contracts a future Gateway version
-// would need to add to remove the remaining emulations.
+// Targets Gateway v0.3.0, which adds native conditional SET (nx/xx/ex/px)
+// and native list/sorted-set ops (mget, lpush, ltrim, lrange, zadd,
+// zrevrange, zrangebyscore, zrem) on top of v0.2.0's get/set/del/exists/
+// ttl/pttl/expire/getdel/incr/rateLimit/sadd/srem/smembers/scard/
+// compareAndDelete. Every op here is translated 1:1 to a single Gateway
+// request — no client-side emulation of atomicity (no claim keys, no
+// GET/SET races, no multi-request fan-out standing in for a data
+// structure). See docs/REDIS_GATEWAY.md for the exact request/response
+// contract this file assumes for every op.
 
 export type GatewayConfig = {
   url: string
@@ -58,12 +59,20 @@ export type GatewayOp =
   | 'smembers'
   | 'scard'
   | 'compareAndDelete'
+  | 'mget'
+  | 'lpush'
+  | 'ltrim'
+  | 'lrange'
+  | 'zadd'
+  | 'zrevrange'
+  | 'zrangebyscore'
+  | 'zrem'
 
 export class GatewayCommandError extends Error {
   constructor(
     message: string,
     public readonly status: number | null,
-    public readonly op: GatewayOp | 'set',
+    public readonly op: GatewayOp,
   ) {
     super(message)
     this.name = 'GatewayCommandError'
@@ -71,18 +80,17 @@ export class GatewayCommandError extends Error {
 }
 
 /**
- * A raw Redis command (e.g. ZADD, LPUSH) that Gateway v0.2.0 has no
- * operation for. Thrown instead of silently emulating it unsafely or
- * asserting the method exists — callers get a controlled error, never a
- * false success. See docs/REDIS_GATEWAY.md for the exact contract the
- * Gateway would need to add.
+ * A raw Redis command that the configured Gateway version has no operation
+ * for. Thrown instead of silently emulating it unsafely or asserting the
+ * method exists — callers get a controlled error, never a false success.
+ * See docs/REDIS_GATEWAY.md.
  */
 export class GatewayUnsupportedCommandError extends Error {
   constructor(
     public readonly command: string,
     hint: string,
   ) {
-    super(`Redis Gateway v0.2.0 has no operation for "${command}" — ${hint} See docs/REDIS_GATEWAY.md.`)
+    super(`The configured Redis Gateway has no operation for "${command}" — ${hint} See docs/REDIS_GATEWAY.md.`)
     this.name = 'GatewayUnsupportedCommandError'
   }
 }
@@ -91,11 +99,14 @@ export class GatewayUnsupportedCommandError extends Error {
 // attempt actually succeeded server-side before the response was lost (a
 // double increment, a getdel that already consumed the value, a rate-limit
 // window counted twice, a compare that no longer matches after the first
-// attempt already deleted it). Every other documented op reaches the same
-// end state no matter how many times it's applied, so only these are
-// excluded from the bounded transient-retry in gatewayCall — "never retry a
+// attempt already deleted it, a list push that would append twice). Every
+// other documented op reaches the same end state no matter how many times
+// it's applied — including conditional `set`: its id/value pairs are always
+// deterministic here, so a retried SET NX either re-confirms the same write
+// or correctly discovers it already happened — so only these are excluded
+// from the bounded transient-retry in gatewayCall — "never retry a
 // non-idempotent operation automatically".
-const NON_IDEMPOTENT_OPS = new Set<GatewayOp>(['incr', 'getdel', 'rateLimit', 'compareAndDelete'])
+const NON_IDEMPOTENT_OPS = new Set<GatewayOp>(['incr', 'getdel', 'rateLimit', 'compareAndDelete', 'lpush'])
 
 function isTransient(error: unknown): boolean {
   if (error instanceof GatewayCommandError) return error.status === null || error.status >= 500
@@ -162,15 +173,33 @@ export async function gatewayCall(config: GatewayConfig, op: GatewayOp, params: 
   }
 }
 
-// ---- Typed per-op helpers — the documented Gateway v0.2.0 contract ----
+// ---- Typed per-op helpers — see docs/REDIS_GATEWAY.md for the exact
+// contract (argument types, range semantics, TTL semantics, error
+// behavior) each of these assumes. ----
 
 export async function gatewayGet(config: GatewayConfig, key: string): Promise<string | null> {
   const result = await gatewayCall(config, 'get', { key })
   return typeof result === 'string' ? result : null
 }
 
-export async function gatewaySet(config: GatewayConfig, key: string, value: string): Promise<void> {
-  await gatewayCall(config, 'set', { key, value })
+export type GatewaySetOptions = { nx?: boolean; xx?: boolean; exSeconds?: number; pxMs?: number }
+
+/**
+ * Native conditional SET. The Gateway performs the NX/XX check and the
+ * value write as one atomic server-side operation — this is a single
+ * request, never a claim-then-write sequence. Returns 'OK' on a successful
+ * write, or null when a condition (NX: key already exists; XX: key doesn't
+ * exist) prevented it — the same contract Upstash's native SET NX/XX has,
+ * which is what every caller already branches on.
+ */
+export async function gatewaySet(config: GatewayConfig, key: string, value: string, options: GatewaySetOptions = {}): Promise<'OK' | null> {
+  const params: Record<string, unknown> = { key, value }
+  if (options.nx) params.nx = true
+  if (options.xx) params.xx = true
+  if (options.exSeconds != null) params.ex = options.exSeconds
+  if (options.pxMs != null) params.px = options.pxMs
+  const result = await gatewayCall(config, 'set', params)
+  return result === 'OK' || result === true ? 'OK' : null
 }
 
 export async function gatewayDel(config: GatewayConfig, key: string): Promise<number> {
@@ -231,77 +260,88 @@ export async function gatewayRateLimit(config: GatewayConfig, key: string, limit
   return { allowed: result?.allowed !== false, remaining: result?.remaining }
 }
 
-// ---- Raw Redis command translator — what kv.ts's kvCommand() calls under
-// REDIS_PROVIDER=http, so every existing repository keeps issuing the same
-// command arrays it already does for Upstash. ----
-
-// Bounded wait for the race-winner's value to become visible after this
-// instance lost a setIfAbsent claim (see below) — short because this sits
-// on the hot path of audit/release/user-create append, not a background
-// fetch. ~1.55s worst case, only ever hit when two instances genuinely
-// race the same id at the same moment.
-const SETNX_POLL_DELAYS_MS = [50, 100, 200, 400, 800]
-
-/**
- * Emulates Redis `SET key value NX [EX sec | PX ms]` using only documented
- * ops. The uniqueness decision itself is made by `sadd` on a claim key —
- * SADD is atomic, so two concurrent callers can never both believe they
- * created the record (never an unsafe GET/SET race). The claim's winner
- * then writes the real value; a loser polls GET briefly for that write to
- * land (it may not be visible the instant the claim resolves) before
- * reporting "not created by us" — exactly like Upstash's native SET NX,
- * callers branch on `result === 'OK'`.
- */
-async function setIfAbsent(config: GatewayConfig, key: string, value: string, ttlSeconds?: number): Promise<'OK' | null> {
-  const claimKey = `${key}:__nx_claim`
-  const claimed = await gatewaySadd(config, claimKey, '1')
-  if (claimed > 0) {
-    if (ttlSeconds) await gatewayExpire(config, claimKey, ttlSeconds)
-    await gatewaySet(config, key, value)
-    if (ttlSeconds) await gatewayExpire(config, key, ttlSeconds)
-    return 'OK'
-  }
-
-  for (const delayMs of SETNX_POLL_DELAYS_MS) {
-    await sleep(delayMs)
-    const existing = await gatewayGet(config, key)
-    if (existing !== null) return null
-  }
-  throw new GatewayCommandError(`SET ${key} NX: lost the creation race via claim key but its value never became visible`, null, 'set')
+export async function gatewayMget(config: GatewayConfig, keys: string[]): Promise<(string | null)[]> {
+  if (keys.length === 0) return []
+  const result = await gatewayCall(config, 'mget', { keys })
+  if (!Array.isArray(result)) return keys.map(() => null)
+  return result.map((item) => (typeof item === 'string' ? item : null))
 }
 
-function parseSetArgs(args: (string | number)[]): { nx: boolean; ttlSeconds: number | undefined } {
-  let nx = false
-  let ttlSeconds: number | undefined
+export async function gatewayLpush(config: GatewayConfig, key: string, value: string): Promise<number> {
+  return Number(await gatewayCall(config, 'lpush', { key, value })) || 0
+}
+
+export async function gatewayLtrim(config: GatewayConfig, key: string, start: number, stop: number): Promise<void> {
+  await gatewayCall(config, 'ltrim', { key, start, stop })
+}
+
+export async function gatewayLrange(config: GatewayConfig, key: string, start: number, stop: number): Promise<string[]> {
+  const result = await gatewayCall(config, 'lrange', { key, start, stop })
+  return Array.isArray(result) ? result.filter((item): item is string => typeof item === 'string') : []
+}
+
+export async function gatewayZadd(config: GatewayConfig, key: string, score: number, member: string): Promise<number> {
+  return Number(await gatewayCall(config, 'zadd', { key, score, member })) || 0
+}
+
+export async function gatewayZrem(config: GatewayConfig, key: string, member: string): Promise<number> {
+  return Number(await gatewayCall(config, 'zrem', { key, member })) || 0
+}
+
+export async function gatewayZrevrange(config: GatewayConfig, key: string, start: number, stop: number): Promise<string[]> {
+  const result = await gatewayCall(config, 'zrevrange', { key, start, stop })
+  return Array.isArray(result) ? result.filter((item): item is string => typeof item === 'string') : []
+}
+
+export type ZRangeByScoreLimit = { offset: number; count: number }
+
+export async function gatewayZrangebyscore(
+  config: GatewayConfig,
+  key: string,
+  min: string | number,
+  max: string | number,
+  limit?: ZRangeByScoreLimit,
+): Promise<string[]> {
+  const params: Record<string, unknown> = { key, min: String(min), max: String(max) }
+  if (limit) {
+    params.offset = limit.offset
+    params.count = limit.count
+  }
+  const result = await gatewayCall(config, 'zrangebyscore', params)
+  return Array.isArray(result) ? result.filter((item): item is string => typeof item === 'string') : []
+}
+
+// ---- Raw Redis command translator — what kv.ts's kvCommand() calls under
+// REDIS_PROVIDER=http, so every existing repository keeps issuing the same
+// command arrays it already does for Upstash. Every branch below is a 1:1
+// translation to a single Gateway request — no multi-call emulation. ----
+
+function parseSetArgs(args: (string | number)[]): GatewaySetOptions {
+  const options: GatewaySetOptions = {}
   for (let i = 2; i < args.length; i += 1) {
     const token = String(args[i]).toUpperCase()
-    if (token === 'NX') nx = true
+    if (token === 'NX') options.nx = true
+    else if (token === 'XX') options.xx = true
     else if (token === 'EX') {
-      ttlSeconds = Number(args[i + 1])
+      options.exSeconds = Number(args[i + 1])
       i += 1
     } else if (token === 'PX') {
-      ttlSeconds = Math.max(1, Math.ceil(Number(args[i + 1]) / 1000))
+      options.pxMs = Number(args[i + 1])
       i += 1
     }
   }
-  return { nx, ttlSeconds }
+  return options
 }
 
-async function gatewaySetCommand(config: GatewayConfig, args: (string | number)[]): Promise<'OK' | null> {
+function parseZRangeByScoreArgs(args: (string | number)[]): { key: string; min: string; max: string; limit?: ZRangeByScoreLimit } {
   const key = String(args[0])
-  const value = String(args[1])
-  const { nx, ttlSeconds } = parseSetArgs(args)
-
-  if (!nx) {
-    await gatewaySet(config, key, value)
-    if (ttlSeconds) await gatewayExpire(config, key, ttlSeconds)
-    return 'OK'
-  }
-  return setIfAbsent(config, key, value, ttlSeconds)
+  const min = String(args[1])
+  const max = String(args[2])
+  const limitIndex = args.findIndex((value, index) => index >= 3 && String(value).toUpperCase() === 'LIMIT')
+  if (limitIndex === -1) return { key, min, max }
+  const limit = { offset: Number(args[limitIndex + 1]), count: Number(args[limitIndex + 2]) }
+  return { key, min, max, limit }
 }
-
-const LIST_OP_HINT = 'a bounded recent-items index needs native list ops (lpush/ltrim/lrange) on the Gateway'
-const ZSET_OP_HINT = 'an ordered/paginated index needs native sorted-set ops (zadd/zrevrange/zrangebyscore/zrem) on the Gateway'
 
 /** Routes one raw Redis command array (the same shape every repository already builds for Upstash) to the Gateway's op set. */
 export async function gatewayExecuteRedisCommand(config: GatewayConfig, command: (string | number)[]): Promise<unknown> {
@@ -311,7 +351,7 @@ export async function gatewayExecuteRedisCommand(config: GatewayConfig, command:
     case 'GET':
       return gatewayGet(config, String(args[0]))
     case 'SET':
-      return gatewaySetCommand(config, args)
+      return gatewaySet(config, String(args[0]), String(args[1]), parseSetArgs(args))
     case 'DEL':
       return gatewayDel(config, String(args[0]))
     case 'EXISTS':
@@ -327,10 +367,7 @@ export async function gatewayExecuteRedisCommand(config: GatewayConfig, command:
     case 'INCR':
       return gatewayIncr(config, String(args[0]))
     case 'MGET':
-      // Not atomic, but MGET's only job here is a batch-read optimization —
-      // the individual GETs it's built from don't need to be atomic with
-      // each other, just correct.
-      return Promise.all(args.map((key) => gatewayGet(config, String(key))))
+      return gatewayMget(config, args.map(String))
     case 'SADD':
       return gatewaySadd(config, String(args[0]), String(args[1]))
     case 'SREM':
@@ -340,15 +377,22 @@ export async function gatewayExecuteRedisCommand(config: GatewayConfig, command:
     case 'SCARD':
       return gatewayScard(config, String(args[0]))
     case 'LPUSH':
+      return gatewayLpush(config, String(args[0]), String(args[1]))
     case 'LTRIM':
+      return gatewayLtrim(config, String(args[0]), Number(args[1]), Number(args[2]))
     case 'LRANGE':
-      throw new GatewayUnsupportedCommandError(verb, LIST_OP_HINT)
+      return gatewayLrange(config, String(args[0]), Number(args[1]), Number(args[2]))
     case 'ZADD':
+      return gatewayZadd(config, String(args[0]), Number(args[1]), String(args[2]))
     case 'ZREM':
+      return gatewayZrem(config, String(args[0]), String(args[1]))
     case 'ZREVRANGE':
-    case 'ZRANGEBYSCORE':
-      throw new GatewayUnsupportedCommandError(verb, ZSET_OP_HINT)
+      return gatewayZrevrange(config, String(args[0]), Number(args[1]), Number(args[2]))
+    case 'ZRANGEBYSCORE': {
+      const parsed = parseZRangeByScoreArgs(args)
+      return gatewayZrangebyscore(config, parsed.key, parsed.min, parsed.max, parsed.limit)
+    }
     default:
-      throw new GatewayUnsupportedCommandError(verb, 'no documented Gateway v0.2.0 operation covers this command')
+      throw new GatewayUnsupportedCommandError(verb, 'no Gateway operation covers this command')
   }
 }
