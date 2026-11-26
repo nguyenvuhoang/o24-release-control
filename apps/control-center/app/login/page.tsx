@@ -16,7 +16,11 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
         <p className="mb-1.5 text-[11px] font-semibold tracking-[0.1em] text-slate-500">QUẢN LÝ TRIỂN KHAI</p>
         <h1 className="text-2xl font-semibold text-slate-100">Đăng nhập quản trị</h1>
         <p className="mt-2 text-sm text-slate-500">Quản lý triển khai DEV → UAT → PROD tại một nơi.</p>
-        {params.error ? (
+        {params.error === 'storage' ? (
+          <div className="mt-4 rounded border border-rose-500/30 bg-rose-500/10 px-3.5 py-2.5 text-sm text-rose-300">
+            Hệ thống xác thực tạm thời không khả dụng. Vui lòng thử lại sau ít phút.
+          </div>
+        ) : params.error ? (
           <div className="mt-4 rounded border border-rose-500/30 bg-rose-500/10 px-3.5 py-2.5 text-sm text-rose-300">
             Tên đăng nhập hoặc mật khẩu không đúng.
           </div>

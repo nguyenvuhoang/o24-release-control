@@ -84,6 +84,11 @@ test('profile-bound image repositories use only their project namespace', () => 
   assert.equal(imageRepositoryForProfile('w4s', 'CMS'), 'vknighthub/w4s_o24cms')
   assert.equal(imageRepositoryForProfile('w4s', 'W4S'), 'vknighthub/w4s_o24w4s')
   assert.equal(imageRepositoryForProfile('w4s', 'AI'), 'vknighthub/w4s_o24ai')
+  // PMT is available on BOTH profiles — pins the exact image name named in
+  // the production incident brief for the IPS profile, and its W4S
+  // equivalent (this branch's active profile).
+  assert.equal(imageRepositoryForProfile('ips', 'PMT'), 'vknighthub/ips_o24pmt')
+  assert.equal(imageRepositoryForProfile('w4s', 'PMT'), 'vknighthub/w4s_o24pmt')
 })
 
 test('profile-bound validation rejects services from the other project', () => {

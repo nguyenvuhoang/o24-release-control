@@ -45,56 +45,87 @@ export async function handleReconcileSnapshotsCron(authorizationHeader: string |
   const nowMs = (deps.now ?? Date.now)()
 
   const dueJobs = await jobStore.listDuePending(nowMs, DUE_JOBS_PER_RUN)
-  const summary = { processed: 0, completed: 0, retried: 0, failed: 0 }
+  const summary = { processed: 0, completed: 0, retried: 0, failed: 0, errored: 0 }
 
   for (const job of dueJobs) {
     summary.processed += 1
-    await jobStore.markResolving(job.service, job.runId)
+    try {
+      await jobStore.markResolving(job.service, job.runId)
 
-    if (isJobExpired(job.createdAt, nowMs)) {
-      await jobStore.markFailedTerminal(job.service, job.runId, 'exceeded max reconcile age')
-      summary.failed += 1
-      continue
-    }
-
-    const runSnapshot: BuildRunSnapshot = {
-      runId: job.runId,
-      status: 'completed',
-      conclusion: 'success',
-      htmlUrl: job.htmlUrl,
-      branch: job.branch,
-      commitSha: job.commitSha,
-      createdAt: job.createdAt,
-      updatedAt: new Date(nowMs).toISOString(),
-      runAttempt: job.runAttempt,
-    }
-
-    const outcome = await createSnapshot(runSnapshot, job.service, job.createdBySource)
-
-    if (outcome.outcome === 'created') {
-      await jobStore.markCompletedIfExists(job.service, job.runId, outcome.result.record.id)
-      summary.completed += 1
-      continue
-    }
-
-    if (outcome.outcome === 'digest_not_found') {
-      if (job.attemptCount + 1 >= MAX_RECONCILE_ATTEMPTS) {
-        await jobStore.markFailedTerminal(job.service, job.runId, 'exceeded max reconcile attempts')
+      if (isJobExpired(job.createdAt, nowMs)) {
+        await jobStore.markFailedTerminal(job.service, job.runId, 'exceeded max reconcile age')
         summary.failed += 1
-      } else {
-        const nextRetryAt = new Date(nowMs + computeNextRetryDelayMs(job.attemptCount)).toISOString()
-        await jobStore.markRetry(job.service, job.runId, 'digest_not_found', nextRetryAt)
-        summary.retried += 1
+        continue
       }
-      continue
-    }
 
-    // 'not_eligible' (shouldn't happen — the run was known completed+success
-    // when the job was created, and that never changes) or 'conflict' —
-    // retrying can never change either outcome.
-    const errorDetail = outcome.outcome === 'conflict' ? `conflict: ${outcome.releaseId}` : outcome.outcome
-    await jobStore.markFailedTerminal(job.service, job.runId, errorDetail)
-    summary.failed += 1
+      const runSnapshot: BuildRunSnapshot = {
+        runId: job.runId,
+        status: 'completed',
+        conclusion: 'success',
+        htmlUrl: job.htmlUrl,
+        branch: job.branch,
+        commitSha: job.commitSha,
+        createdAt: job.createdAt,
+        updatedAt: new Date(nowMs).toISOString(),
+        runAttempt: job.runAttempt,
+      }
+
+      const outcome = await createSnapshot(runSnapshot, job.service, job.createdBySource)
+
+      if (outcome.outcome === 'created') {
+        await jobStore.markCompletedIfExists(job.service, job.runId, outcome.result.record.id)
+        summary.completed += 1
+        continue
+      }
+
+      if (outcome.outcome === 'digest_not_found') {
+        if (job.attemptCount + 1 >= MAX_RECONCILE_ATTEMPTS) {
+          await jobStore.markFailedTerminal(job.service, job.runId, 'exceeded max reconcile attempts')
+          summary.failed += 1
+        } else {
+          const nextRetryAt = new Date(nowMs + computeNextRetryDelayMs(job.attemptCount)).toISOString()
+          await jobStore.markRetry(job.service, job.runId, 'digest_not_found', nextRetryAt)
+          summary.retried += 1
+        }
+        continue
+      }
+
+      // 'not_eligible' (shouldn't happen — the run was known completed+success
+      // when the job was created, and that never changes) or 'conflict' —
+      // retrying can never change either outcome.
+      const errorDetail = outcome.outcome === 'conflict' ? `conflict: ${outcome.releaseId}` : outcome.outcome
+      await jobStore.markFailedTerminal(job.service, job.runId, errorDetail)
+      summary.failed += 1
+    } catch (error) {
+      // A transient failure (KV/GitHub/Docker Hub hiccup) processing ONE job
+      // must never abort the whole batch — every other due job still gets a
+      // chance this tick. markResolving above already flipped this job's
+      // status away from 'pending', and listDuePending only ever returns
+      // 'pending' jobs — without reverting it here, a job that fails after
+      // that point would be stuck in 'resolving' forever, invisible to every
+      // future cron run (this was a real durability gap, not hypothetical).
+      const message = error instanceof Error ? error.message : 'Unknown error'
+      console.error('[cron/reconcile-snapshots] job processing failed — reverting to pending for retry', {
+        service: job.service,
+        runId: job.runId,
+        error: message,
+      })
+      summary.errored += 1
+      try {
+        const nextRetryAt = new Date(nowMs + computeNextRetryDelayMs(job.attemptCount)).toISOString()
+        await jobStore.markRetry(job.service, job.runId, message, nextRetryAt)
+      } catch (revertError) {
+        // Storage itself is unavailable right now — nothing more can be done
+        // for this job this tick; it stays 'resolving' until a future tick
+        // where storage has recovered, at which point THIS catch no longer
+        // fires and the revert above succeeds.
+        console.error('[cron/reconcile-snapshots] failed to revert job to pending — will remain stuck until storage recovers', {
+          service: job.service,
+          runId: job.runId,
+          error: revertError instanceof Error ? revertError.message : 'Unknown error',
+        })
+      }
+    }
   }
 
   return { status: 200, body: { status: 'ok', ...summary } }

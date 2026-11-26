@@ -65,6 +65,21 @@ function defaultLogLoginFailure(reason: LoginFailureReason, context: { username:
 }
 
 /**
+ * Thrown ONLY when the user store itself could not be reached (a transient
+ * KV failure) — distinct from "credentials didn't match" (see
+ * LoginFailureReason). The env-admin path never touches KV, so it can never
+ * throw this; a real non-admin login hitting a flaky KV read must surface as
+ * a retriable infra error, never silently fall through to (or get conflated
+ * with) "invalid credentials", and never crash the request uncaught.
+ */
+export class AuthStorageError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'AuthStorageError'
+  }
+}
+
+/**
  * Tries the env-based admin account first (unchanged behavior — always
  * available regardless of Redis config), then falls back to the Redis user
  * store (see lib/userRepository.ts) with a bcrypt-verified password. Returns
@@ -93,7 +108,14 @@ export async function validateCredentials(
     return null
   }
 
-  const record = await userRepository.getByUsername(username)
+  let record
+  try {
+    record = await userRepository.getByUsername(username)
+  } catch (error) {
+    throw new AuthStorageError(
+      `User store unavailable while resolving login for "${username}": ${error instanceof Error ? error.message : 'Unknown error'}`,
+    )
+  }
   if (!record) {
     logFailure('user_not_found', { username })
     return null

@@ -57,19 +57,140 @@ export class GithubPermissionError extends Error {
   }
 }
 
-async function githubRequest<T>(path: string, init: RequestInit = {}): Promise<T | null> {
+// Thrown for a 401 — token is missing/revoked/expired. Distinct from
+// GithubPermissionError (403: token is valid but lacks a scope) so callers
+// (and diagnostics) never conflate "bad token" with "token missing a grant".
+export class GithubAuthError extends Error {
+  constructor(
+    public readonly path: string,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'GithubAuthError'
+  }
+}
+
+// Thrown for GitHub's primary (429) and secondary (403 with rate-limit
+// signals) rate limits — never for a genuine permission 403, see
+// isSecondaryRateLimitSignal. retryAfterMs is the best available hint from
+// Retry-After/X-RateLimit-Reset, null when GitHub sent neither.
+export class GithubRateLimitError extends Error {
+  constructor(
+    public readonly path: string,
+    message: string,
+    public readonly retryAfterMs: number | null,
+  ) {
+    super(message)
+    this.name = 'GithubRateLimitError'
+  }
+}
+
+// Thrown for GitHub upstream 500/502/503/504 — transient, safe to retry on
+// GET requests (never on the dispatch POST, see triggerWorkflowBuild).
+export class GithubServerError extends Error {
+  constructor(
+    public readonly path: string,
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'GithubServerError'
+  }
+}
+
+// Thrown when the request itself never got a response — DNS/connection
+// reset/timeout (the literal "fetch failed" seen in production logs).
+// Retryable on GET, same as GithubServerError.
+export class GithubNetworkError extends Error {
+  constructor(
+    public readonly path: string,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'GithubNetworkError'
+  }
+}
+
+// Bounded per-attempt timeout — GitHub's API has no documented SLA, and a
+// hung connection on a serverless function must never block indefinitely
+// (that's exactly how one slow GitHub response turns into a 2,200-request
+// pileup). Overridable per-deployment, always bounded.
+const DEFAULT_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.GITHUB_REQUEST_TIMEOUT_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 10_000
+})()
+const MAX_GET_RETRIES = 2 // up to 3 total attempts
+const BASE_RETRY_DELAY_MS = 300
+const MAX_RETRY_DELAY_MS = 4_000
+// Never block a request waiting out a rate limit longer than this — beyond
+// it, fail fast so the caller's own fallback (stale cache, known-run
+// fallback, etc.) can take over instead of a function hanging near its
+// platform timeout.
+const MAX_RATE_LIMIT_WAIT_MS = 5_000
+
+function parseRetryAfterMs(response: Response): number | null {
+  const retryAfter = response.headers.get('retry-after')
+  if (retryAfter) {
+    const seconds = Number(retryAfter)
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000
+  }
+  const reset = response.headers.get('x-ratelimit-reset')
+  if (reset) {
+    const resetAtMs = Number(reset) * 1000
+    if (Number.isFinite(resetAtMs)) {
+      const delay = resetAtMs - Date.now()
+      if (delay > 0) return delay
+    }
+  }
+  return null
+}
+
+// GitHub signals BOTH permission failures and secondary/primary rate limits
+// with a 403 — the only reliable way to tell them apart is these headers
+// (never the message text alone, which GitHub doesn't guarantee the wording
+// of). A real permission 403 never carries these.
+function isSecondaryRateLimitSignal(response: Response): boolean {
+  if (response.headers.get('x-ratelimit-remaining') === '0') return true
+  if (response.headers.get('retry-after')) return true
+  return false
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// Single HTTP attempt, no retry — used directly by the dispatch POST (which
+// must never be blindly retried, see triggerWorkflowBuild) and wrapped by
+// githubRequest (below) for every GET read.
+async function githubRequestOnce<T>(path: string, init: RequestInit = {}): Promise<T | null> {
   const { token, apiVersion } = githubConfig()
-  const response = await fetch(`${GITHUB_API_BASE}${path}`, {
-    ...init,
-    headers: {
-      Accept: 'application/vnd.github+json',
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-      'X-GitHub-Api-Version': apiVersion,
-      ...init.headers,
-    },
-    cache: 'no-store',
-  })
+  const controller = new AbortController()
+  const timeoutHandle = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
+
+  let response: Response
+  try {
+    response = await fetch(`${GITHUB_API_BASE}${path}`, {
+      ...init,
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        'X-GitHub-Api-Version': apiVersion,
+        ...init.headers,
+      },
+      cache: 'no-store',
+      signal: controller.signal,
+    })
+  } catch (networkError) {
+    const isTimeout = networkError instanceof Error && networkError.name === 'AbortError'
+    const message = networkError instanceof Error ? networkError.message : 'Unknown network error'
+    throw new GithubNetworkError(
+      path,
+      isTimeout ? `GitHub request timed out after ${DEFAULT_TIMEOUT_MS}ms: ${path}` : `GitHub request failed (${path}): ${message}`,
+    )
+  } finally {
+    clearTimeout(timeoutHandle)
+  }
 
   let parsed: unknown
   try {
@@ -83,13 +204,66 @@ async function githubRequest<T>(path: string, init: RequestInit = {}): Promise<T
     const message = parsed && typeof parsed === 'object' && 'message' in parsed
       ? String((parsed as { message?: unknown }).message ?? response.statusText)
       : response.statusText
+
+    if (response.status === 401) {
+      throw new GithubAuthError(path, `GitHub token không hợp lệ hoặc đã hết hạn cho ${path}: ${message}`)
+    }
     if (response.status === 403) {
+      if (isSecondaryRateLimitSignal(response)) {
+        throw new GithubRateLimitError(path, `GitHub rate limit cho ${path}: ${message}`, parseRetryAfterMs(response))
+      }
       throw new GithubPermissionError(path, `GitHub token thiếu quyền cần thiết cho ${path}: ${message}`)
+    }
+    if (response.status === 429) {
+      throw new GithubRateLimitError(path, `GitHub rate limit cho ${path}: ${message}`, parseRetryAfterMs(response))
+    }
+    if (response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504) {
+      throw new GithubServerError(path, response.status, `GitHub API ${response.status}: ${message}`)
     }
     throw new Error(`GitHub API ${response.status}: ${message}`)
   }
 
   return parsed as T | null
+}
+
+/**
+ * GET-only wrapper: bounded retry (3 attempts total) with exponential
+ * backoff + jitter for transient failures (GithubServerError,
+ * GithubNetworkError), and for rate limits specifically, waits out
+ * Retry-After/X-RateLimit-Reset only up to MAX_RATE_LIMIT_WAIT_MS — never
+ * long enough to risk the caller's own timeout. Auth/permission/validation
+ * errors are never retried — retrying a 401/403/4xx cannot change the
+ * outcome. Never used for the dispatch POST — see triggerWorkflowBuild.
+ */
+async function githubRequest<T>(path: string, init: RequestInit = {}): Promise<T | null> {
+  let attempt = 0
+  for (;;) {
+    try {
+      return await githubRequestOnce<T>(path, init)
+    } catch (error) {
+      const isLastAttempt = attempt >= MAX_GET_RETRIES
+
+      if (error instanceof GithubRateLimitError) {
+        const waitMs = error.retryAfterMs ?? BASE_RETRY_DELAY_MS * 2 ** attempt
+        if (isLastAttempt || waitMs > MAX_RATE_LIMIT_WAIT_MS) throw error
+        await sleep(waitMs)
+        attempt += 1
+        continue
+      }
+
+      if (error instanceof GithubServerError || error instanceof GithubNetworkError) {
+        if (isLastAttempt) throw error
+        const base = Math.min(BASE_RETRY_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS)
+        const jittered = Math.round(base * (0.5 + Math.random()))
+        await sleep(jittered)
+        attempt += 1
+        continue
+      }
+
+      // GithubAuthError, GithubPermissionError, or any other (4xx/validation) — never retried.
+      throw error
+    }
+  }
 }
 
 type GithubRunResponse = {
@@ -127,16 +301,17 @@ function normalizeRun(run: GithubRunResponse): BuildRunSnapshot {
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
 /**
  * Fallback only: older GitHub API behavior returns 204 No Content from
  * workflow_dispatch, with no run id in the response. When that happens we
  * have no choice but to poll the "list workflow runs" endpoint and pick the
  * newest run created at/after the dispatch call. The primary path
  * (API version 2026-03-10, see triggerWorkflowBuild) never needs this.
+ *
+ * Each poll already retries transient failures internally (githubRequest),
+ * but a run that exhausts THAT retry budget on one attempt must not abort
+ * the whole wait — swallow it and let the next (of 6) attempts try again;
+ * only the final attempt's error (if any) is surfaced.
  */
 async function resolveDispatchedRun(branch: string, dispatchedAt: Date): Promise<GithubRunResponse> {
   const { owner, repo, workflow } = githubConfig()
@@ -144,15 +319,26 @@ async function resolveDispatchedRun(branch: string, dispatchedAt: Date): Promise
   const delayMs = 1500
   const cutoff = dispatchedAt.getTime() - 5000 // small tolerance for clock skew
 
+  let lastError: unknown
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     await sleep(delayMs)
-    const data = await githubRequest<{ workflow_runs: GithubRunResponse[] }>(
-      `/repos/${owner}/${repo}/actions/workflows/${encodeURIComponent(workflow)}/runs?event=workflow_dispatch&branch=${encodeURIComponent(branch)}&per_page=5`,
-    )
-    const match = data?.workflow_runs.find((run) => new Date(run.created_at).getTime() >= cutoff)
-    if (match) return match
+    try {
+      const data = await githubRequest<{ workflow_runs: GithubRunResponse[] }>(
+        `/repos/${owner}/${repo}/actions/workflows/${encodeURIComponent(workflow)}/runs?event=workflow_dispatch&branch=${encodeURIComponent(branch)}&per_page=5`,
+      )
+      const match = data?.workflow_runs.find((run) => new Date(run.created_at).getTime() >= cutoff)
+      if (match) return match
+    } catch (error) {
+      lastError = error
+      console.error('[github] resolveDispatchedRun attempt failed — will retry', {
+        attempt,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+    }
   }
-  throw new Error('Timed out waiting for GitHub to register the triggered workflow run')
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Timed out waiting for GitHub to register the triggered workflow run')
 }
 
 type DispatchResponseBody = {
@@ -169,7 +355,10 @@ export async function triggerWorkflowBuild(input: {
   const { owner, repo, workflow } = githubConfig()
   const dispatchedAt = new Date()
 
-  const data = await githubRequest<DispatchResponseBody>(
+  // githubRequestOnce — NEVER the retrying githubRequest — a dispatch POST
+  // that succeeded upstream but whose response we failed to receive must
+  // never be retried blindly (that would create a second, duplicate build).
+  const data = await githubRequestOnce<DispatchResponseBody>(
     `/repos/${owner}/${repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`,
     {
       method: 'POST',
@@ -220,19 +409,64 @@ export async function getWorkflowRun(runId: number): Promise<BuildRunSnapshot> {
 // build-o24.yml does that; if it doesn't, this returns null and the route
 // falls back to buildPointerStore for runs control-center itself dispatched.
 let runsListCache: { at: number; runs: GithubRunResponse[] } | null = null
-const RUNS_LIST_CACHE_TTL_MS = 8000
+// Bounded (not unbounded, not an eternal cache) but wide enough that
+// concurrent per-service polling (several services' /api/builds/latest
+// calls landing within the same few seconds) shares one GitHub read instead
+// of each re-scanning — was 8s, too tight to meaningfully cut duplicate
+// traffic under the dashboard's own polling cadence.
+const RUNS_LIST_CACHE_TTL_MS = 15_000
+// Single-flight: concurrent cache-miss callers (e.g. hydrating every
+// service's card at once on page load) await the SAME in-flight GitHub
+// request instead of each issuing their own — this is process-local, same
+// scope as the cache itself (see the module doc comment above).
+let runsListInFlight: Promise<GithubRunResponse[]> | null = null
+
+async function fetchRunsList(): Promise<GithubRunResponse[]> {
+  const { owner, repo, workflow } = githubConfig()
+  const data = await githubRequest<{ workflow_runs: GithubRunResponse[] }>(
+    `/repos/${owner}/${repo}/actions/workflows/${encodeURIComponent(workflow)}/runs?per_page=100`,
+  )
+  return data?.workflow_runs ?? []
+}
 
 async function listRecentWorkflowRuns(): Promise<GithubRunResponse[]> {
   if (runsListCache && Date.now() - runsListCache.at < RUNS_LIST_CACHE_TTL_MS) {
     return runsListCache.runs
   }
-  const { owner, repo, workflow } = githubConfig()
-  const data = await githubRequest<{ workflow_runs: GithubRunResponse[] }>(
-    `/repos/${owner}/${repo}/actions/workflows/${encodeURIComponent(workflow)}/runs?per_page=100`,
-  )
-  const runs = data?.workflow_runs ?? []
-  runsListCache = { at: Date.now(), runs }
-  return runs
+  if (runsListInFlight) return runsListInFlight
+
+  runsListInFlight = (async () => {
+    try {
+      const runs = await fetchRunsList()
+      runsListCache = { at: Date.now(), runs }
+      return runs
+    } catch (error) {
+      // Last-known-good fallback: a transient GitHub failure (after
+      // githubRequest's own retries are exhausted) must not throw away a
+      // still-useful cache — serve it stale rather than making every poller
+      // 502 (see "[latestReleaseResolver] GitHub run scan failed" in
+      // production logs). Only throws when there is truly nothing cached.
+      if (runsListCache) {
+        const ageMs = Date.now() - runsListCache.at
+        console.error('[github] workflow run list refresh failed — serving stale cache', {
+          staleForMs: ageMs,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        })
+        return runsListCache.runs
+      }
+      throw error
+    } finally {
+      runsListInFlight = null
+    }
+  })()
+
+  return runsListInFlight
+}
+
+/** Test-only: clears the process-local runs-list cache/in-flight state between tests. */
+export function resetGithubRunsListCacheForTests(): void {
+  runsListCache = null
+  runsListInFlight = null
 }
 
 function runMentionsService(run: GithubRunResponse, service: string): boolean {

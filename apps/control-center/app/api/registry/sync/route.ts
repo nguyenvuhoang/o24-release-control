@@ -80,30 +80,49 @@ export async function POST(request: Request) {
     const response: RegistrySyncResponse = { success: true, release: record, deduped }
     return NextResponse.json(response)
   } catch (error) {
+    // The audit write below is best-effort diagnostics for an ALREADY-failed
+    // sync — if KV is also flaky for this write, it must never be allowed to
+    // escape uncaught and turn the intended (502/409/400) response into an
+    // unhandled framework 500. This is the exact, confirmed mechanism behind
+    // "Release Snapshot synchronization returns HTTP 500" in production.
     if (error instanceof ReleaseConflictError) {
-      await appendAudit({
-        idempotencyKey: `registry-import-conflict:${error.releaseId}:${Date.now()}`,
-        username: session.username,
-        action: 'import',
-        service,
-        releaseId: error.releaseId,
-        status: 'failed',
-        error: error.message,
-      })
+      try {
+        await appendAudit({
+          idempotencyKey: `registry-import-conflict:${error.releaseId}:${Date.now()}`,
+          username: session.username,
+          action: 'import',
+          service,
+          releaseId: error.releaseId,
+          status: 'failed',
+          error: error.message,
+        })
+      } catch (auditError) {
+        console.error('[registry] sync conflict audit write failed', {
+          service,
+          error: auditError instanceof Error ? auditError.message : 'Unknown error',
+        })
+      }
       return syncError('release_conflict', 409, error.message)
     }
     if (error instanceof InvalidReleaseInputError) {
       return syncError('invalid_release', 400, error.message)
     }
     console.error('[registry] sync failed', { service, error: error instanceof Error ? error.message : 'Unknown error' })
-    await appendAudit({
-      idempotencyKey: `registry-import-failed:${service}:${Date.now()}`,
-      username: session.username,
-      action: 'import',
-      service,
-      status: 'failed',
-      error: error instanceof Error ? error.message : 'Unknown error',
-    })
+    try {
+      await appendAudit({
+        idempotencyKey: `registry-import-failed:${service}:${Date.now()}`,
+        username: session.username,
+        action: 'import',
+        service,
+        status: 'failed',
+        error: error instanceof Error ? error.message : 'Unknown error',
+      })
+    } catch (auditError) {
+      console.error('[registry] sync failure audit write failed', {
+        service,
+        error: auditError instanceof Error ? auditError.message : 'Unknown error',
+      })
+    }
     return syncError('sync_failed', 502, error instanceof Error ? error.message : 'Unknown error')
   }
 }

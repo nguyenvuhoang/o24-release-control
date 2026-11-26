@@ -20,44 +20,76 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'invalid_service', details: `service must be one of: ${BUILD_SERVICES.join(', ')}` }, { status: 400 })
   }
 
+  // GitHub Actions is the authoritative source of build execution status —
+  // a failure anywhere else (audit/snapshot persistence) must never turn a
+  // successful GitHub read into a 502. Only a genuine failure to determine
+  // the run itself (both the scan AND the known-run fallback failing) is
+  // allowed to fail this request.
+  let run
   try {
-    let run = await findLatestGithubRunForService(service)
-    if (!run) {
-      // Scan found nothing (workflow's run-name/job names may not embed the
-      // service) — fall back to a run WE know we dispatched for this
-      // service, if any, re-read live so its status is still current.
+    run = await findLatestGithubRunForService(service)
+  } catch (scanError) {
+    // The scan throwing (GitHub 5xx/timeout/network) must fall back to a
+    // known-dispatched run exactly like a clean "found nothing" does — this
+    // was the direct cause of a transient GitHub hiccup immediately
+    // surfacing as a 502 even when control-center itself dispatched (and
+    // therefore already knows) this very run.
+    console.error('[builds/latest] GitHub run scan failed — falling back to known dispatched run', {
+      service,
+      error: scanError instanceof Error ? scanError.message : 'Unknown error',
+    })
+    run = null
+  }
+
+  if (!run) {
+    try {
+      // Scan found nothing (or threw) — fall back to a run WE know we
+      // dispatched for this service, if any, re-read live so its status is
+      // still current.
       const knownRunId = await getLastDispatchedRun(service)
       if (knownRunId) run = await getWorkflowRun(knownRunId)
+    } catch (fallbackError) {
+      // Both paths to a run have now failed — this IS a genuine 502: there
+      // is truly no way to answer "what is the latest build" right now.
+      return errorResponse(fallbackError, 502)
     }
-
-    if (!run) {
-      const empty: LatestBuildResponse = { service, runId: null }
-      return NextResponse.json(empty)
-    }
-
-    // Whichever path found it, this may be the first time ANY client has
-    // observed this run reach a terminal state (e.g. it was dispatched from
-    // Telegram and nobody ever polled /api/builds/{runId} for it) — record
-    // it now so the audit trail doesn't miss builds that didn't originate
-    // in this app. Idempotent: harmless if the per-run poll route already
-    // recorded the same runId+attempt.
-    await appendBuildAudit(run, service, session.username)
-    try {
-      // Fallback/reconciliation path (the webhook is primary) — see
-      // app/api/builds/[runId]/route.ts's identical comment.
-      await attemptSnapshotAndPersistPending(run, service, session.username)
-    } catch (snapshotError) {
-      // Best-effort, same non-blocking contract as appendBuildAudit above.
-      console.error('[builds/latest] attemptSnapshotAndPersistPending failed', {
-        service,
-        runId: run.runId,
-        error: snapshotError instanceof Error ? snapshotError.message : 'Unknown error',
-      })
-    }
-
-    const response: LatestBuildResponse = { service, ...run }
-    return NextResponse.json(response)
-  } catch (error) {
-    return errorResponse(error, 502)
   }
+
+  if (!run) {
+    const empty: LatestBuildResponse = { service, runId: null }
+    return NextResponse.json(empty)
+  }
+
+  // Whichever path found it, this may be the first time ANY client has
+  // observed this run reach a terminal state (e.g. it was dispatched from
+  // Telegram and nobody ever polled /api/builds/{runId} for it) — record
+  // it now so the audit trail doesn't miss builds that didn't originate
+  // in this app. Idempotent: harmless if the per-run poll route already
+  // recorded the same runId+attempt. Best-effort: a durable-storage hiccup
+  // here must never mask an otherwise-successful GitHub status read (see
+  // the module doc comment).
+  try {
+    await appendBuildAudit(run, service, session.username)
+  } catch (auditError) {
+    console.error('[builds/latest] appendBuildAudit failed', {
+      service,
+      runId: run.runId,
+      error: auditError instanceof Error ? auditError.message : 'Unknown error',
+    })
+  }
+  try {
+    // Fallback/reconciliation path (the webhook is primary) — see
+    // app/api/builds/[runId]/route.ts's identical comment.
+    await attemptSnapshotAndPersistPending(run, service, session.username)
+  } catch (snapshotError) {
+    // Best-effort, same non-blocking contract as appendBuildAudit above.
+    console.error('[builds/latest] attemptSnapshotAndPersistPending failed', {
+      service,
+      runId: run.runId,
+      error: snapshotError instanceof Error ? snapshotError.message : 'Unknown error',
+    })
+  }
+
+  const response: LatestBuildResponse = { service, ...run }
+  return NextResponse.json(response)
 }

@@ -221,6 +221,9 @@ export function ServiceCard({
             ) : null}
           </div>
           {buildState.status === 'failed' && buildState.error ? <p className="mt-1.5 break-words text-rose-300">{buildState.error}</p> : null}
+          {buildState.status !== 'failed' && buildState.monitoringError ? (
+            <p className="mt-1.5 break-words text-amber-400">Mất kết nối giám sát build, đang tự động thử lại…</p>
+          ) : null}
         </div>
       ) : null}
 

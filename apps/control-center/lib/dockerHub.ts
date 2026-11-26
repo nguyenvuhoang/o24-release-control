@@ -2,6 +2,27 @@ import type { DockerHubTagInfo } from './types'
 
 const DOCKER_HUB_API_BASE = 'https://hub.docker.com/v2'
 
+// Bounded per-attempt timeout — same rationale as lib/github/client.ts and
+// lib/kv.ts: a hung Docker Hub/registry connection on a serverless function
+// must never block indefinitely.
+const DEFAULT_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.DOCKER_HUB_REQUEST_TIMEOUT_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 10_000
+})()
+
+async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Response> {
+  const controller = new AbortController()
+  const timeoutHandle = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } catch (error) {
+    const isTimeout = error instanceof Error && error.name === 'AbortError'
+    throw new Error(isTimeout ? `Docker Hub/registry request timed out after ${DEFAULT_TIMEOUT_MS}ms: ${url}` : `Docker Hub/registry request failed: ${error instanceof Error ? error.message : 'Unknown error'}`)
+  } finally {
+    clearTimeout(timeoutHandle)
+  }
+}
+
 type DockerHubTagResponse = { digest?: string; last_updated?: string }
 
 /**
@@ -14,7 +35,7 @@ type DockerHubTagResponse = { digest?: string; last_updated?: string }
  */
 export async function fetchDockerHubTagDigest(repository: string, tag = 'latest'): Promise<DockerHubTagInfo | null> {
   const url = `${DOCKER_HUB_API_BASE}/repositories/${repository}/tags/${encodeURIComponent(tag)}`
-  const response = await fetch(url, { cache: 'no-store' })
+  const response = await fetchWithTimeout(url, { cache: 'no-store' })
   if (response.status === 404) return null
   if (!response.ok) {
     throw new Error(`Docker Hub API ${response.status}: ${response.statusText}`)
@@ -51,14 +72,14 @@ type DockerImageConfig = { config?: { Labels?: Record<string, string> } }
 
 async function getAnonymousPullToken(repository: string): Promise<string | null> {
   const url = `${DOCKER_AUTH_URL}?service=registry.docker.io&scope=repository:${repository}:pull`
-  const response = await fetch(url, { cache: 'no-store' })
+  const response = await fetchWithTimeout(url, { cache: 'no-store' })
   if (!response.ok) return null
   const data = (await response.json()) as { token?: string; access_token?: string }
   return data.token ?? data.access_token ?? null
 }
 
 async function fetchManifest(repository: string, reference: string, token: string): Promise<DockerManifest | null> {
-  const response = await fetch(`${DOCKER_REGISTRY_BASE}/${repository}/manifests/${reference}`, {
+  const response = await fetchWithTimeout(`${DOCKER_REGISTRY_BASE}/${repository}/manifests/${reference}`, {
     headers: { Authorization: `Bearer ${token}`, Accept: MANIFEST_ACCEPT },
     cache: 'no-store',
   })
@@ -98,7 +119,7 @@ export async function fetchImageRevisionLabel(repository: string, repoDigest: st
 
     if (!manifest.config?.digest) return null
 
-    const blobResponse = await fetch(`${DOCKER_REGISTRY_BASE}/${repository}/blobs/${manifest.config.digest}`, {
+    const blobResponse = await fetchWithTimeout(`${DOCKER_REGISTRY_BASE}/${repository}/blobs/${manifest.config.digest}`, {
       headers: { Authorization: `Bearer ${token}` },
       cache: 'no-store',
     })

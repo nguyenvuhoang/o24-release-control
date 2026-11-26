@@ -31,6 +31,13 @@ export type BuildTrackedState = {
   runAttempt?: number
   error?: string
   updatedAt?: string
+  // Set only when repeated attempts to READ status have failed (network/our
+  // own API 502-5xx) — deliberately separate from `error`/`status: 'failed'`,
+  // which mean "GitHub reported this build failed". A monitoring failure is
+  // never promoted to a build failure: HTTP 502 from our own status API
+  // must never automatically mean the build itself failed. Cleared on the
+  // next successful read.
+  monitoringError?: string
 }
 
 type ApiErrorBody = { error?: string; details?: string }
@@ -52,9 +59,13 @@ type LatestBuildResult = ({ service: string; runId: null }) | ({ service: string
 // null return means "stop polling"; a number is the delay before the next poll.
 type PollOutcome = { nextDelayMs: number | null }
 
-const FAST_INTERVAL_MS = 3000
+// 10s, per the requested "reasonable polling interval for active builds"
+// range — was 3s, which (multiplied across every tracked service, every
+// poller) was a meaningful contributor to the request volume behind the
+// Vercel error spike.
+const FAST_INTERVAL_MS = 10000
 // Once a run completes as a failure, GitHub's "Re-run failed jobs" can land
-// minutes later — polling every 3s for that whole time would be wasteful, so
+// minutes later — polling every 10s for that whole time would be wasteful, so
 // this cadence (within the requested 15–30s range) is used instead while
 // watching for it.
 const SLOW_INTERVAL_MS = 20000
@@ -63,6 +74,18 @@ const SLOW_INTERVAL_MS = 20000
 // action still works after this window closes.
 const SLOW_WATCH_WINDOW_MS = 15 * 60 * 1000
 const MAX_CONSECUTIVE_ERRORS = 5
+// Recovery cadence used ONLY once MAX_CONSECUTIVE_ERRORS is reached — never
+// stops polling (a monitoring failure must recover automatically once the
+// transient upstream issue clears), just backs off further so a prolonged
+// outage doesn't keep hammering our own API every few seconds.
+const RECOVERY_BASE_INTERVAL_MS = 15000
+const RECOVERY_MAX_INTERVAL_MS = 60000
+// Bounded retries for the one-shot discovery read (hydrate / manual sync) —
+// was a silent, unretried no-op on any failure, which is the literal
+// mechanism behind "reloading the browser does not reliably recover the
+// actual build status" when GitHub/our API is transiently down at that exact
+// moment.
+const SYNC_RETRY_DELAYS_MS = [3000, 8000, 20000]
 
 function isRunningStatus(status: BuildRunStatus): status is 'queued' | 'in_progress' {
   return status === 'queued' || status === 'in_progress'
@@ -105,6 +128,18 @@ export function deriveBuildUpdate(
     nextDelayMs: now < deadline ? SLOW_INTERVAL_MS : null,
     slowWatchDeadline: deadline,
   }
+}
+
+/**
+ * Pure backoff schedule used once MAX_CONSECUTIVE_ERRORS is reached — kept
+ * separate from deriveBuildUpdate (which only ever runs on a SUCCESSFUL
+ * read) so the "keep retrying forever, just slower" monitoring-recovery
+ * cadence is directly unit-testable. `errorsPastThreshold` is
+ * errorCount - MAX_CONSECUTIVE_ERRORS (0 on the very first post-threshold
+ * failure), always >= 0.
+ */
+export function computeMonitoringRecoveryDelayMs(errorsPastThreshold: number): number {
+  return Math.min(RECOVERY_BASE_INTERVAL_MS * 2 ** Math.max(errorsPastThreshold, 0), RECOVERY_MAX_INTERVAL_MS)
 }
 
 // Purely an optimistic first-paint cache — see the module doc comment above.
@@ -184,6 +219,27 @@ export function useBuildTracker() {
   // `builds`, which can also be true from an unverified localStorage-cache
   // seed. hydrateFromServer only skips services already in this set.
   const verifiedThisSession = useRef<Set<string>>(new Set())
+  // Monotonic per-service counter: every pollRun/syncFromLatest/triggerBuild
+  // call bumps it before awaiting, then checks it's still current before
+  // applying its result. Prevents a slower, earlier-issued request (e.g. a
+  // background poll already in flight when the user clicks "Đồng bộ trạng
+  // thái") from clobbering state with stale data after a newer request has
+  // since been issued or already resolved.
+  const requestEpoch = useRef<Map<string, number>>(new Map())
+  // A discovery sequence (syncFromLatest + its bounded retries) already in
+  // progress for this service — hydrateFromServer/syncBuild skip starting a
+  // second, overlapping one rather than racing two live /api/builds/latest
+  // reads for the same service.
+  const syncInFlight = useRef<Set<string>>(new Set())
+
+  const nextEpoch = useCallback((service: string): number => {
+    const next = (requestEpoch.current.get(service) ?? 0) + 1
+    requestEpoch.current.set(service, next)
+    return next
+  }, [])
+  const isCurrentEpoch = useCallback((service: string, epoch: number): boolean => {
+    return requestEpoch.current.get(service) === epoch
+  }, [])
 
   useEffect(() => {
     buildsRef.current = builds
@@ -242,6 +298,9 @@ export function useBuildTracker() {
             branch: snapshot.branch ?? current?.branch,
             updatedAt: snapshot.updatedAt,
             error: update.status === 'failed' ? current?.error : undefined,
+            // A live read just succeeded — any prior monitoring failure is
+            // now resolved, regardless of what the build status itself is.
+            monitoringError: undefined,
           },
         }
       })
@@ -257,9 +316,11 @@ export function useBuildTracker() {
   // since GitHub's per-run endpoint always reflects the latest attempt).
   const pollRun = useCallback(
     async (service: string, runId: number): Promise<PollOutcome> => {
+      const epoch = nextEpoch(service)
       try {
         const response = await fetch(`/api/builds/${runId}?service=${encodeURIComponent(service)}`, { cache: 'no-store' })
         const data = await readJsonSafe<RunSnapshotResult & ApiErrorBody>(response)
+        if (!isCurrentEpoch(service, epoch)) return { nextDelayMs: null } // superseded by a newer request
         if (!response.ok || !data) {
           throw new Error(data?.details ?? data?.error ?? `Không lấy được trạng thái build (mã ${response.status})`)
         }
@@ -273,17 +334,25 @@ export function useBuildTracker() {
 
         return { nextDelayMs: applyRunResult(service, data) }
       } catch (caught) {
+        if (!isCurrentEpoch(service, epoch)) return { nextDelayMs: null }
         const message = caught instanceof Error ? caught.message : 'Không lấy được trạng thái build'
         const errorCount = (consecutiveErrors.current.get(service) ?? 0) + 1
         consecutiveErrors.current.set(service, errorCount)
 
         if (errorCount >= MAX_CONSECUTIVE_ERRORS) {
+          // A failure to READ status (network/our own API 502) is NEVER the
+          // same thing as GitHub reporting the build itself failed — HTTP
+          // 502 must never automatically mean "build failed". Keep whatever
+          // status was last known, surface the monitoring problem
+          // separately, and keep retrying indefinitely (never stop) at a
+          // bounded, slower recovery cadence so this recovers automatically
+          // once the transient upstream issue clears.
           setBuilds((prev) => {
             const current = prev[service]
             if (!current || current.runId !== runId) return prev
-            return { ...prev, [service]: { ...current, status: 'failed', error: message } }
+            return { ...prev, [service]: { ...current, monitoringError: message } }
           })
-          return { nextDelayMs: null }
+          return { nextDelayMs: computeMonitoringRecoveryDelayMs(errorCount - MAX_CONSECUTIVE_ERRORS) }
         }
 
         // Transient hiccup (network blip, GitHub rate limit, etc.) — don't
@@ -294,7 +363,7 @@ export function useBuildTracker() {
         return { nextDelayMs: retryDelay }
       }
     },
-    [applyRunResult],
+    [applyRunResult, nextEpoch, isCurrentEpoch],
   )
 
   // pollRunRef breaks the pollRun <-> runAndSchedule circular dependency: the
@@ -329,11 +398,25 @@ export function useBuildTracker() {
   // manual "Đồng bộ trạng thái" action — both cases where we can't just
   // reuse a remembered runId.
   const syncFromLatest = useCallback(
-    async (service: string): Promise<void> => {
+    async (service: string, attempt = 0): Promise<void> => {
+      // Guard against two overlapping discovery sequences for the same
+      // service (e.g. hydrateFromServer called again before the first
+      // resolves, or a manual "Đồng bộ trạng thái" click while hydration is
+      // still in flight) — only the FIRST attempt of a sequence claims the
+      // guard; its own retries re-enter with attempt > 0 and must proceed.
+      if (attempt === 0) {
+        if (syncInFlight.current.has(service)) return
+        syncInFlight.current.add(service)
+      }
+      const epoch = attempt === 0 ? nextEpoch(service) : (requestEpoch.current.get(service) ?? nextEpoch(service))
+      let retryScheduled = false
       try {
         const response = await fetch(`/api/builds/latest?service=${encodeURIComponent(service)}`, { cache: 'no-store' })
         const data = await readJsonSafe<LatestBuildResult & ApiErrorBody>(response)
-        if (!response.ok || !data) return
+        if (!isCurrentEpoch(service, epoch)) return // superseded by a newer request
+        if (!response.ok || !data) {
+          throw new Error(data?.details ?? data?.error ?? `Không lấy được trạng thái build (mã ${response.status})`)
+        }
         verifiedThisSession.current.add(service)
         if (data.runId === null) return // a real "no build found" answer — nothing to schedule
 
@@ -343,14 +426,32 @@ export function useBuildTracker() {
           const handle = window.setTimeout(() => void runAndScheduleRef.current(service, data.runId as number), nextDelayMs)
           timers.current.set(service, handle)
         }
-      } catch {
-        // Best-effort discovery: leaves this service's card falling back to
-        // "no known run yet" (or whatever the optimistic cache showed) —
-        // triggering a build or a later manual sync still works normally.
+      } catch (error) {
+        if (!isCurrentEpoch(service, epoch)) return
+        if (attempt < SYNC_RETRY_DELAYS_MS.length) {
+          // Bounded retry with backoff — this (not a silent no-op) is what
+          // makes browser-reload recovery actually work when GitHub/our API
+          // is transiently down at the exact moment the dashboard loads.
+          retryScheduled = true
+          window.setTimeout(() => void syncFromLatestRef.current(service, attempt + 1), SYNC_RETRY_DELAYS_MS[attempt])
+        } else {
+          console.error('[useBuildTracker] syncFromLatest giving up after retries', {
+            service,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          })
+        }
+      } finally {
+        if (!retryScheduled) syncInFlight.current.delete(service)
       }
     },
-    [applyRunResult, clearTimer],
+    [applyRunResult, clearTimer, nextEpoch, isCurrentEpoch],
   )
+  // syncFromLatestRef breaks the syncFromLatest <-> its own retry circular
+  // dependency, same pattern as pollRunRef/runAndScheduleRef below.
+  const syncFromLatestRef = useRef(syncFromLatest)
+  useEffect(() => {
+    syncFromLatestRef.current = syncFromLatest
+  }, [syncFromLatest])
 
   // Called once the dashboard knows which services support build (DEV
   // environment services that map to a GitHub build-service code). Fetches
@@ -376,6 +477,11 @@ export function useBuildTracker() {
       clearTimer(service)
       slowWatchDeadline.current.delete(service)
       consecutiveErrors.current.delete(service)
+      // Invalidate any in-flight poll/sync for this service — a response
+      // landing after this point belongs to the run we're about to replace,
+      // never to the new one, and must never clobber the 'triggering' state
+      // set immediately below.
+      nextEpoch(service)
       setBuilds((prev) => ({ ...prev, [service]: { status: 'triggering', tag: options.tag, branch: options.branch } }))
 
       try {
@@ -422,7 +528,7 @@ export function useBuildTracker() {
         throw caught instanceof Error ? caught : new Error(message)
       }
     },
-    [clearTimer, persistEntry],
+    [clearTimer, persistEntry, nextEpoch],
   )
 
   // Manual "Đồng bộ trạng thái": always re-discovers this service's latest

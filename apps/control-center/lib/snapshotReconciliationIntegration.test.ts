@@ -131,7 +131,7 @@ test('full lifecycle: webhook exhausts immediate retries with digest still missi
           .then((result) => ({ outcome: 'created' as const, result })),
     })
 
-    assert.deepEqual(cronResult.body, { status: 'ok', processed: 1, completed: 1, retried: 0, failed: 0 })
+    assert.deepEqual(cronResult.body, { status: 'ok', processed: 1, completed: 1, retried: 0, failed: 0, errored: 0 })
 
     const jobAfterCron = await jobStore.getJob('CMS', 7001)
     assert.equal(jobAfterCron?.status, 'completed')

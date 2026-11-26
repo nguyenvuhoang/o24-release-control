@@ -19,6 +19,10 @@ export async function GET() {
   try {
     const releaseRepository = getReleaseRepository()
 
+    // Each service is resolved independently — one service's transient KV/
+    // GitHub hiccup must never 500 the entire registry status response for
+    // every other (otherwise-healthy) service. A failed service is still
+    // reported, just without the fields that couldn't be resolved.
     const services: RegistryServiceStatus[] = await Promise.all(
       BUILD_SERVICES.map(async (service) => {
         const dockerRepository = imageRepositoryFor(service)
@@ -37,8 +41,20 @@ export async function GET() {
         // answer to "what is actually latest" (see latestReleaseResolver.ts),
         // reusing this same dockerHub fetch instead of doing it twice.
         const [latest, latestBuild] = await Promise.all([
-          releaseRepository.list({ service, limit: 1 }),
-          resolveLatestRelease(service, { dockerHub }),
+          releaseRepository.list({ service, limit: 1 }).catch((error) => {
+            console.error('[registry] release repository lookup failed', {
+              service,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            })
+            return { items: [] }
+          }),
+          resolveLatestRelease(service, { dockerHub }).catch((error) => {
+            console.error('[registry] resolveLatestRelease failed', {
+              service,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            })
+            return null
+          }),
         ])
         return {
           service,

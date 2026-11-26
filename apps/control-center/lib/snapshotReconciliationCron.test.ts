@@ -81,7 +81,7 @@ test('a correct Authorization header with no due jobs processes zero jobs', asyn
   const { jobStore } = makeJobStore()
   const result = await handleReconcileSnapshotsCron('Bearer test-cron-secret', { snapshotJobStore: jobStore })
   assert.equal(result.status, 200)
-  assert.deepEqual(result.body, { status: 'ok', processed: 0, completed: 0, retried: 0, failed: 0 })
+  assert.deepEqual(result.body, { status: 'ok', processed: 0, completed: 0, retried: 0, failed: 0, errored: 0 })
 })
 
 test('a due job whose digest is STILL not found gets rescheduled with exponential backoff, not marked failed', async () => {
@@ -93,7 +93,7 @@ test('a due job whose digest is STILL not found gets rescheduled with exponentia
     snapshotJobStore: jobStore,
     createSnapshot: async () => ({ outcome: 'digest_not_found' }),
   })
-  assert.deepEqual(result.body, { status: 'ok', processed: 1, completed: 0, retried: 1, failed: 0 })
+  assert.deepEqual(result.body, { status: 'ok', processed: 1, completed: 0, retried: 1, failed: 0, errored: 0 })
 
   const job = await jobStore.getJob('CMS', 6001)
   assert.equal(job?.status, 'pending')
@@ -124,7 +124,7 @@ test('a due job whose digest is now available creates exactly one snapshot and m
         })
         .then((result) => ({ outcome: 'created' as const, result })),
   })
-  assert.deepEqual(result.body, { status: 'ok', processed: 1, completed: 1, retried: 0, failed: 0 })
+  assert.deepEqual(result.body, { status: 'ok', processed: 1, completed: 1, retried: 0, failed: 0, errored: 0 })
 
   const job = await jobStore.getJob('CMS', 6002)
   assert.equal(job?.status, 'completed')
@@ -148,7 +148,7 @@ test('a job that exceeds MAX_RECONCILE_ATTEMPTS is marked failed and removed fro
     snapshotJobStore: jobStore,
     createSnapshot: async () => ({ outcome: 'digest_not_found' }),
   })
-  assert.deepEqual(result.body, { status: 'ok', processed: 1, completed: 0, retried: 0, failed: 1 })
+  assert.deepEqual(result.body, { status: 'ok', processed: 1, completed: 0, retried: 0, failed: 1, errored: 0 })
 
   const after = await jobStore.getJob('CMS', 6003)
   assert.equal(after?.status, 'failed')
@@ -172,7 +172,7 @@ test('a job past MAX_RECONCILE_AGE_MS is marked failed immediately, without atte
     },
   })
   assert.equal(snapshotCalled, false)
-  assert.deepEqual(result.body, { status: 'ok', processed: 1, completed: 0, retried: 0, failed: 1 })
+  assert.deepEqual(result.body, { status: 'ok', processed: 1, completed: 0, retried: 0, failed: 1, errored: 0 })
 })
 
 test('a job that resolves to conflict is marked failed terminally, not retried', async () => {
@@ -184,7 +184,34 @@ test('a job that resolves to conflict is marked failed terminally, not retried',
     snapshotJobStore: jobStore,
     createSnapshot: async () => ({ outcome: 'conflict', releaseId: 'release:CMS:6005:1' }),
   })
-  assert.deepEqual(result.body, { status: 'ok', processed: 1, completed: 0, retried: 0, failed: 1 })
+  assert.deepEqual(result.body, { status: 'ok', processed: 1, completed: 0, retried: 0, failed: 1, errored: 0 })
   const job = await jobStore.getJob('CMS', 6005)
   assert.equal(job?.status, 'failed')
+})
+
+// Regression test for a real durability gap: markResolving flips a job's
+// status away from 'pending' BEFORE createSnapshot runs — listDuePending
+// only ever returns 'pending' jobs, so a job that throws after that point
+// used to stay 'resolving' forever, invisible to every future cron tick.
+test('a job whose processing throws (transient upstream failure) is reverted to pending, not stuck in resolving', async () => {
+  const { jobStore } = makeJobStore()
+  await jobStore.upsertPending({ service: 'CMS', runId: 6006, runAttempt: 1, branch: 'developer', commitSha: 'a'.repeat(40), htmlUrl: 'x', createdBySource: 'github-webhook' })
+  await jobStore.markRetry('CMS', 6006, 'digest_not_found', new Date(Date.now() - 1000).toISOString())
+
+  const result = await handleReconcileSnapshotsCron('Bearer test-cron-secret', {
+    snapshotJobStore: jobStore,
+    createSnapshot: async () => {
+      throw new Error('KV command failed (503): temporarily unavailable')
+    },
+  })
+  assert.deepEqual(result.body, { status: 'ok', processed: 1, completed: 0, retried: 0, failed: 0, errored: 1 })
+
+  const job = await jobStore.getJob('CMS', 6006)
+  // Reverted back to 'pending' (not stuck at 'resolving') AND still present
+  // in the due-pending index, so the NEXT cron tick (not just a future one
+  // after a code fix) will pick it up again.
+  assert.equal(job?.status, 'pending')
+  assert.equal(job?.lastError, 'KV command failed (503): temporarily unavailable')
+  const stillDue = await jobStore.listDuePending(Date.parse(job!.nextRetryAt) + 1, 10)
+  assert.ok(stillDue.some((due) => due.runId === 6006))
 })

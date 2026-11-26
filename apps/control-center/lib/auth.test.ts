@@ -6,7 +6,7 @@ process.env.SESSION_SECRET = 'a'.repeat(32)
 process.env.ADMIN_USERNAME = 'admin'
 process.env.ADMIN_PASSWORD = 'super-secret-admin-password'
 
-const { decodeSessionCookie, encodeSessionCookie, validateCredentials } = await import('./auth')
+const { AuthStorageError, decodeSessionCookie, encodeSessionCookie, validateCredentials } = await import('./auth')
 
 // A tiny fake UserRepository — inline since it's only needed in this file.
 type FakeRecord = { username: string; passwordHash: string; role: 'admin' | 'user'; mustChangePassword: boolean; createdAt: string; createdBy: string }
@@ -84,6 +84,40 @@ test('a Redis-backed user with a mixed-case/whitespace username at login still s
   const identity = await validateCredentials('  LinhNQ  ', 'linhnq', repo as never)
   assert.ok(identity)
   assert.equal(identity.username, 'linhnq')
+})
+
+// ---- a transient user-store failure must never crash uncaught, and must
+// never be conflated with "wrong credentials" (see AuthStorageError's own
+// doc comment — this is the confirmed root cause of intermittent login
+// failures in production) ----
+
+test('a user-store read failure for a real (non-admin) user throws AuthStorageError, not a generic crash or a false "invalid credentials"', async () => {
+  const brokenRepo = {
+    async getByUsername(): Promise<never> {
+      throw new Error('KV command failed (503): temporarily unavailable')
+    },
+    async createIfAbsent(): Promise<never> {
+      throw new Error('not used in this test')
+    },
+  }
+  await assert.rejects(
+    () => validateCredentials('linhnq', 'whatever', brokenRepo as never),
+    (error: unknown) => error instanceof AuthStorageError,
+  )
+})
+
+test('the env-admin path NEVER touches the user store, so it cannot throw AuthStorageError even when the store is broken', async () => {
+  const brokenRepo = {
+    async getByUsername(): Promise<never> {
+      throw new Error('KV command failed (503): temporarily unavailable')
+    },
+    async createIfAbsent(): Promise<never> {
+      throw new Error('not used in this test')
+    },
+  }
+  const identity = await validateCredentials('admin', 'super-secret-admin-password', brokenRepo as never)
+  assert.ok(identity)
+  assert.equal(identity.role, 'admin')
 })
 
 // ---- safe, distinguishable server-side failure logging (never leaked to the caller's return value) ----
