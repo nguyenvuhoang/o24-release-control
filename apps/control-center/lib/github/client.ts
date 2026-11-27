@@ -469,9 +469,27 @@ export function resetGithubRunsListCacheForTests(): void {
   runsListInFlight = null
 }
 
+// `run.name` is the WORKFLOW's own static name — identical on every run of
+// that workflow, regardless of which service was dispatched — so it can
+// never genuinely distinguish one run's service from another's; searching
+// it is always either redundant or actively wrong. It's wrong whenever the
+// workflow's own name happens to contain a service code as a substring,
+// which is near-guaranteed for a deployment's workflow named after its own
+// project (e.g. the real build-w4s.yml is named "Build O24 W4S" — every
+// single run of it, for EVERY one of its 8 services, would then spuriously
+// "mention" W4S). Verified live against nguyenvuhoang/w4s: build-w4s.yml
+// has no `run-name:` override, and GitHub's `display_title` for a
+// workflow_dispatch run with none falls back to that same static workflow
+// name (not the head commit message, despite the long-standing assumption
+// below) — so `display_title === run.name` is the exact, reliable signal
+// that this run's title carries no per-dispatch information at all; such a
+// run must never be treated as matching any service, not just excluded via
+// `run.name` in the search text (dropping `name` from the haystack alone
+// would still have display_title itself spuriously match "W4S").
 function runMentionsService(run: GithubRunResponse, service: string): boolean {
-  const haystack = `${run.display_title ?? ''} ${run.name ?? ''}`
-  return new RegExp(`\\b${service}\\b`, 'i').test(haystack)
+  const displayTitle = run.display_title ?? ''
+  if (displayTitle === (run.name ?? '')) return false
+  return new RegExp(`\\b${service}\\b`, 'i').test(displayTitle)
 }
 
 /**

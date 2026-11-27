@@ -334,3 +334,62 @@ test('when the cache refresh fails, the last-known-good cache is served instead 
     restore()
   }
 })
+
+// ---- Run-title matching must never use the workflow's own static `name`
+// as evidence (see runMentionsService) — reproduces the real
+// nguyenvuhoang/w4s build-w4s.yml bug: that workflow is named "Build O24
+// W4S", has no run-name override, and GitHub's display_title for a
+// workflow_dispatch run with no override falls back to that SAME static
+// name — so every run of it, no matter which of its 8 services was
+// actually dispatched, would otherwise spuriously "mention" W4S. ----
+
+function runsListResponseWithRawRuns(runs: Array<Record<string, unknown>>): Response {
+  return new Response(
+    JSON.stringify({
+      workflow_runs: runs.map((r) => ({
+        id: 1,
+        url: 'https://api.github.com/x',
+        status: 'completed',
+        conclusion: 'success',
+        html_url: 'https://github.com/x',
+        head_branch: 'developer',
+        head_sha: 'a'.repeat(40),
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:05:00Z',
+        ...r,
+      })),
+    }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  )
+}
+
+test('a run whose display_title equals the workflow\'s own static name never matches any service, even one spelled out in that name', async () => {
+  const { restore } = mockFetchSequence([
+    () =>
+      runsListResponseWithRawRuns([
+        { id: 101, name: 'Build O24 W4S', display_title: 'Build O24 W4S' }, // real build-w4s.yml shape: no run-name override
+      ]),
+  ])
+  try {
+    const run = await findLatestGithubRunForService('W4S')
+    assert.equal(run, null, 'a run with no genuine per-dispatch title must never be attributed to a service, even one the static workflow name happens to contain')
+  } finally {
+    restore()
+  }
+})
+
+test('a run whose display_title genuinely differs from the workflow name still matches by its own title', async () => {
+  const { restore } = mockFetchSequence([
+    () =>
+      runsListResponseWithRawRuns([
+        { id: 202, name: 'Build O24 W4S', display_title: 'W4S · v1.2.3' }, // a real run-name override, or a head commit message that happens to mention it
+      ]),
+  ])
+  try {
+    const run = await findLatestGithubRunForService('W4S')
+    assert.ok(run, 'a display_title that genuinely differs from the static workflow name is real per-dispatch evidence and must still match')
+    assert.equal(run!.runId, 202)
+  } finally {
+    restore()
+  }
+})
