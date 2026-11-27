@@ -9,8 +9,11 @@ import { isServiceCodeForProfile } from './serviceMap'
 // services (BUILD_SERVICES) — deliberately NOT a hardcoded map in this
 // repo's source. Every fact here is read straight from w4s at the ref being
 // compared:
-//   - .github/workflows/build-o24.yml tells us which service maps to which
-//     Dockerfile (the same file build-o24.yml itself uses to build).
+//   - This deployment's own configured build workflow (GITHUB_WORKFLOW,
+//     e.g. build-o24.yml for IPS or build-w4s.yml for w4s) tells us which
+//     service maps to which Dockerfile — the same file the workflow itself
+//     uses to build, read live rather than assumed to be "build-o24.yml" for
+//     every profile.
 //   - Each service's Dockerfile tells us its root .csproj (via the
 //     WORKDIR + "dotnet build" pair) and which non-project files
 //     (Directory.Packages.props / Directory.Build.props) it explicitly
@@ -230,8 +233,16 @@ async function resolveClosure(rootCsproj: string, ref: string, cache: Map<string
  * every service, never as "nothing is affected".
  */
 async function buildGraphFromGitHub(sha: string): Promise<DependencyGraph> {
+  // Must be THIS deployment's own configured workflow (GITHUB_WORKFLOW), not
+  // a literal "build-o24.yml" — that was always IPS's file. A w4s deployment
+  // (GITHUB_WORKFLOW=build-w4s.yml) hardcoded to fetch build-o24.yml instead
+  // would parse the wrong, IPS-only case statement on every call, so W4S and
+  // AI would ALWAYS land in `missingServices` even when build-w4s.yml (which
+  // does define them) is the one actually in use — see
+  // docs/W4S_DEPLOYMENT.md and the regression test in w4sGraph.test.ts.
+  const workflowPath = `.github/workflows/${githubConfig().workflow}`
   const [ymlContent, slnContent] = await Promise.all([
-    fetchRawFile('.github/workflows/build-o24.yml', sha),
+    fetchRawFile(workflowPath, sha),
     fetchRawFile('O24OpenAPI.sln', sha),
   ])
 

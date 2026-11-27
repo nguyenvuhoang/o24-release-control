@@ -290,6 +290,34 @@ test('parseServiceDockerfileMapForProfile accepts the complete W4S catalog and i
   assert.equal(map.IPS, undefined)
 })
 
+// Regression test pinning the exact incident found while investigating the
+// incomplete W4S service card: nguyenvuhoang/w4s's REAL `build-o24.yml` (the
+// fixture above, verified live via the GitHub Contents API on the
+// "developer" branch) is the ORIGINAL IPS workflow — it has no W4S or AI
+// case at all, and every image it pushes to uses the `ips_o24` namespace.
+// A w4s deployment whose GITHUB_WORKFLOW points at this file (instead of the
+// real, separate `build-w4s.yml`, which DOES define all 8 w4s services under
+// the `w4s_o24` namespace — see W4S_BUILD_WORKFLOW_YML above) can never
+// discover, dispatch, or track a build for W4S or AI: BUILD_SERVICES correctly
+// lists them (the project profile is right), but GitHub's own `service`
+// workflow_dispatch input has no such choice, so no run ever exists to find.
+// This is exactly why W4S's card loses every build-derived feature (Latest
+// Build, the LATEST→DEV→UAT→PROD pipeline, the source badge, Build/Rebuild)
+// while CTH/NCH keep working — they DO have a case in this file. See
+// docs/W4S_DEPLOYMENT.md's GITHUB_WORKFLOW value and
+// lib/affectedServices/resolver.ts's workflowPath parameter.
+test('the real (IPS) build-o24.yml is missing W4S and AI when parsed under the w4s profile', () => {
+  const map = parseServiceDockerfileMapForProfile('w4s', REAL_BUILD_WORKFLOW_YML)
+  assert.equal(map.W4S, undefined)
+  assert.equal(map.AI, undefined)
+  // The services it DOES share with the w4s catalog (CTH, NCH, PMT, …) are
+  // still found, but under the wrong (ips_o24) image namespace — this file
+  // was never updated for the w4s image split, it just happens to still
+  // parse for the services IPS and W4S have in common.
+  assert.equal(map.CTH?.image, 'vknighthub/ips_o24cth')
+  assert.equal(map.NCH?.image, 'vknighthub/ips_o24nch')
+})
+
 // ---- parseDockerfileRootCsproj ----
 
 test('parseDockerfileRootCsproj finds the root project from a Dockerfile WITH a dotnet restore step (CMS)', () => {
@@ -443,6 +471,36 @@ test('fetchDependencyGraph: cache miss fetches from GitHub and reports source "g
     assert.ok(mocks.githubFetchCount.count > 0)
   } finally {
     mocks.restore()
+  }
+})
+
+// Regression test for the W4S investigation: buildGraphFromGitHub used to
+// fetch the LITERAL path '.github/workflows/build-o24.yml' no matter what
+// GITHUB_WORKFLOW was actually configured to. For a w4s deployment
+// (GITHUB_WORKFLOW=build-w4s.yml) this silently parsed the wrong (IPS-only)
+// workflow on every request, so W4S/AI always landed in `missingServices`
+// even when the correct file was configured. Proven here by pointing
+// GITHUB_WORKFLOW at a DIFFERENT filename than the one baked into
+// MINI_FIXTURES and confirming the graph still resolves — it only can if the
+// fetch path was derived from the live env var, not a hardcoded literal.
+test('fetchDependencyGraph fetches the WORKFLOW FILE GITHUB_WORKFLOW is actually configured to, not a hardcoded name', async () => {
+  resetDependencyGraphCacheForTests()
+  const originalWorkflow = process.env.GITHUB_WORKFLOW
+  process.env.GITHUB_WORKFLOW = 'build-w4s.yml'
+  const fixturesUnderConfiguredName = {
+    ...MINI_FIXTURES,
+    '.github/workflows/build-w4s.yml': MINI_FIXTURES['.github/workflows/build-o24.yml'],
+  }
+  delete (fixturesUnderConfiguredName as Record<string, string>)['.github/workflows/build-o24.yml']
+  const mocks = installMocks(fixturesUnderConfiguredName, null)
+  try {
+    const { graph, source } = await fetchDependencyGraph('sha-configured-workflow')
+    assert.equal(source, 'github')
+    assert.ok(graph.services.CMS, 'graph must resolve from the file at the CONFIGURED workflow path, not build-o24.yml')
+  } finally {
+    mocks.restore()
+    if (originalWorkflow === undefined) delete process.env.GITHUB_WORKFLOW
+    else process.env.GITHUB_WORKFLOW = originalWorkflow
   }
 })
 

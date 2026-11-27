@@ -145,6 +145,38 @@ test('a build-o24.yml change is unknown scope and falls back to building everyth
   assert.equal(result.fellBackToAll, true)
 })
 
+// Regression guard for the W4S investigation: classifyOneFile used to
+// hardcode '.github/workflows/build-o24.yml' as THE build workflow path,
+// regardless of what GITHUB_WORKFLOW is actually configured for this
+// deployment. A w4s deployment (GITHUB_WORKFLOW=build-w4s.yml) would then
+// never recognize its own workflow file changing, AND would misclassify an
+// unrelated build-o24.yml path change as "outside the solution" instead of
+// "unknown scope". The 4th param must be threaded from the caller's own
+// githubConfig().workflow — see app/api/builds/affected-services/route.ts.
+test('workflowPath is configurable: a build-w4s.yml change falls back to building everything only when that is the configured workflow', () => {
+  const asConfigured = resolveAffectedServices(
+    compareWith([{ filename: '.github/workflows/build-w4s.yml', status: 'modified' }]),
+    fixtureGraph(),
+    'github',
+    '.github/workflows/build-w4s.yml',
+  )
+  assert.equal(asConfigured.matchedRules[0].rule, 'workflow-change')
+  assert.deepEqual(asConfigured.affectedServices.sort(), [...ALL_SERVICES].sort())
+  assert.equal(asConfigured.fellBackToAll, true)
+
+  // The same file path is NOT the configured workflow under the default
+  // (IPS) workflowPath — it falls through to the generic "outside the
+  // solution folder" rule instead (.github/ isn't under O24OpenAPI/), which
+  // is correctly a no-impact classification, NOT a silent "workflow-change"
+  // match on the wrong file.
+  const notConfigured = resolveAffectedServices(
+    compareWith([{ filename: '.github/workflows/build-w4s.yml', status: 'modified' }]),
+    fixtureGraph(),
+  )
+  assert.equal(notConfigured.matchedRules[0].rule, 'known-unrelated')
+  assert.equal(notConfigured.fellBackToAll, false)
+})
+
 test('a graph fetch failure (graph is null) falls back to building everything', () => {
   const result = resolveAffectedServices(compareWith([{ filename: 'O24OpenAPI/O24OpenAPI.CMS/X.API/Controller.cs', status: 'modified' }]), null)
   assert.deepEqual(result.affectedServices.sort(), [...ALL_SERVICES].sort())

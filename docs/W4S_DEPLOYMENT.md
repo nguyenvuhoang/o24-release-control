@@ -39,7 +39,7 @@ Thiết lập các biến sau cho Production và các môi trường Vercel cầ
 RELEASE_PROJECT=w4s
 GITHUB_OWNER=nguyenvuhoang
 GITHUB_REPO=w4s
-GITHUB_WORKFLOW=build-o24.yml
+GITHUB_WORKFLOW=build-w4s.yml
 GITHUB_BUILD_BRANCH=developer
 GITHUB_API_VERSION=2026-03-10
 GITHUB_TOKEN=CHANGE_ME_ACTIONS_WRITE_AND_CONTENTS_READ_TOKEN
@@ -87,7 +87,7 @@ Token sử dụng bởi Control Center phải truy cập repository `nguyenvuhoa
 - Contents: Read-only.
 - Metadata: Read-only.
 
-Workflow `build-o24.yml` phải nhận input `service` cho đủ tám service W4S và push đúng image `vknighthub/w4s_o24<service>`.
+Workflow `build-w4s.yml` phải nhận input `service` cho đủ tám service W4S và push đúng image `vknighthub/w4s_o24<service>`. Không dùng `build-o24.yml` — đó là workflow của IPS (9 service IPS, image `vknighthub/ips_o24<service>`) và không có case cho `W4S`/`AI`.
 
 ## 5. Chuẩn bị từng server
 

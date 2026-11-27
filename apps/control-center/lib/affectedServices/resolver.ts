@@ -24,12 +24,13 @@ function isUnderDir(filePath: string, dir: string): boolean {
 function classifyOneFile(
   filePath: string,
   graph: DependencyGraph,
+  workflowPath: string,
 ): { rule: AffectedServiceMatchedRule['rule']; services: BuildServiceCode[]; reason: string } {
-  if (filePath === '.github/workflows/build-o24.yml') {
+  if (filePath === workflowPath) {
     return {
       rule: 'workflow-change',
       services: [],
-      reason: 'Thay đổi trong build-o24.yml — không xác định được phạm vi ảnh hưởng bằng path matcher tĩnh',
+      reason: `Thay đổi trong ${workflowPath} — không xác định được phạm vi ảnh hưởng bằng path matcher tĩnh`,
     }
   }
 
@@ -104,6 +105,14 @@ export function resolveAffectedServices(
   compare: ResolverCompareInput,
   graph: DependencyGraph | null,
   graphSource: AffectedServicesResult['graphSource'] = graph ? 'github' : 'none',
+  // The build workflow file actually configured for this deployment
+  // (GITHUB_WORKFLOW) — defaults to the IPS profile's own workflow so every
+  // existing fixture/test keeps matching its own graph unchanged. A caller
+  // for a different profile (e.g. w4s's build-w4s.yml) must pass its own
+  // path explicitly; this must never be hardcoded to one profile's filename
+  // the way it used to be, since it is what every other deployment's
+  // "Build các service bị thay đổi" preview checks changed files against.
+  workflowPath = '.github/workflows/build-o24.yml',
 ): AffectedServicesResult {
   const warnings: string[] = []
   const matchedRules: AffectedServiceMatchedRule[] = []
@@ -124,12 +133,12 @@ export function resolveAffectedServices(
     fellBackToAll = true
   } else {
     if (graph.missingServices.length > 0) {
-      warnings.push(`build-o24.yml không định nghĩa service: ${graph.missingServices.join(', ')} — các service này sẽ luôn được build khi rơi vào fallback.`)
+      warnings.push(`${workflowPath} không định nghĩa service: ${graph.missingServices.join(', ')} — các service này sẽ luôn được build khi rơi vào fallback.`)
     }
     for (const file of compare.files) {
       const pathsToCheck = file.previousFilename ? [file.filename, file.previousFilename] : [file.filename]
       for (const filePath of pathsToCheck) {
-        const classification = classifyOneFile(filePath, graph)
+        const classification = classifyOneFile(filePath, graph, workflowPath)
         matchedRules.push({ file: filePath, rule: classification.rule, services: classification.services, reason: classification.reason })
         if (classification.rule === 'unknown' || classification.rule === 'workflow-change') {
           warnings.push(classification.reason)

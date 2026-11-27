@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { resolveAffectedServices } from '../../../../lib/affectedServices/resolver'
 import { requireApiSession } from '../../../../lib/api'
 import { appendAudit } from '../../../../lib/audit'
-import { GithubPermissionError, getConfiguredBuildBranch } from '../../../../lib/github/client'
+import { GithubPermissionError, getConfiguredBuildBranch, githubConfig } from '../../../../lib/github/client'
 import { CompareNotFoundError, CompareRateLimitedError, compareCommits } from '../../../../lib/github/compare'
 import { fetchDependencyGraph, type DependencyGraph, type GraphSource } from '../../../../lib/github/w4sGraph'
 import type { AffectedServicesRequest, AffectedServicesResponse } from '../../../../lib/types'
@@ -68,6 +68,7 @@ export async function POST(request: Request) {
       },
       graph,
       graphSource,
+      `.github/workflows/${githubConfig().workflow}`,
     )
     if (graphError) {
       result.warnings.push(`Không lấy được dependency graph: ${graphError}`)
